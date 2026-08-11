@@ -315,13 +315,13 @@ fn handle_settings_change(
     }
 
     // 5. 写前检测用户手填：先看 userExplicit，再比较 lastWritten/staticInjected。
-    // 该检测必须在静态注入/无 active window 早退之前，保证用户手改会被记账。
-    // 键结构按 spec 固定为 ACW / MAX 短键。
+    // 以及当前 model 的自动目标值。该检测必须在静态注入/无 active window
+    // 早退之前，保证用户手改会被记账；键结构按 spec 固定为 ACW / MAX 短键。
     let explicit_acw = new_acw.filter(|value| {
-        !is_user_explicit(&provider, "ACW") && !is_auto_source_value(&provider, "ACW", value)
+        !is_user_explicit(&provider, "ACW") && !is_auto_target_value(&v, &provider, "ACW", value)
     });
     let explicit_max = new_max.filter(|value| {
-        !is_user_explicit(&provider, "MAX") && !is_auto_source_value(&provider, "MAX", value)
+        !is_user_explicit(&provider, "MAX") && !is_auto_target_value(&v, &provider, "MAX", value)
     });
     if explicit_acw.is_some() || explicit_max.is_some() {
         record_user_explicit(&mut *provider, explicit_acw, explicit_max);
@@ -499,6 +499,24 @@ fn is_auto_source_value(provider: &Provider, key: &str, value: &str) -> bool {
         legacy_key
             .is_some_and(|env_key| source_obj.get(env_key).and_then(Value::as_str) == Some(value))
     })
+}
+
+/// live 值与 DB 账本、staticInjected，或当前 model 的自动目标一致时，视为自动来源。
+/// 用于 watcher 重建后 DB lastWritten 缺失/过期时，仍不会把自动写入误判为 userExplicit。
+fn is_auto_target_value(settings: &Value, provider: &Provider, key: &str, value: &str) -> bool {
+    if is_auto_source_value(provider, key, value) {
+        return true;
+    }
+    let Some(active) = resolve_active_model_window(settings, provider) else {
+        return false;
+    };
+    let writes = build_env_writes(active.window, provider_compact_ratio(provider));
+    let Some(env_key) = legacy_env_key(key) else {
+        return false;
+    };
+    writes
+        .iter()
+        .any(|(write_key, expected)| *write_key == env_key && expected.as_str() == value)
 }
 
 fn verify_file_unchanged(path: &std::path::Path, expected: &str) -> Result<(), String> {
@@ -1715,6 +1733,133 @@ mod tests {
             .settings_config
             .pointer("/autoSyncState/userExplicit")
             .is_none());
+    }
+
+    #[test]
+    fn handle_settings_change_rebuilt_watcher_with_stale_ledger_keeps_auto_sync() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let initial = json!({
+            "model": "haiku",
+            "env": {
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "haiku-model",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "sonnet-model",
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "24000",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "30000"
+            }
+        });
+        fs::write(&path, initial.to_string()).unwrap();
+
+        // DB 账本还是旧值，live 文件已包含上一次自动写入的 ACW/MAX；
+        // watcher 重建时 state 从空快照开始，不能用旧 lastWritten 判成用户手改。
+        let provider = Mutex::new(Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "haiku-model",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "sonnet-model"
+                },
+                "contextWindows": {
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": 30000,
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": 200000
+                },
+                "autoSyncContextWindow": true,
+                "autoSyncCompactRatio": 0.8,
+                "autoSyncState": { "lastWritten": { "ACW": "1", "MAX": "2" } }
+            }),
+            None,
+        ));
+        let state = Mutex::new(None);
+
+        handle_settings_change(&path, &provider, &state, &noop_persist());
+
+        let provider_guard = provider.lock().unwrap();
+        assert!(provider_guard
+            .settings_config
+            .pointer("/autoSyncState/userExplicit")
+            .is_none());
+        drop(provider_guard);
+
+        // 自动同步不停止：下一次真实切换仍按目标写入。
+        fs::write(
+            &path,
+            json!({
+                "model": "sonnet",
+                "env": { "ANTHROPIC_DEFAULT_SONNET_MODEL": "sonnet-model" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        handle_settings_change(&path, &provider, &state, &noop_persist());
+
+        let content = fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "160000");
+        assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "200000");
+    }
+
+    #[test]
+    fn failing_persist_retry_after_state_reset_does_not_mark_auto_target_explicit() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let initial = json!({
+            "model": "haiku",
+            "env": { "ANTHROPIC_DEFAULT_HAIKU_MODEL": "Kimi[30k]" }
+        });
+        fs::write(&path, initial.to_string()).unwrap();
+
+        let provider = Mutex::new(Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "Kimi[30k]",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "GLM[200k]"
+                },
+                "autoSyncContextWindow": true,
+                "autoSyncCompactRatio": 0.8,
+                "autoSyncState": { "lastWritten": { "ACW": "1", "MAX": "2" } }
+            }),
+            None,
+        ));
+        let state = Mutex::new(None);
+
+        // 第一次 live 写入成功但 DB 持久化失败；第二次相同事件不再被 should_process 跳过，
+        // 并且 DB 账本仍是旧值，必须按当前 model 的自动目标校准，而不是记成 userExplicit。
+        let persist = fail_once_then_succeed_persist();
+        handle_settings_change(&path, &provider, &state, &persist);
+        provider.lock().unwrap().settings_config["autoSyncState"]["lastWritten"] =
+            json!({ "ACW": "1", "MAX": "2" });
+        *state.lock().unwrap() = None;
+        handle_settings_change(&path, &provider, &state, &persist);
+
+        let provider_guard = provider.lock().unwrap();
+        assert!(provider_guard
+            .settings_config
+            .pointer("/autoSyncState/userExplicit")
+            .is_none());
+        drop(provider_guard);
+
+        fs::write(
+            &path,
+            json!({
+                "model": "sonnet",
+                "env": { "ANTHROPIC_DEFAULT_SONNET_MODEL": "GLM[200k]" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        handle_settings_change(&path, &provider, &state, &persist);
+
+        let content = fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "160000");
+        assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "200000");
     }
 
     #[test]
