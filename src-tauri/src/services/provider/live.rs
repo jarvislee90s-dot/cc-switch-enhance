@@ -157,6 +157,12 @@ fn apply_context_window_defaults(settings: &mut Value, provider: &Provider) {
     let Some(target) = context_window_target_from_settings(settings)
         .or_else(|| context_window_target_from_settings(&provider.settings_config))
     else {
+        if let Some(state) = settings
+            .get_mut("autoSyncState")
+            .and_then(Value::as_object_mut)
+        {
+            state.remove("staticInjected");
+        }
         return;
     };
     let writes = crate::claude_settings_watcher::build_env_writes(
@@ -222,9 +228,9 @@ fn restore_claude_subagent_local_marker_for_effective(settings: &mut Value, prov
     else {
         return;
     };
-    if crate::claude_desktop_config::parse_context_window_suffix(model)
+    if !crate::claude_desktop_config::parse_context_window_suffix(model)
         .1
-        .is_none()
+        .is_some_and(|window| window >= 1_000_000)
     {
         return;
     }
@@ -236,7 +242,7 @@ fn restore_claude_subagent_local_marker_for_effective(settings: &mut Value, prov
     }
 }
 
-fn strip_legacy_suffixes_from_claude_models(settings: &mut Value) {
+pub(crate) fn strip_legacy_suffixes_from_claude_models(settings: &mut Value) {
     let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) else {
         return;
     };
@@ -1037,7 +1043,9 @@ fn restore_claude_internal_fields_for_backfill(settings: &mut Value, provider: &
             continue;
         };
         if crate::proxy::model_mapper::strip_one_m_suffix_for_upstream(stored_model) == live_model {
-            restore_models.push((key.to_string(), stored_model.to_string()));
+            let restored_model =
+                crate::proxy::model_mapper::strip_one_m_suffix_for_upstream(stored_model);
+            restore_models.push((key.to_string(), restored_model.to_string()));
         }
     }
     let Some(obj) = settings.as_object_mut() else {
@@ -1073,6 +1081,7 @@ fn restore_live_settings_for_provider_backfill(
         strip_injected_kimi_for_coding_context_defaults(&mut settings, provider);
         restore_claude_internal_fields_for_backfill(&mut settings, provider);
         strip_injected_model_suffix_context_defaults(&mut settings, provider);
+        strip_legacy_suffixes_from_claude_models(&mut settings);
         return settings;
     }
     if matches!(app_type, AppType::GrokBuild) {
@@ -2295,6 +2304,49 @@ mod tests {
     }
 
     #[test]
+    fn restore_subagent_local_marker_only_for_one_million_window() {
+        let provider_200k = Provider::with_id(
+            "p-200k".to_string(),
+            "P 200k".to_string(),
+            json!({
+                "env": {
+                    "CLAUDE_CODE_SUBAGENT_MODEL": "subagent-model[200k]"
+                },
+                "contextWindows": { "CLAUDE_CODE_SUBAGENT_MODEL": 200000 }
+            }),
+            None,
+        );
+        let mut effective_200k = json!({
+            "env": { "CLAUDE_CODE_SUBAGENT_MODEL": "subagent-model" }
+        });
+        restore_claude_subagent_local_marker_for_effective(&mut effective_200k, &provider_200k);
+        assert_eq!(
+            effective_200k["env"]["CLAUDE_CODE_SUBAGENT_MODEL"],
+            "subagent-model"
+        );
+
+        let provider_1m = Provider::with_id(
+            "p-1m".to_string(),
+            "P 1M".to_string(),
+            json!({
+                "env": {
+                    "CLAUDE_CODE_SUBAGENT_MODEL": "subagent-model[1M]"
+                },
+                "contextWindows": { "CLAUDE_CODE_SUBAGENT_MODEL": 1000000 }
+            }),
+            None,
+        );
+        let mut effective_1m = json!({
+            "env": { "CLAUDE_CODE_SUBAGENT_MODEL": "subagent-model" }
+        });
+        restore_claude_subagent_local_marker_for_effective(&mut effective_1m, &provider_1m);
+        assert_eq!(
+            effective_1m["env"]["CLAUDE_CODE_SUBAGENT_MODEL"],
+            "subagent-model[1M]"
+        );
+    }
+
+    #[test]
     #[serial]
     fn direct_live_writes_clean_models_and_persists_static_injected() {
         let _home = TempHome::new();
@@ -3311,6 +3363,37 @@ base_url = "https://a.example/v1"
     }
 
     #[test]
+    fn apply_context_window_defaults_remove_stale_static_injected_when_no_target() {
+        let provider = Provider::with_id(
+            "test".to_string(),
+            "Test".to_string(),
+            json!({
+                "env": { "ANTHROPIC_MODEL": "fallback-model" },
+                "contextWindows": {}
+            }),
+            None,
+        );
+
+        let mut settings = json!({
+            "env": { "ANTHROPIC_MODEL": "fallback-model" },
+            "contextWindows": {},
+            "autoSyncState": {
+                "lastWritten": { "model": "sonnet" },
+                "staticInjected": { "ACW": "1000000", "MAX": "1000000" }
+            }
+        });
+        apply_context_window_defaults(&mut settings, &provider);
+        assert_eq!(
+            settings["autoSyncState"]["lastWritten"],
+            json!({ "model": "sonnet" })
+        );
+        assert!(
+            settings["autoSyncState"].get("staticInjected").is_none(),
+            "empty contextWindows must clear stale staticInjected"
+        );
+    }
+
+    #[test]
     fn context_window_defaults_skip_when_auto_sync_disabled() {
         let db = Database::memory().expect("create memory db");
         let provider = Provider::with_id(
@@ -3442,6 +3525,45 @@ base_url = "https://a.example/v1"
     }
 
     #[test]
+    fn claude_backfill_strips_all_legacy_suffixes_from_stored_models() {
+        let provider = Provider::with_id(
+            "test".to_string(),
+            "Test".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_MODEL": "fallback-model[200k]",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "sonnet-model[1M]",
+                    "CLAUDE_CODE_SUBAGENT_MODEL": "subagent-model[1M]"
+                },
+                "contextWindows": {
+                    "ANTHROPIC_MODEL": 200000,
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": 1000000,
+                    "CLAUDE_CODE_SUBAGENT_MODEL": 1000000
+                }
+            }),
+            None,
+        );
+        let live = json!({
+            "env": {
+                "ANTHROPIC_MODEL": "fallback-model",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "sonnet-model",
+                "CLAUDE_CODE_SUBAGENT_MODEL": "subagent-model"
+            }
+        });
+        let backfilled =
+            restore_live_settings_for_provider_backfill(&AppType::Claude, &provider, live);
+        assert_eq!(backfilled["env"]["ANTHROPIC_MODEL"], "fallback-model");
+        assert_eq!(
+            backfilled["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"],
+            "sonnet-model"
+        );
+        assert_eq!(
+            backfilled["env"]["CLAUDE_CODE_SUBAGENT_MODEL"],
+            "subagent-model"
+        );
+    }
+
+    #[test]
     fn claude_backfill_preserves_all_internal_fields() {
         let db = Database::memory().expect("create memory db");
         let provider = Provider::with_id(
@@ -3482,7 +3604,7 @@ base_url = "https://a.example/v1"
         assert_eq!(backfilled["autoSyncState"], json!({ "lastWritten": {} }));
         assert_eq!(
             backfilled["env"]["ANTHROPIC_MODEL"],
-            json!("fallback-model[1M]")
+            json!("fallback-model")
         );
     }
 
@@ -3540,7 +3662,7 @@ base_url = "https://a.example/v1"
         assert!(backfilled["env"]
             .get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
             .is_none());
-        assert_eq!(backfilled["env"]["ANTHROPIC_MODEL"], "fallback-model[1M]");
+        assert_eq!(backfilled["env"]["ANTHROPIC_MODEL"], "fallback-model");
     }
 
     #[test]
