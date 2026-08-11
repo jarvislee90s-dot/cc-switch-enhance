@@ -1181,26 +1181,24 @@ fn auto_sync_ledger_value_relevant(value: &Value) -> bool {
     !value.is_null() && value.as_bool() != Some(false)
 }
 
-fn auto_sync_state_has_context_ledger(state: &serde_json::Map<String, Value>) -> bool {
-    ["userExplicit", "lastWritten", "staticInjected"]
-        .iter()
-        .any(|source| {
-            state
-                .get(*source)
-                .and_then(Value::as_object)
-                .is_some_and(|source_obj| {
-                    CLAUDE_BACKFILL_CONTEXT_KEYS
-                        .iter()
-                        .any(|(env_key, short_key)| {
-                            source_obj
-                                .get(*short_key)
-                                .is_some_and(auto_sync_ledger_value_relevant)
-                                || source_obj
-                                    .get(*env_key)
-                                    .is_some_and(auto_sync_ledger_value_relevant)
-                        })
-                })
-        })
+fn auto_sync_key_has_auto_source_record(
+    state: &serde_json::Map<String, Value>,
+    short_key: &str,
+    env_key: &str,
+) -> bool {
+    ["lastWritten", "staticInjected"].iter().any(|source| {
+        state
+            .get(*source)
+            .and_then(Value::as_object)
+            .is_some_and(|source_obj| {
+                source_obj
+                    .get(short_key)
+                    .is_some_and(auto_sync_ledger_value_relevant)
+                    || source_obj
+                        .get(env_key)
+                        .is_some_and(auto_sync_ledger_value_relevant)
+            })
+    })
 }
 
 fn backfill_user_explicit_value(
@@ -1213,11 +1211,8 @@ fn backfill_user_explicit_value(
         return false;
     };
     if let Some(value) = explicit.get(short_key) {
-        if value.is_null() {
-            return false;
-        }
-        // 短键新账本保存实际字符串；旧形状允许 true/null 之外的标记兜底。
-        return value.as_str() == Some(live_value) || !value.is_string();
+        // 短键新账本只保存实际字符串；null / 非字符串视为无显式值。
+        return value.as_str() == Some(live_value);
     }
     if let Some(value) = explicit.get(env_key) {
         if value.is_null() || value.as_bool() == Some(false) {
@@ -1251,8 +1246,35 @@ fn strip_legacy_context_defaults_for_backfill(settings: &mut Value, provider: &P
     strip_injected_model_suffix_context_defaults(settings, provider);
 }
 
-/// 优先按 autoSyncState 三来源判定：userExplicit 保留，lastWritten/staticInjected
-/// 匹配时删除。无账本或账本没有 ACW/MAX 记录时退回旧的窗口剥离逻辑。
+/// 只对单个 env key 套用旧兜底逻辑；隔离该键避免误删账本已覆盖的另一键。
+fn strip_legacy_context_default_for_backfill(
+    settings: &mut Value,
+    provider: &Provider,
+    env_key: &str,
+) {
+    let mut isolated = settings.clone();
+    if let Some(env) = isolated.get_mut("env").and_then(Value::as_object_mut) {
+        let value = env.get(env_key).cloned();
+        env.clear();
+        if let Some(value) = value {
+            env.insert(env_key.to_string(), value);
+        }
+    }
+    strip_legacy_context_defaults_for_backfill(&mut isolated, provider);
+    let removed = isolated
+        .get("env")
+        .and_then(Value::as_object)
+        .map(|env| !env.contains_key(env_key))
+        .unwrap_or(true);
+    if removed {
+        if let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) {
+            env.remove(env_key);
+        }
+    }
+}
+
+/// 优先按 autoSyncState 逐键判定：userExplicit 保留，lastWritten/staticInjected
+/// 匹配时删除；该键没有任何自动来源记录时退回旧的窗口剥离逻辑。
 fn strip_auto_synced_context_defaults(settings: &mut Value, provider: &Provider) {
     let Some(state) = provider
         .settings_config
@@ -1262,23 +1284,33 @@ fn strip_auto_synced_context_defaults(settings: &mut Value, provider: &Provider)
         strip_legacy_context_defaults_for_backfill(settings, provider);
         return;
     };
-    if !auto_sync_state_has_context_ledger(state) {
-        strip_legacy_context_defaults_for_backfill(settings, provider);
-        return;
-    }
-    let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) else {
-        return;
-    };
-    for (env_key, short_key) in CLAUDE_BACKFILL_CONTEXT_KEYS {
-        let Some(live_value) = env.get(env_key).and_then(Value::as_str) else {
-            continue;
+    let mut remove_keys = Vec::new();
+    let mut legacy_keys = Vec::new();
+    {
+        let Some(env) = settings.get("env").and_then(Value::as_object) else {
+            return;
         };
-        if backfill_user_explicit_value(state, short_key, env_key, live_value) {
-            continue;
+        for (env_key, short_key) in CLAUDE_BACKFILL_CONTEXT_KEYS {
+            let Some(live_value) = env.get(env_key).and_then(Value::as_str) else {
+                continue;
+            };
+            if backfill_user_explicit_value(state, short_key, env_key, live_value) {
+                continue;
+            }
+            if backfill_auto_source_value(state, short_key, env_key, live_value) {
+                remove_keys.push(env_key);
+            } else if !auto_sync_key_has_auto_source_record(state, short_key, env_key) {
+                legacy_keys.push(env_key);
+            }
         }
-        if backfill_auto_source_value(state, short_key, env_key, live_value) {
+    }
+    if let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) {
+        for env_key in remove_keys {
             env.remove(env_key);
         }
+    }
+    for env_key in legacy_keys {
+        strip_legacy_context_default_for_backfill(settings, provider, env_key);
     }
 }
 
@@ -4636,6 +4668,85 @@ base_url = "https://a.example/v1"
         assert_eq!(
             effective["autoSyncState"]["staticInjected"],
             json!({ "ACW": "262144", "MAX": "262144" })
+        );
+    }
+
+    #[test]
+    fn backfill_falls_back_per_key_when_ledger_has_only_other_key() {
+        let mut settings = json!({
+            "env": {
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1000000",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "250000"
+            }
+        });
+        let provider = Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "env": { "ANTHROPIC_MODEL": "fallback-model[1M]" },
+                "autoSyncState": {
+                    "userExplicit": { "MAX": "250000" }
+                }
+            }),
+            None,
+        );
+        strip_auto_synced_context_defaults(&mut settings, &provider);
+        assert!(settings["env"]
+            .get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+            .is_none());
+        assert_eq!(
+            settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
+            json!("250000")
+        );
+    }
+
+    #[test]
+    fn backfill_prefers_user_explicit_when_matching_last_written() {
+        let mut settings = json!({ "env": { "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "200000" } });
+        let provider = Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "autoSyncState": {
+                    "lastWritten": { "MAX": "200000" },
+                    "userExplicit": { "MAX": "200000" }
+                }
+            }),
+            None,
+        );
+        strip_auto_synced_context_defaults(&mut settings, &provider);
+        assert_eq!(
+            settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
+            json!("200000")
+        );
+    }
+
+    #[test]
+    fn backfill_ignores_non_string_short_user_explicit_marker() {
+        let mut settings = json!({
+            "env": {
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1000000",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "250000"
+            }
+        });
+        let provider = Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "env": { "ANTHROPIC_MODEL": "fallback-model[1M]" },
+                "autoSyncState": {
+                    "userExplicit": { "ACW": false, "MAX": "250000" }
+                }
+            }),
+            None,
+        );
+        strip_auto_synced_context_defaults(&mut settings, &provider);
+        assert!(settings["env"]
+            .get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+            .is_none());
+        assert_eq!(
+            settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
+            json!("250000")
         );
     }
 }
