@@ -2460,6 +2460,59 @@ requires_openai_auth = true
             );
         });
     }
+
+    #[test]
+    fn normalize_provider_if_claude_persists_legacy_suffix_migration_on_update() {
+        with_test_home(|state, _| {
+            let original = Provider::with_id(
+                "p".to_string(),
+                "P".to_string(),
+                json!({ "env": { "ANTHROPIC_MODEL": "fallback-model" } }),
+                None,
+            );
+            state
+                .db
+                .save_provider(AppType::Claude.as_str(), &original)
+                .expect("seed provider");
+
+            let updated = Provider::with_id(
+                "p".to_string(),
+                "P".to_string(),
+                json!({
+                    "env": {
+                        "ANTHROPIC_MODEL": "fallback-model",
+                        "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2[200k]",
+                        "CLAUDE_CODE_SUBAGENT_MODEL": "subagent-model[1M]"
+                    }
+                }),
+                None,
+            );
+            ProviderService::update(state, AppType::Claude, None, updated)
+                .expect("update provider");
+
+            let saved = state
+                .db
+                .get_provider_by_id("p", AppType::Claude.as_str())
+                .expect("query provider")
+                .expect("provider should exist");
+            assert_eq!(
+                saved.settings_config["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"],
+                "glm-5.2"
+            );
+            assert_eq!(
+                saved.settings_config["contextWindows"]["ANTHROPIC_DEFAULT_SONNET_MODEL"],
+                200000
+            );
+            assert_eq!(
+                saved.settings_config["env"]["CLAUDE_CODE_SUBAGENT_MODEL"],
+                "subagent-model"
+            );
+            assert_eq!(
+                saved.settings_config["contextWindows"]["CLAUDE_CODE_SUBAGENT_MODEL"],
+                1000000
+            );
+        });
+    }
 }
 
 impl ProviderService {
