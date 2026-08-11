@@ -2838,7 +2838,12 @@ base_url = "https://a.example/v1"
         });
         let clean = sanitize_claude_settings_for_live(&settings);
         let obj = clean.as_object().unwrap();
-        for key in ["autoSyncContextWindow", "autoSyncCompactRatio", "contextWindows", "autoSyncState"] {
+        for key in [
+            "autoSyncContextWindow",
+            "autoSyncCompactRatio",
+            "contextWindows",
+            "autoSyncState",
+        ] {
             assert!(!obj.contains_key(key), "{key} leaked into live settings");
         }
     }
