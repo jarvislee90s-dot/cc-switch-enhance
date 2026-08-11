@@ -2103,6 +2103,8 @@ impl ProxyService {
             env.remove("ANTHROPIC_BASE_URL");
         }
 
+        crate::services::provider::strip_legacy_suffixes_from_claude_models(&mut config);
+
         self.write_claude_live(&config)?;
         Ok(())
     }
@@ -7118,6 +7120,73 @@ requires_openai_auth = true
                 !model.to_ascii_lowercase().contains("[1m]")
                     && !model.to_ascii_lowercase().contains("[200k]"),
                 "restored model {key} still carries a suffix: {model}"
+            );
+        }
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL").and_then(Value::as_str),
+            Some("fallback-model")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_SONNET_MODEL")
+                .and_then(Value::as_str),
+            Some("sonnet-model")
+        );
+        assert_eq!(
+            env.get("CLAUDE_CODE_SUBAGENT_MODEL")
+                .and_then(Value::as_str),
+            Some("subagent-model")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn cleanup_claude_takeover_placeholders_strips_model_suffixes() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        write_json_file(
+            &get_claude_settings_path(),
+            &json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:15721",
+                    "ANTHROPIC_API_KEY": PROXY_TOKEN_PLACEHOLDER,
+                    "ANTHROPIC_MODEL": "fallback-model[200k]",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "sonnet-model[1M]",
+                    "CLAUDE_CODE_SUBAGENT_MODEL": "subagent-model[1m]"
+                }
+            }),
+        )
+        .expect("seed taken-over live file");
+
+        service
+            .cleanup_claude_takeover_placeholders_in_live()
+            .expect("cleanup Claude takeover placeholders");
+
+        let live = service.read_claude_live().expect("read live");
+        let env = live
+            .get("env")
+            .and_then(Value::as_object)
+            .expect("live env");
+        assert!(
+            env.get("ANTHROPIC_BASE_URL").is_none(),
+            "cleanup should remove local proxy base URL"
+        );
+        assert!(
+            env.get("ANTHROPIC_API_KEY").is_none(),
+            "cleanup should remove proxy token placeholder"
+        );
+        for key in [
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "CLAUDE_CODE_SUBAGENT_MODEL",
+        ] {
+            let model = env.get(key).and_then(Value::as_str).expect("model key");
+            assert!(
+                !model.to_ascii_lowercase().contains("[1m]")
+                    && !model.to_ascii_lowercase().contains("[200k]"),
+                "cleanup must strip suffix from {key}, got: {model}"
             );
         }
         assert_eq!(
