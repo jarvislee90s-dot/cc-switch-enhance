@@ -248,6 +248,17 @@ fn handle_settings_change(
         return;
     }
 
+    // Kimi / Codex OAuth 的 ACW/MAX 由静态注入写入 live，watcher 不应再按
+    // autoSyncCompactRatio 重写；只有用户显式修改或下次切换供应商时才更新。
+    if crate::services::provider::is_kimi_for_coding_provider(provider) || provider.is_codex_oauth()
+    {
+        log::debug!(
+            "[ClaudeSettingsWatcher] static ACW/MAX for {}, skip watcher rewrite",
+            provider.name
+        );
+        return;
+    }
+
     // 5. 决定要写的窗口值
     let active = match resolve_active_model_window(&v, provider) {
         Some(a) => a,
@@ -837,6 +848,90 @@ mod tests {
         drop(watcher);
     }
     /// 只改 effortLevel 不应该触发 ACW/MAX 写入
+
+    /// Kimi/Codex OAuth 的静态 ACW/MAX 写入 live 后，watcher 不应再按压缩比例重写。
+    #[test]
+    fn handle_settings_change_keeps_kimi_static_acw_max() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let initial = json!({
+            "model": "sonnet",
+            "env": {
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "kimi-for-coding",
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "262144",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "262144"
+            },
+            "autoSyncState": { "staticInjected": { "ACW": "262144", "MAX": "262144" } }
+        });
+        fs::write(&path, initial.to_string()).unwrap();
+
+        let provider = Provider::with_id(
+            "kimi".to_string(),
+            "Kimi For Coding".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding/",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "kimi-for-coding"
+                },
+                "autoSyncContextWindow": true,
+                "autoSyncCompactRatio": 0.8,
+                "autoSyncState": { "staticInjected": { "ACW": "262144", "MAX": "262144" } }
+            }),
+            None,
+        );
+
+        let state = Mutex::new(None);
+        handle_settings_change(&path, &provider, &state);
+
+        let content = fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "262144");
+        assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "262144");
+    }
+
+    #[test]
+    fn handle_settings_change_keeps_codex_oauth_static_acw_max() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let initial = json!({
+            "model": "sonnet",
+            "env": {
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "gpt-5.6",
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "372000",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "372000"
+            },
+            "autoSyncState": { "staticInjected": { "ACW": "372000", "MAX": "372000" } }
+        });
+        fs::write(&path, initial.to_string()).unwrap();
+
+        let mut provider = Provider::with_id(
+            "codex-oauth".to_string(),
+            "Codex".to_string(),
+            json!({
+                "env": { "ANTHROPIC_DEFAULT_SONNET_MODEL": "gpt-5.6" },
+                "autoSyncContextWindow": true,
+                "autoSyncCompactRatio": 0.8,
+                "autoSyncState": { "staticInjected": { "ACW": "372000", "MAX": "372000" } }
+            }),
+            None,
+        );
+        provider.meta = Some(crate::provider::ProviderMeta {
+            provider_type: Some("codex_oauth".to_string()),
+            ..Default::default()
+        });
+
+        let state = Mutex::new(None);
+        handle_settings_change(&path, &provider, &state);
+
+        let content = fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "372000");
+        assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "372000");
+    }
     #[test]
     fn fs_real_watcher_effort_change_no_trigger() {
         use std::fs;

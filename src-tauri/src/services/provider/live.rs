@@ -228,12 +228,7 @@ fn apply_context_window_defaults(settings: &mut Value, provider: &Provider) {
     let Some(target) = context_window_target_from_settings(settings)
         .or_else(|| context_window_target_from_settings(&provider.settings_config))
     else {
-        if let Some(state) = settings
-            .get_mut("autoSyncState")
-            .and_then(Value::as_object_mut)
-        {
-            state.remove("staticInjected");
-        }
+        clear_static_injected(settings);
         return;
     };
     let writes = crate::claude_settings_watcher::build_env_writes(
@@ -247,8 +242,16 @@ fn apply_context_window_defaults(settings: &mut Value, provider: &Provider) {
         let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) else {
             return;
         };
-        has_explicit_acw = env.contains_key("CLAUDE_CODE_AUTO_COMPACT_WINDOW");
-        has_explicit_max = env.contains_key("CLAUDE_CODE_MAX_CONTEXT_TOKENS");
+        let provider_env = provider
+            .settings_config
+            .get("env")
+            .and_then(Value::as_object);
+        has_explicit_acw = provider_env
+            .and_then(|env| env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW"))
+            .is_some();
+        has_explicit_max = provider_env
+            .and_then(|env| env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS"))
+            .is_some();
         for (key, value) in &writes {
             if !env.contains_key(*key) {
                 env.insert(key.to_string(), Value::String(value.clone()));
@@ -258,28 +261,9 @@ fn apply_context_window_defaults(settings: &mut Value, provider: &Provider) {
     }
 
     if has_explicit_acw || has_explicit_max {
-        if let Some(state) = settings
-            .get_mut("autoSyncState")
-            .and_then(Value::as_object_mut)
-        {
-            state.remove("staticInjected");
-        }
+        clear_static_injected(settings);
     } else if injected_writes.len() == 2 {
-        let Some(obj) = settings.as_object_mut() else {
-            return;
-        };
-        let state = obj.entry("autoSyncState").or_insert_with(|| json!({}));
-        if !state.is_object() {
-            *state = json!({});
-        }
-        let state = state.as_object_mut().expect("autoSyncState object");
-        state.insert(
-            "staticInjected".to_string(),
-            json!({
-                "ACW": injected_writes[0].1.clone(),
-                "MAX": injected_writes[1].1.clone(),
-            }),
-        );
+        record_static_injected(settings, &injected_writes[0].1, &injected_writes[1].1);
     }
 }
 
@@ -3664,6 +3648,47 @@ base_url = "https://a.example/v1"
         assert!(
             settings["autoSyncState"].get("staticInjected").is_none(),
             "empty contextWindows must clear stale staticInjected"
+        );
+    }
+
+    #[test]
+    fn apply_context_window_defaults_keeps_kimi_static_injected() {
+        let provider = Provider::with_id(
+            "kimi".to_string(),
+            "Kimi For Coding".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding/",
+                    "ANTHROPIC_MODEL": "kimi-for-coding"
+                },
+                "contextWindows": { "ANTHROPIC_MODEL": 800000 }
+            }),
+            None,
+        );
+
+        let mut settings = json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding/",
+                "ANTHROPIC_MODEL": "kimi-for-coding"
+            },
+            "contextWindows": { "ANTHROPIC_MODEL": 800000 },
+            "autoSyncState": {}
+        });
+
+        apply_kimi_for_coding_context_defaults(&mut settings, &provider);
+        apply_context_window_defaults(&mut settings, &provider);
+
+        assert_eq!(
+            settings["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
+            json!("262144")
+        );
+        assert_eq!(
+            settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
+            json!("262144")
+        );
+        assert_eq!(
+            settings["autoSyncState"]["staticInjected"],
+            json!({ "ACW": "262144", "MAX": "262144" })
         );
     }
 
