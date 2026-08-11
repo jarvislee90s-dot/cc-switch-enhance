@@ -1753,8 +1753,11 @@ impl ProxyService {
         match app_type {
             AppType::Claude => {
                 if let Ok(Some(backup)) = self.db.get_live_backup("claude").await {
-                    let config: Value = serde_json::from_str(&backup.original_config)
+                    let mut config: Value = serde_json::from_str(&backup.original_config)
                         .map_err(|e| format!("解析 Claude 备份失败: {e}"))?;
+                    crate::services::provider::strip_legacy_suffixes_from_claude_models(
+                        &mut config,
+                    );
                     self.write_claude_live(&config)?;
                     log::info!("Claude Live 配置已恢复");
                 }
@@ -7065,6 +7068,66 @@ requires_openai_auth = true
         assert!(
             !crate::codex_config::get_codex_auth_path().exists(),
             "empty-auth restore must delete auth.json rather than write an empty one"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn restore_live_config_for_app_strips_model_suffixes_from_backup_before_writing_live() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let backup = json!({
+            "env": {
+                "ANTHROPIC_MODEL": "fallback-model[200k]",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "sonnet-model[1M]",
+                "CLAUDE_CODE_SUBAGENT_MODEL": "subagent-model[1M]"
+            }
+        });
+        db.save_live_backup(
+            "claude",
+            &serde_json::to_string(&backup).expect("serialize backup"),
+        )
+        .await
+        .expect("seed live backup");
+
+        service
+            .restore_live_config_for_app_inner(&AppType::Claude)
+            .await
+            .expect("restore claude live");
+
+        let live = service.read_claude_live().expect("read live");
+        let env = live
+            .get("env")
+            .and_then(Value::as_object)
+            .expect("live env");
+        for key in [
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "CLAUDE_CODE_SUBAGENT_MODEL",
+        ] {
+            let model = env.get(key).and_then(Value::as_str).expect("model key");
+            assert!(
+                !model.to_ascii_lowercase().contains("[1m]")
+                    && !model.to_ascii_lowercase().contains("[200k]"),
+                "restored model {key} still carries a suffix: {model}"
+            );
+        }
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL").and_then(Value::as_str),
+            Some("fallback-model")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_SONNET_MODEL")
+                .and_then(Value::as_str),
+            Some("sonnet-model")
+        );
+        assert_eq!(
+            env.get("CLAUDE_CODE_SUBAGENT_MODEL")
+                .and_then(Value::as_str),
+            Some("subagent-model")
         );
     }
 
