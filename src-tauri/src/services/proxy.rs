@@ -5750,9 +5750,7 @@ model = "gpt-5.1-codex"
             Some("b-key")
         );
         assert_eq!(
-            backup_env
-                .get("ANTHROPIC_BASE_URL")
-                .and_then(Value::as_str),
+            backup_env.get("ANTHROPIC_BASE_URL").and_then(Value::as_str),
             Some("https://api.b.example")
         );
         assert_eq!(
