@@ -74,6 +74,97 @@ pub fn parse_context_window_suffix(model: &str) -> (&str, Option<u64>) {
     (model, None)
 }
 
+/// 将 env 中旧式模型名后缀迁移到独立的 contextWindows 字段，并清理模型名。
+#[allow(dead_code)]
+pub(crate) fn migrate_legacy_suffix_to_context_windows(
+    settings_config: &mut serde_json::Value,
+) -> bool {
+    const ROLE_KEYS: [&str; 6] = [
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_FABLE_MODEL",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+    ];
+
+    // 先只读扫描，避免同时持有 env 和 contextWindows 的写借用。
+    let pending = {
+        let Some(env) = settings_config.get("env").and_then(Value::as_object) else {
+            return false;
+        };
+        let mut pending: Vec<(&'static str, String, u64)> = Vec::new();
+        for key in ROLE_KEYS {
+            let Some(model) = env.get(key).and_then(Value::as_str) else {
+                continue;
+            };
+            let (slug, window) = parse_context_window_suffix(model);
+            if let Some(window) = window {
+                if slug != model {
+                    pending.push((key, slug.to_string(), window));
+                }
+            }
+        }
+        pending
+    };
+
+    if pending.is_empty() {
+        return false;
+    }
+
+    // contextWindows 已存在但形状非法时不改写任何 env，保持与直接写入逻辑一致。
+    match settings_config.get("contextWindows") {
+        Some(windows) if !windows.is_object() => return false,
+        None => {
+            settings_config["contextWindows"] = json!({});
+        }
+        _ => {}
+    }
+
+    {
+        let Some(env) = settings_config
+            .get_mut("env")
+            .and_then(Value::as_object_mut)
+        else {
+            return false;
+        };
+        for (key, slug, _) in &pending {
+            env.insert(key.to_string(), json!(slug));
+        }
+    }
+
+    let Some(windows) = settings_config
+        .get_mut("contextWindows")
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    for (key, _, window) in pending {
+        windows.insert(key.to_string(), json!(window));
+    }
+    true
+}
+
+/// 优先读取 contextWindows 中的显式值，缺失时回退到模型名后缀。
+#[allow(dead_code)]
+pub(crate) fn resolve_context_window(
+    settings_config: &serde_json::Value,
+    role_env_key: &str,
+) -> Option<u64> {
+    if let Some(w) = settings_config
+        .get("contextWindows")
+        .and_then(|o| o.get(role_env_key))
+        .and_then(Value::as_u64)
+    {
+        return Some(w);
+    }
+    settings_config
+        .get("env")
+        .and_then(|o| o.get(role_env_key))
+        .and_then(Value::as_str)
+        .and_then(|m| parse_context_window_suffix(m).1)
+}
+
 const CURRENT_OPUS_ROUTE_ID: &str = "claude-opus-5";
 const LEGACY_OPUS_ROUTE_ID: &str = "claude-opus-4-8";
 
@@ -2309,5 +2400,35 @@ mod tests {
         assert_eq!(parse_window_token(""), None);
         assert_eq!(parse_window_token("0"), None);
         assert_eq!(parse_window_token("0K"), None);
+    }
+
+    #[test]
+    fn migrate_legacy_suffix_writes_context_windows_and_cleans_model() {
+        let mut config = json!({
+            "env": {
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2[200k]"
+            }
+        });
+        assert!(migrate_legacy_suffix_to_context_windows(&mut config));
+        assert_eq!(config["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"], "glm-5.2");
+        assert_eq!(
+            config["contextWindows"]["ANTHROPIC_DEFAULT_SONNET_MODEL"],
+            200000
+        );
+        assert_eq!(
+            resolve_context_window(&config, "ANTHROPIC_DEFAULT_SONNET_MODEL"),
+            Some(200000)
+        );
+    }
+
+    #[test]
+    fn resolve_context_window_falls_back_to_suffix_then_none() {
+        let config = json!({ "env": { "ANTHROPIC_MODEL": "deepseek[1m]" } });
+        assert_eq!(
+            resolve_context_window(&config, "ANTHROPIC_MODEL"),
+            Some(1000000)
+        );
+        let empty = json!({ "env": {} });
+        assert_eq!(resolve_context_window(&empty, "ANTHROPIC_MODEL"), None);
     }
 }
