@@ -382,20 +382,23 @@ fn handle_settings_change(
         log::warn!("[ClaudeSettingsWatcher] write failed: {e}");
     } else {
         record_last_written(&mut *provider, &writes[0].1, &writes[1].1);
-        if !persist_settings(persist, &provider) {
-            provider.settings_config = previous_settings;
-            *state.lock().expect("settings watcher mutex poisoned") = previous_snapshot;
-        } else {
-            record_processed_state(
-                state,
-                Some(active.model.as_str()),
-                Some(&writes[0].1),
-                Some(&writes[1].1),
-            );
+        record_processed_state(
+            state,
+            Some(active.model.as_str()),
+            Some(&writes[0].1),
+            Some(&writes[1].1),
+        );
+        // live 已写入后若 DB 持久化失败，不能回滚到与文件不一致的账本/state；
+        // 保留新值等下次变化时重试，避免 rename 事件把自动写入误判成用户手改。
+        if persist_settings(persist, &provider) {
             log::info!(
                 "[ClaudeSettingsWatcher] wrote ACW/MAX for model={} window={}",
                 active.model,
                 active.window
+            );
+        } else {
+            log::warn!(
+                "[ClaudeSettingsWatcher] persist failed after live write; keeping ACW/MAX for retry"
             );
         }
     }
@@ -453,20 +456,48 @@ fn record_last_written(provider: &mut Provider, acw: &str, max: &str) {
     );
 }
 
+fn legacy_env_key(key: &str) -> Option<&'static str> {
+    match key {
+        "ACW" => Some("CLAUDE_CODE_AUTO_COMPACT_WINDOW"),
+        "MAX" => Some("CLAUDE_CODE_MAX_CONTEXT_TOKENS"),
+        _ => None,
+    }
+}
+
 fn is_user_explicit(provider: &Provider, key: &str) -> bool {
-    provider
+    let Some(explicit) = provider
         .settings_config
-        .pointer(&format!("/autoSyncState/userExplicit/{key}"))
-        .map_or(false, |value| !value.is_null())
+        .pointer("/autoSyncState/userExplicit")
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    if explicit.get(key).is_some_and(|value| !value.is_null()) {
+        return true;
+    }
+    // 兼容旧账本：完整 env key 出现且不为 false/null 即视为用户显式。
+    legacy_env_key(key).is_some_and(|env_key| {
+        explicit
+            .get(env_key)
+            .is_some_and(|value| !value.is_null() && value.as_bool() != Some(false))
+    })
 }
 
 fn is_auto_source_value(provider: &Provider, key: &str, value: &str) -> bool {
+    let legacy_key = legacy_env_key(key);
     ["lastWritten", "staticInjected"].iter().any(|source| {
-        provider
+        let Some(source_obj) = provider
             .settings_config
-            .pointer(&format!("/autoSyncState/{source}/{key}"))
-            .and_then(Value::as_str)
-            == Some(value)
+            .pointer(&format!("/autoSyncState/{source}"))
+            .and_then(Value::as_object)
+        else {
+            return false;
+        };
+        if source_obj.get(key).and_then(Value::as_str) == Some(value) {
+            return true;
+        }
+        legacy_key
+            .is_some_and(|env_key| source_obj.get(env_key).and_then(Value::as_str) == Some(value))
     })
 }
 
@@ -533,6 +564,17 @@ mod tests {
 
     fn failing_persist() -> Arc<dyn Fn(Value) -> Result<(), String> + Send + Sync> {
         Arc::new(|_| Err("db unavailable".to_string()))
+    }
+
+    fn fail_once_then_succeed_persist() -> Arc<dyn Fn(Value) -> Result<(), String> + Send + Sync> {
+        let failed = Arc::new(AtomicBool::new(false));
+        Arc::new(move |_| {
+            if failed.swap(true, Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err("db unavailable".to_string())
+            }
+        })
     }
 
     // ========== Task 2: 角色映射测试 ==========
@@ -1546,7 +1588,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_settings_change_rolls_back_state_when_persist_fails_after_write() {
+    fn handle_settings_change_keeps_ledger_and_state_when_persist_fails_after_write() {
         use std::fs;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1585,16 +1627,94 @@ mod tests {
         let provider_guard = provider.lock().unwrap();
         assert_eq!(
             provider_guard.settings_config["autoSyncState"]["lastWritten"],
-            json!({ "ACW": "1", "MAX": "2" })
+            json!({ "ACW": "30000", "MAX": "30000" })
         );
         drop(provider_guard);
-        assert_eq!(*state.lock().unwrap(), previous);
-        assert!(should_process(
+        assert_eq!(
+            *state.lock().unwrap(),
+            Some(WatcherSnapshot {
+                model: Some("haiku".to_string()),
+                acw: Some("30000".to_string()),
+                max: Some("30000".to_string()),
+            })
+        );
+        assert!(!should_process(
             &state,
             Some("haiku"),
             Some("30000"),
             Some("30000")
         ));
+    }
+
+    #[test]
+    fn failing_persist_after_write_does_not_mark_next_event_user_explicit() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            json!({
+                "model": "haiku",
+                "env": { "ANTHROPIC_DEFAULT_HAIKU_MODEL": "Kimi-K2.7-Code[30k]" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let provider = Mutex::new(Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "Kimi-K2.7-Code[30k]",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2"
+                },
+                "contextWindows": {
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": 30000,
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": 200000
+                },
+                "autoSyncContextWindow": true,
+                "autoSyncState": { "lastWritten": { "ACW": "1", "MAX": "2" } }
+            }),
+            None,
+        ));
+        let state = Mutex::new(None);
+
+        // 第一次写 live 成功但 DB 持久化失败，必须保留新 live 值/账本/state，
+        // 否则 atomic_write 触发的同名事件会被误判成用户手改。
+        let persist = fail_once_then_succeed_persist();
+        handle_settings_change(&path, &provider, &state, &persist);
+        handle_settings_change(&path, &provider, &state, &persist);
+
+        let provider_guard = provider.lock().unwrap();
+        assert!(provider_guard
+            .settings_config
+            .pointer("/autoSyncState/userExplicit")
+            .is_none());
+        drop(provider_guard);
+
+        // 自动同步仍可继续：后续真实切换 model 仍会写入新窗口，而不是永久停同步。
+        fs::write(
+            &path,
+            json!({
+                "model": "sonnet",
+                "env": { "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        handle_settings_change(&path, &provider, &state, &persist);
+
+        let content = fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "200000");
+        assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "200000");
+        let provider_guard = provider.lock().unwrap();
+        assert!(provider_guard
+            .settings_config
+            .pointer("/autoSyncState/userExplicit")
+            .is_none());
     }
 
     #[test]
@@ -1880,6 +2000,42 @@ mod tests {
         assert!(provider.settings_config["autoSyncState"]["userExplicit"]
             .get("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
             .is_none());
+    }
+
+    #[test]
+    fn watcher_recognizes_legacy_auto_sync_shapes() {
+        let provider = Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "autoSyncState": {
+                    "lastWritten": {
+                        "model": "sonnet",
+                        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "160000",
+                        "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "200000"
+                    },
+                    "staticInjected": {
+                        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "372000",
+                        "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "372000"
+                    },
+                    "userExplicit": {
+                        "legacy": true,
+                        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": true,
+                        "CLAUDE_CODE_MAX_CONTEXT_TOKENS": true
+                    }
+                }
+            }),
+            None,
+        );
+
+        assert!(is_auto_source_value(&provider, "ACW", "160000"));
+        assert!(is_auto_source_value(&provider, "MAX", "200000"));
+        assert!(is_auto_source_value(&provider, "ACW", "372000"));
+        assert!(is_auto_source_value(&provider, "MAX", "372000"));
+        assert!(!is_auto_source_value(&provider, "ACW", "sonnet"));
+        assert!(!is_auto_source_value(&provider, "MAX", "legacy"));
+        assert!(is_user_explicit(&provider, "ACW"));
+        assert!(is_user_explicit(&provider, "MAX"));
     }
 
     #[test]
