@@ -19,10 +19,10 @@ pub(crate) struct ActiveModelWindow {
     pub window: u64,
 }
 
-/// 根据 settings.json 顶层 model 字段和 provider env 配置，
+/// 根据 settings.json 顶层 model 字段和 provider 配置，
 /// 决定要写入 ACW/MAX 的窗口值。
 ///
-/// 返回 None 表示"不写"（model 字段无效 / 角色对应 env 不存在 / env 无后缀）。
+/// 返回 None 表示"不写"（model 字段无效 / 角色无可用窗口 / 无固定兜底窗口）。
 pub(crate) fn resolve_active_model_window(
     settings: &Value,
     provider: &Provider,
@@ -38,32 +38,25 @@ pub(crate) fn resolve_active_model_window(
         "subagent" => "CLAUDE_CODE_SUBAGENT_MODEL",
         _ => return None,
     };
-    // 3. 读 provider env 里对应字段
-    let env_value = provider
-        .settings_config
-        .get("env")
-        .and_then(|e| e.get(env_key))
-        .and_then(Value::as_str)?;
-    // 4. 解析后缀得到窗口
-    // 4. 优先解析后缀；无后缀的 Codex OAuth / Kimi 使用固定兜底窗口，
-    // 仍只在 watcher 观察到模型切换时写入。
+    // 3. 优先读取 contextWindows 显式窗口，其次回退到 env 模型名后缀；
+    // 两者都没有时，保留 Codex OAuth / Kimi 的固定兜底窗口。
     let provider_env = provider
         .settings_config
         .get("env")
         .and_then(Value::as_object);
-    let window = crate::claude_desktop_config::parse_context_window_suffix(env_value)
-        .1
-        .or_else(|| {
-            if provider.is_codex_oauth()
-                && crate::services::provider::provider_env_targets_gpt56(provider_env)
-            {
-                Some(372000)
-            } else if crate::services::provider::is_kimi_for_coding_provider(provider) {
-                Some(262144)
-            } else {
-                None
-            }
-        });
+    let window =
+        crate::claude_desktop_config::resolve_context_window(&provider.settings_config, env_key)
+            .or_else(|| {
+                if provider.is_codex_oauth()
+                    && crate::services::provider::provider_env_targets_gpt56(provider_env)
+                {
+                    Some(372000)
+                } else if crate::services::provider::is_kimi_for_coding_provider(provider) {
+                    Some(262144)
+                } else {
+                    None
+                }
+            });
     window.map(|w| ActiveModelWindow {
         model: model.to_string(),
         window: w,
@@ -403,6 +396,40 @@ mod tests {
         let result = resolve_active_model_window(&settings, &provider).unwrap();
         assert_eq!(result.model, "sonnet");
         assert_eq!(result.window, 262144);
+    }
+
+    #[test]
+    fn resolve_active_model_window_uses_context_windows_without_env_suffix() {
+        let settings = json!({ "model": "sonnet" });
+        let provider = Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "env": { "ANTHROPIC_DEFAULT_SONNET_MODEL": "sonnet-model" },
+                "contextWindows": { "ANTHROPIC_DEFAULT_SONNET_MODEL": 200000 }
+            }),
+            None,
+        );
+        let result = resolve_active_model_window(&settings, &provider).unwrap();
+        assert_eq!(result.model, "sonnet");
+        assert_eq!(result.window, 200000);
+    }
+
+    #[test]
+    fn resolve_active_model_window_context_windows_beats_legacy_suffix() {
+        let settings = json!({ "model": "sonnet" });
+        let provider = Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "env": { "ANTHROPIC_DEFAULT_SONNET_MODEL": "model[200k]" },
+                "contextWindows": { "ANTHROPIC_DEFAULT_SONNET_MODEL": 500000 }
+            }),
+            None,
+        );
+        let result = resolve_active_model_window(&settings, &provider).unwrap();
+        assert_eq!(result.model, "sonnet");
+        assert_eq!(result.window, 500000);
     }
 
     // ========== Task 3: build_env_writes 测试 ==========
