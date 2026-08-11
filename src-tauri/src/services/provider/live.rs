@@ -1032,10 +1032,12 @@ fn strip_injected_model_suffix_context_defaults(settings: &mut Value, provider: 
 }
 
 fn restore_claude_internal_fields_for_backfill(settings: &mut Value, provider: &Provider) {
-    let provider_env = provider
-        .settings_config
-        .get("env")
-        .and_then(Value::as_object);
+    // provider 可能仍只有 legacy 模型后缀，写 live 时 sanitize 会把迁移后的
+    // contextWindows 剥掉；回填时必须基于迁移结果恢复窗口信息。
+    let mut migrated = provider.settings_config.clone();
+    crate::claude_desktop_config::migrate_legacy_suffix_to_context_windows(&mut migrated);
+
+    let provider_env = migrated.get("env").and_then(Value::as_object);
     let live_env = settings.get("env").and_then(Value::as_object);
     let mut restore_models = Vec::new();
     for key in CLAUDE_MODEL_ENV_KEYS {
@@ -1068,7 +1070,7 @@ fn restore_claude_internal_fields_for_backfill(settings: &mut Value, provider: &
     if let Some(value) = provider.settings_config.get("autoSyncCompactRatio") {
         obj.insert("autoSyncCompactRatio".to_string(), value.clone());
     }
-    if let Some(value) = provider.settings_config.get("contextWindows") {
+    if let Some(value) = migrated.get("contextWindows") {
         obj.insert("contextWindows".to_string(), value.clone());
     }
     if let Some(value) = provider.settings_config.get("autoSyncState") {
@@ -3608,6 +3610,31 @@ base_url = "https://a.example/v1"
     }
 
     #[test]
+    fn claude_backfill_migrates_legacy_suffix_only_provider_context_windows() {
+        let db = Database::memory().expect("create memory db");
+        let provider = Provider::with_id(
+            "test".to_string(),
+            "Test".to_string(),
+            json!({ "env": { "ANTHROPIC_MODEL": "fallback-model[1M]" } }),
+            None,
+        );
+
+        // live 写盘时会 sanitize 掉 contextWindows，且模型名已被剥离后缀。
+        let live = sanitize_claude_settings_for_live(
+            &build_effective_settings_with_common_config(&db, &AppType::Claude, &provider)
+                .expect("build effective settings"),
+        );
+        assert!(live.get("contextWindows").is_none());
+        assert_eq!(live["env"]["ANTHROPIC_MODEL"], "fallback-model");
+
+        let backfilled =
+            strip_common_config_from_live_settings(&db, &AppType::Claude, &provider, live);
+        // provider 只有 legacy 后缀时，回填也必须从迁移结果恢复窗口信息。
+        assert_eq!(backfilled["contextWindows"]["ANTHROPIC_MODEL"], 1000000);
+        assert_eq!(backfilled["env"]["ANTHROPIC_MODEL"], "fallback-model");
+    }
+
+    #[test]
     fn claude_backfill_strips_all_legacy_suffixes_from_stored_models() {
         let provider = Provider::with_id(
             "test".to_string(),
@@ -3662,7 +3689,8 @@ base_url = "https://a.example/v1"
             None,
         );
 
-        // 写 live 时四个内部字段都会被 sanitize 移除，切走回填时必须从 provider 恢复。
+        // 写 live 时四个内部字段都会被 sanitize 移除，切走回填时必须从 provider 恢复；
+        // legacy 后缀会迁移出 role-key contextWindows，旧 key 也保留。
         let live = sanitize_claude_settings_for_live(
             &build_effective_settings_with_common_config(&db, &AppType::Claude, &provider)
                 .expect("build effective settings"),
@@ -3682,7 +3710,10 @@ base_url = "https://a.example/v1"
         assert_eq!(backfilled["autoSyncCompactRatio"], json!(0.8));
         assert_eq!(
             backfilled["contextWindows"],
-            json!({ "fallback-model[1M]": 1000000 })
+            json!({
+                "fallback-model[1M]": 1000000,
+                "ANTHROPIC_MODEL": 1000000
+            })
         );
         assert_eq!(backfilled["autoSyncState"], json!({ "lastWritten": {} }));
         assert_eq!(
