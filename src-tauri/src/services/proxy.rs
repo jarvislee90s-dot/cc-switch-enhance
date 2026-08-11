@@ -7076,7 +7076,8 @@ requires_openai_auth = true
 
     #[tokio::test]
     #[serial]
-    async fn restore_live_config_for_app_strips_model_suffixes_from_backup_before_writing_live() {
+    async fn restore_live_config_for_app_inner_strips_model_suffixes_from_backup_before_writing_live(
+    ) {
         let _home = TempHome::new();
         crate::settings::reload_settings().expect("reload settings");
 
@@ -7100,10 +7101,6 @@ requires_openai_auth = true
             .restore_live_config_for_app_inner(&AppType::Claude)
             .await
             .expect("restore claude live");
-        service
-            .restore_live_config_for_app_with_fallback_inner(&AppType::Claude)
-            .await
-            .expect("restore claude live via fallback");
 
         let live = service.read_claude_live().expect("read live");
         let env = live
@@ -7140,7 +7137,7 @@ requires_openai_auth = true
 
     #[test]
     #[serial]
-    fn cleanup_claude_takeover_placeholders_strips_model_suffixes() {
+    fn cleanup_claude_takeover_placeholders_strips_model_suffixes_for_no_backup_fallback() {
         let _home = TempHome::new();
         crate::settings::reload_settings().expect("reload settings");
 
@@ -7161,7 +7158,7 @@ requires_openai_auth = true
         .expect("seed taken-over live file");
 
         service
-            .cleanup_claude_takeover_placeholders_in_live()
+            .cleanup_takeover_placeholders_in_live_for_app(&AppType::Claude)
             .expect("cleanup Claude takeover placeholders");
 
         let live = service.read_claude_live().expect("read live");
