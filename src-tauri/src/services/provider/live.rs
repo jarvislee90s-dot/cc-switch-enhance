@@ -212,6 +212,8 @@ pub(crate) fn sanitize_claude_settings_for_live(settings: &Value) -> Value {
         // 不应泄露到 Claude Code 的 settings.json
         obj.remove("autoSyncContextWindow");
         obj.remove("autoSyncCompactRatio");
+        obj.remove("contextWindows");
+        obj.remove("autoSyncState");
     }
     v
 }
@@ -2817,6 +2819,22 @@ base_url = "https://a.example/v1"
         assert!(sanitized.get("autoSyncCompactRatio").is_none());
         // 其他字段保留
         assert_eq!(sanitized["env"]["ANTHROPIC_MODEL"], json!("test"));
+    }
+
+    #[test]
+    fn sanitize_strips_all_internal_fields() {
+        let settings = json!({
+            "env": {},
+            "autoSyncContextWindow": true,
+            "autoSyncCompactRatio": 0.8,
+            "contextWindows": { "ANTHROPIC_MODEL": 200000 },
+            "autoSyncState": { "lastWritten": {} }
+        });
+        let clean = sanitize_claude_settings_for_live(&settings);
+        let obj = clean.as_object().unwrap();
+        for key in ["autoSyncContextWindow", "autoSyncCompactRatio", "contextWindows", "autoSyncState"] {
+            assert!(!obj.contains_key(key), "{key} leaked into live settings");
+        }
     }
 
     #[test]
