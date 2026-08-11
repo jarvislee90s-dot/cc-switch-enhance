@@ -19,6 +19,14 @@ pub(crate) struct ActiveModelWindow {
     pub window: u64,
 }
 
+/// watcher 防循环用的文件快照：model 或 ACW/MAX 任一变化都视为需要处理。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WatcherSnapshot {
+    model: Option<String>,
+    acw: Option<String>,
+    max: Option<String>,
+}
+
 /// 根据 settings.json 顶层 model 字段和 provider 配置，
 /// 决定要写入 ACW/MAX 的窗口值。
 ///
@@ -88,25 +96,47 @@ pub(crate) fn build_env_writes(window: u64, ratio: f64) -> Vec<(&'static str, St
     ]
 }
 
-/// 检查新事件的 model 字段是否需要处理（与上次不同则处理）。
-/// 这是监听器防循环的核心逻辑：自己写 env 不改 model 字段 → 自动跳过。
-pub(crate) fn should_process(state: &Mutex<Option<String>>, new_model: Option<&str>) -> bool {
+/// 检查新事件的 model + ACW/MAX 是否需要处理（与上次快照不同则处理）。
+/// watcher 写入成功后会把 state 更新为新值，避免自身写入再次触发。
+fn should_process(
+    state: &Mutex<Option<WatcherSnapshot>>,
+    new_model: Option<&str>,
+    new_acw: Option<&str>,
+    new_max: Option<&str>,
+) -> bool {
     let mut guard = state.lock().expect("settings watcher mutex poisoned");
-    let new_model_owned = new_model.map(|s| s.to_string());
-    if *guard == new_model_owned {
+    let next = WatcherSnapshot {
+        model: new_model.map(|s| s.to_string()),
+        acw: new_acw.map(|s| s.to_string()),
+        max: new_max.map(|s| s.to_string()),
+    };
+    if *guard == Some(next.clone()) {
         return false;
     }
-    *guard = new_model_owned;
+    *guard = Some(next);
     true
+}
+
+fn record_processed_state(
+    state: &Mutex<Option<WatcherSnapshot>>,
+    model: Option<&str>,
+    acw: Option<&str>,
+    max: Option<&str>,
+) {
+    *state.lock().expect("settings watcher mutex poisoned") = Some(WatcherSnapshot {
+        model: model.map(|s| s.to_string()),
+        acw: acw.map(|s| s.to_string()),
+        max: max.map(|s| s.to_string()),
+    });
 }
 
 /// Claude Code settings.json 监听器
 ///
 /// 后台线程监听文件变化，根据顶层 model 字段值变化自动同步 ACW/MAX。
 pub struct ClaudeSettingsWatcher {
-    /// 防循环用的"上次见到的 model 字段值"
+    /// 防循环用的"上次见到的 model + ACW/MAX 快照"
     #[allow(dead_code)]
-    state: Arc<Mutex<Option<String>>>,
+    state: Arc<Mutex<Option<WatcherSnapshot>>>,
     /// 关闭信号
     shutdown: Arc<AtomicBool>,
     /// notify debouncer handle（Drop 时自动停止监听）
@@ -124,7 +154,7 @@ impl Drop for ClaudeSettingsWatcher {
 /// 返回的 watcher 在 Drop 时自动停止监听。
 pub(crate) fn spawn_claude_settings_watcher(
     settings_path: PathBuf,
-    provider: Arc<Provider>,
+    provider: Arc<Mutex<Provider>>,
 ) -> Result<ClaudeSettingsWatcher, AppError> {
     let state = Arc::new(Mutex::new(None));
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -132,7 +162,17 @@ pub(crate) fn spawn_claude_settings_watcher(
     // 启动时读一次 settings.json 初始化 state
     if let Ok(content) = std::fs::read_to_string(&settings_path) {
         if let Ok(v) = serde_json::from_str::<Value>(&content) {
-            *state.lock().unwrap() = v.get("model").and_then(Value::as_str).map(String::from);
+            *state.lock().unwrap() = Some(WatcherSnapshot {
+                model: v.get("model").and_then(Value::as_str).map(String::from),
+                acw: v
+                    .pointer("/env/CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+                    .and_then(Value::as_str)
+                    .map(String::from),
+                max: v
+                    .pointer("/env/CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+                    .and_then(Value::as_str)
+                    .map(String::from),
+            });
         }
     }
 
@@ -160,7 +200,7 @@ pub(crate) fn spawn_claude_settings_watcher(
             // 平台（如 macOS FSEvents）可能报告目录级别事件，file_name
             // 过滤会漏掉。
             for _event in events {
-                handle_settings_change(&path_clone, &provider_clone, &state_clone);
+                handle_settings_change(&path_clone, provider_clone.as_ref(), &state_clone);
             }
         },
     )
@@ -210,8 +250,8 @@ pub fn replace_watcher(new: ClaudeSettingsWatcher) {
 /// 处理一次 settings.json 变化
 fn handle_settings_change(
     path: &std::path::Path,
-    provider: &Provider,
-    state: &Mutex<Option<String>>,
+    provider: &Mutex<Provider>,
+    state: &Mutex<Option<WatcherSnapshot>>,
 ) {
     // 1. 读最新内容
     let content = match std::fs::read_to_string(path) {
@@ -229,13 +269,22 @@ fn handle_settings_change(
         }
     };
 
-    // 2. 读 model 字段
     let new_model = v.get("model").and_then(Value::as_str);
+    let new_acw = v
+        .pointer("/env/CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+        .and_then(Value::as_str);
+    let new_max = v
+        .pointer("/env/CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+        .and_then(Value::as_str);
 
-    // 3. 检查 model 字段是否变化（防循环）
-    if !should_process(state, new_model) {
+    // 3. 检查 model / ACW / MAX 任一变化（防循环）
+    if !should_process(state, new_model, new_acw, new_max) {
         return;
     }
+
+    let mut provider = provider
+        .lock()
+        .expect("settings watcher provider mutex poisoned");
 
     // 4. 检查 provider 的 autoSyncContextWindow 开关
     let auto_sync = provider
@@ -254,7 +303,7 @@ fn handle_settings_change(
         .settings_config
         .get("env")
         .and_then(Value::as_object);
-    let static_injection_active = crate::services::provider::is_kimi_for_coding_provider(provider)
+    let static_injection_active = crate::services::provider::is_kimi_for_coding_provider(&provider)
         || (provider.is_codex_oauth()
             && crate::services::provider::provider_env_targets_gpt56(provider_env));
     if static_injection_active {
@@ -266,7 +315,7 @@ fn handle_settings_change(
     }
 
     // 5. 决定要写的窗口值
-    let active = match resolve_active_model_window(&v, provider) {
+    let active = match resolve_active_model_window(&v, &provider) {
         Some(a) => a,
         None => {
             log::debug!("[ClaudeSettingsWatcher] no active model window to write");
@@ -274,8 +323,24 @@ fn handle_settings_change(
         }
     };
 
-    // 6. 写 ACW/MAX
-    let writes = build_env_writes(active.window, provider_compact_ratio(provider));
+    // 6. 写前检测用户手填：先看 userExplicit，再比较 lastWritten/staticInjected。
+    // 发现非自动来源值就记账，并在已有用户显式时完全跳过 watcher 重写。
+    let explicit_acw = new_acw.filter(|value| {
+        !is_user_explicit(&provider, "ACW") && !is_auto_source_value(&provider, "ACW", value)
+    });
+    let explicit_max = new_max.filter(|value| {
+        !is_user_explicit(&provider, "MAX") && !is_auto_source_value(&provider, "MAX", value)
+    });
+    if explicit_acw.is_some() || explicit_max.is_some() {
+        record_user_explicit(&mut *provider, explicit_acw, explicit_max);
+    }
+    if is_user_explicit(&provider, "ACW") || is_user_explicit(&provider, "MAX") {
+        log::debug!("[ClaudeSettingsWatcher] user explicit ACW/MAX, skip rewrite");
+        return;
+    }
+
+    // 7. 生成 ACW/MAX 并做写前二次校验，避免覆盖并发修改。
+    let writes = build_env_writes(active.window, provider_compact_ratio(&provider));
     let new_content = match update_env_fields(&content, &writes) {
         Ok(c) => c,
         Err(e) => {
@@ -283,16 +348,96 @@ fn handle_settings_change(
             return;
         }
     };
+    if let Err(e) = verify_file_unchanged(path, &content) {
+        log::warn!("[ClaudeSettingsWatcher] concurrent change, skip write: {e}");
+        return;
+    }
+
     // 使用原子写入（临时文件 + rename），避免 Claude Code 在写入期间
-    // 读到截断后的空文件或残缺 JSON
+    // 读到截断后的空文件或残缺 JSON；写入成功后才更新 lastWritten。
     if let Err(e) = crate::config::atomic_write(path, new_content.as_bytes()) {
         log::warn!("[ClaudeSettingsWatcher] write failed: {e}");
     } else {
+        record_last_written(&mut *provider, &writes[0].1, &writes[1].1);
+        record_processed_state(
+            state,
+            Some(active.model.as_str()),
+            Some(&writes[0].1),
+            Some(&writes[1].1),
+        );
         log::info!(
             "[ClaudeSettingsWatcher] wrote ACW/MAX for model={} window={}",
             active.model,
             active.window
         );
+    }
+}
+
+fn record_user_explicit(provider: &mut Provider, acw: Option<&str>, max: Option<&str>) {
+    let Some(obj) = provider.settings_config.as_object_mut() else {
+        return;
+    };
+    let state = obj
+        .entry("autoSyncState".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !state.is_object() {
+        *state = serde_json::json!({});
+    }
+    let state = state.as_object_mut().expect("autoSyncState object");
+    let explicit = state
+        .entry("userExplicit".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !explicit.is_object() {
+        *explicit = serde_json::json!({});
+    }
+    let explicit = explicit.as_object_mut().expect("userExplicit object");
+    if let Some(value) = acw {
+        explicit.insert("ACW".to_string(), Value::String(value.to_string()));
+    }
+    if let Some(value) = max {
+        explicit.insert("MAX".to_string(), Value::String(value.to_string()));
+    }
+}
+
+fn record_last_written(provider: &mut Provider, acw: &str, max: &str) {
+    let Some(obj) = provider.settings_config.as_object_mut() else {
+        return;
+    };
+    let state = obj
+        .entry("autoSyncState".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !state.is_object() {
+        *state = serde_json::json!({});
+    }
+    state.as_object_mut().expect("autoSyncState object").insert(
+        "lastWritten".to_string(),
+        serde_json::json!({ "ACW": acw, "MAX": max }),
+    );
+}
+
+fn is_user_explicit(provider: &Provider, key: &str) -> bool {
+    provider
+        .settings_config
+        .pointer(&format!("/autoSyncState/userExplicit/{key}"))
+        .map_or(false, |value| !value.is_null())
+}
+
+fn is_auto_source_value(provider: &Provider, key: &str, value: &str) -> bool {
+    ["lastWritten", "staticInjected"].iter().any(|source| {
+        provider
+            .settings_config
+            .pointer(&format!("/autoSyncState/{source}/{key}"))
+            .and_then(Value::as_str)
+            == Some(value)
+    })
+}
+
+fn verify_file_unchanged(path: &std::path::Path, expected: &str) -> Result<(), String> {
+    let current = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    if current == expected {
+        Ok(())
+    } else {
+        Err("settings.json changed between read and write".to_string())
     }
 }
 
@@ -313,7 +458,7 @@ fn update_env_fields(content: &str, writes: &[(&'static str, String)]) -> Result
     for (key, value) in writes {
         env_obj.insert((*key).to_string(), Value::String(value.clone()));
     }
-    serde_json::to_string(&v).map_err(|e| e.to_string())
+    serde_json::to_string_pretty(&v).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -655,46 +800,50 @@ mod tests {
     #[test]
     fn loop_same_model_consecutive_triggers() {
         let state = Mutex::new(None);
-        assert!(should_process(&state, Some("haiku")));
-        assert!(!should_process(&state, Some("haiku")));
-        assert!(!should_process(&state, Some("haiku")));
+        assert!(should_process(&state, Some("haiku"), None, None));
+        assert!(!should_process(&state, Some("haiku"), None, None));
+        assert!(!should_process(&state, Some("haiku"), None, None));
     }
 
     #[test]
     fn loop_two_models_alternating() {
         let state = Mutex::new(None);
-        assert!(should_process(&state, Some("haiku")));
-        assert!(should_process(&state, Some("sonnet")));
-        assert!(should_process(&state, Some("haiku")));
-        assert!(should_process(&state, Some("sonnet")));
+        assert!(should_process(&state, Some("haiku"), None, None));
+        assert!(should_process(&state, Some("sonnet"), None, None));
+        assert!(should_process(&state, Some("haiku"), None, None));
+        assert!(should_process(&state, Some("sonnet"), None, None));
     }
 
     #[test]
     fn loop_model_to_none_to_same() {
         let state = Mutex::new(None);
-        assert!(should_process(&state, Some("haiku")));
-        assert!(should_process(&state, None)); // model 被删
-        assert!(should_process(&state, Some("haiku"))); // 重新出现
+        assert!(should_process(&state, Some("haiku"), None, None));
+        assert!(should_process(&state, None, None, None)); // model 被删
+        assert!(should_process(&state, Some("haiku"), None, None)); // 重新出现
     }
 
     #[test]
     fn loop_model_to_none_stays_none() {
         let state = Mutex::new(None);
-        assert!(should_process(&state, Some("haiku")));
-        assert!(should_process(&state, None));
+        assert!(should_process(&state, Some("haiku"), None, None));
+        assert!(should_process(&state, None, None, None));
         // 后续 None 事件都算"无变化" → 跳过
-        assert!(!should_process(&state, None));
-        assert!(!should_process(&state, None));
+        assert!(!should_process(&state, None, None, None));
+        assert!(!should_process(&state, None, None, None));
     }
 
     #[test]
     fn loop_initial_state_with_existing_model() {
         // 启动时 model 已经是 "haiku"（如上次会话留下的）
-        let state = Mutex::new(Some("haiku".to_string()));
+        let state = Mutex::new(Some(WatcherSnapshot {
+            model: Some("haiku".to_string()),
+            acw: None,
+            max: None,
+        }));
         // 第一次触发就是 haiku → 跳过（不算变化）
-        assert!(!should_process(&state, Some("haiku")));
+        assert!(!should_process(&state, Some("haiku"), None, None));
         // 切到别的 → 处理
-        assert!(should_process(&state, Some("sonnet")));
+        assert!(should_process(&state, Some("sonnet"), None, None));
     }
 
     // ========== Task 6: 文件系统集成测试 ==========
@@ -764,7 +913,7 @@ mod tests {
         });
         fs::write(&path, initial.to_string()).unwrap();
 
-        let provider = Arc::new(Provider::with_id(
+        let provider = Arc::new(Mutex::new(Provider::with_id(
             "p".to_string(),
             "P".to_string(),
             json!({
@@ -774,7 +923,7 @@ mod tests {
                 "autoSyncContextWindow":true
             }),
             None,
-        ));
+        )));
 
         let watcher = spawn_claude_settings_watcher(path.clone(), provider).unwrap();
 
@@ -819,7 +968,7 @@ mod tests {
         });
         fs::write(&path, initial.to_string()).unwrap();
 
-        let provider = Arc::new(Provider::with_id(
+        let provider = Arc::new(Mutex::new(Provider::with_id(
             "p".to_string(),
             "P".to_string(),
             json!({
@@ -831,7 +980,7 @@ mod tests {
                 "autoSyncCompactRatio": 0.5
             }),
             None,
-        ));
+        )));
 
         let watcher = spawn_claude_settings_watcher(path.clone(), provider).unwrap();
 
@@ -873,7 +1022,7 @@ mod tests {
         });
         fs::write(&path, initial.to_string()).unwrap();
 
-        let provider = Provider::with_id(
+        let provider = Mutex::new(Provider::with_id(
             "kimi".to_string(),
             "Kimi For Coding".to_string(),
             json!({
@@ -886,7 +1035,7 @@ mod tests {
                 "autoSyncState": { "staticInjected": { "ACW": "262144", "MAX": "262144" } }
             }),
             None,
-        );
+        ));
 
         let state = Mutex::new(None);
         handle_settings_change(&path, &provider, &state);
@@ -914,7 +1063,7 @@ mod tests {
         });
         fs::write(&path, initial.to_string()).unwrap();
 
-        let mut provider = Provider::with_id(
+        let provider = Mutex::new(Provider::with_id(
             "codex-oauth".to_string(),
             "Codex".to_string(),
             json!({
@@ -924,8 +1073,8 @@ mod tests {
                 "autoSyncState": { "staticInjected": { "ACW": "372000", "MAX": "372000" } }
             }),
             None,
-        );
-        provider.meta = Some(crate::provider::ProviderMeta {
+        ));
+        provider.lock().unwrap().meta = Some(crate::provider::ProviderMeta {
             provider_type: Some("codex_oauth".to_string()),
             ..Default::default()
         });
@@ -948,14 +1097,12 @@ mod tests {
         let initial = json!({
             "model": "haiku",
             "env": {
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-5.5-mini",
-                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "111111",
-                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "222222"
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-5.5-mini"
             }
         });
         fs::write(&path, initial.to_string()).unwrap();
 
-        let mut provider = Provider::with_id(
+        let provider = Mutex::new(Provider::with_id(
             "codex-oauth-non-gpt56".to_string(),
             "Codex Non-GPT56".to_string(),
             json!({
@@ -968,14 +1115,18 @@ mod tests {
                 "autoSyncCompactRatio": 0.8
             }),
             None,
-        );
-        provider.meta = Some(crate::provider::ProviderMeta {
+        ));
+        provider.lock().unwrap().meta = Some(crate::provider::ProviderMeta {
             provider_type: Some("codex_oauth".to_string()),
             ..Default::default()
         });
 
         // 模拟 model 从 sonnet 切到 haiku，且 provider 不触发 gpt-5.6 静态注入。
-        let state = Mutex::new(Some("sonnet".to_string()));
+        let state = Mutex::new(Some(WatcherSnapshot {
+            model: Some("sonnet".to_string()),
+            acw: None,
+            max: None,
+        }));
         handle_settings_change(&path, &provider, &state);
 
         let content = fs::read_to_string(&path).unwrap();
@@ -998,9 +1149,9 @@ mod tests {
         });
         fs::write(&path, initial.to_string()).unwrap();
 
-        let provider = Arc::new(make_provider(json!({
+        let provider = Arc::new(Mutex::new(make_provider(json!({
             "ANTHROPIC_DEFAULT_SONNET_MODEL":"MiniMax-M3[1M]","ANTHROPIC_DEFAULT_HAIKU_MODEL":"Kimi-K2.7-Code[30k]"
-        })));
+        }))));
 
         let watcher = spawn_claude_settings_watcher(path.clone(), provider).unwrap();
 
@@ -1031,9 +1182,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nonexistent.json");
 
-        let provider = Arc::new(make_provider(json!({
+        let provider = Arc::new(Mutex::new(make_provider(json!({
             "ANTHROPIC_DEFAULT_SONNET_MODEL":"MiniMax-M3[1M]","ANTHROPIC_DEFAULT_HAIKU_MODEL":"Kimi-K2.7-Code[30k]"
-        })));
+        }))));
 
         let result = spawn_claude_settings_watcher(path, provider);
         // 文件不存在 → 应该出错（watch 失败）
@@ -1066,7 +1217,7 @@ mod tests {
         });
         fs::write(&path, initial.to_string()).unwrap();
 
-        let provider = Arc::new(Provider::with_id(
+        let provider = Arc::new(Mutex::new(Provider::with_id(
             "p".to_string(),
             "P".to_string(),
             json!({
@@ -1077,7 +1228,7 @@ mod tests {
                 "autoSyncContextWindow":true
             }),
             None,
-        ));
+        )));
 
         // 模拟 production 调用：spawn 后立即存进进程单例，不保留局部绑定。
         // spawned 在这里 move 进 replace_watcher，没有局部变量持有 watcher。
@@ -1124,7 +1275,7 @@ mod tests {
         fs::write(&path, initial.to_string()).unwrap();
 
         // provider 显式关闭 autoSyncContextWindow
-        let provider = Arc::new(Provider::with_id(
+        let provider = Arc::new(Mutex::new(Provider::with_id(
             "p".to_string(),
             "P".to_string(),
             json!({
@@ -1135,7 +1286,7 @@ mod tests {
                 "autoSyncContextWindow": false
             }),
             None,
-        ));
+        )));
 
         let spawned = spawn_claude_settings_watcher(path.clone(), provider).unwrap();
         replace_watcher(spawned);
@@ -1188,7 +1339,7 @@ mod tests {
         });
         fs::write(&path, initial.to_string()).unwrap();
 
-        let provider = Arc::new(Provider::with_id(
+        let provider = Arc::new(Mutex::new(Provider::with_id(
             "p".to_string(),
             "P".to_string(),
             json!({
@@ -1199,7 +1350,7 @@ mod tests {
                 "autoSyncContextWindow":true
             }),
             None,
-        ));
+        )));
 
         let spawned = spawn_claude_settings_watcher(path.clone(), provider).unwrap();
         replace_watcher(spawned);
@@ -1221,5 +1372,178 @@ mod tests {
         assert_eq!(v["model"], "haiku");
         assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "30000");
         assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "30000");
+    }
+
+    // ========== Task 6: pretty、记账、用户显式、二次校验 ==========
+
+    #[test]
+    fn watcher_writes_use_pretty_json_and_update_last_written_on_success() {
+        let content = r#"{"model":"sonnet","env":{}}"#;
+        let writes = build_env_writes(200000, 0.8);
+        let next = update_env_fields(content, &writes).unwrap();
+        assert!(next.contains('\n'), "expected pretty JSON");
+        let v: Value = serde_json::from_str(&next).unwrap();
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "160000");
+        assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "200000");
+    }
+
+    #[test]
+    fn should_process_tracks_acw_max_changes() {
+        let state = Mutex::new(None);
+        assert!(should_process(
+            &state,
+            Some("sonnet"),
+            Some("160000"),
+            Some("200000")
+        ));
+        assert!(!should_process(
+            &state,
+            Some("sonnet"),
+            Some("160000"),
+            Some("200000")
+        ));
+        assert!(should_process(
+            &state,
+            Some("sonnet"),
+            Some("250000"),
+            Some("250000")
+        ));
+        assert!(!should_process(
+            &state,
+            Some("sonnet"),
+            Some("250000"),
+            Some("250000")
+        ));
+    }
+
+    #[test]
+    fn handle_settings_change_records_last_written_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let initial = json!({
+            "model": "sonnet",
+            "env": { "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2" }
+        });
+        std::fs::write(&path, initial.to_string()).unwrap();
+
+        let provider = Mutex::new(Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "env": { "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2" },
+                "contextWindows": { "ANTHROPIC_DEFAULT_SONNET_MODEL": 200000 },
+                "autoSyncContextWindow": true,
+                "autoSyncCompactRatio": 0.8,
+                "autoSyncState": { "lastWritten": {} }
+            }),
+            None,
+        ));
+        let state = Mutex::new(None);
+
+        handle_settings_change(&path, &provider, &state);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "160000");
+        assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "200000");
+        let provider_guard = provider.lock().unwrap();
+        assert_eq!(
+            provider_guard.settings_config["autoSyncState"]["lastWritten"],
+            json!({ "ACW": "160000", "MAX": "200000" })
+        );
+    }
+
+    #[test]
+    fn handle_settings_change_keeps_last_written_when_update_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let initial = json!({
+            "model": "sonnet",
+            "env": []
+        });
+        std::fs::write(&path, initial.to_string()).unwrap();
+
+        let provider = Mutex::new(Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "env": { "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2" },
+                "contextWindows": { "ANTHROPIC_DEFAULT_SONNET_MODEL": 200000 },
+                "autoSyncContextWindow": true,
+                "autoSyncState": { "lastWritten": { "ACW": "1", "MAX": "2" } }
+            }),
+            None,
+        ));
+        let state = Mutex::new(None);
+
+        handle_settings_change(&path, &provider, &state);
+
+        let provider_guard = provider.lock().unwrap();
+        assert_eq!(
+            provider_guard.settings_config["autoSyncState"]["lastWritten"],
+            json!({ "ACW": "1", "MAX": "2" })
+        );
+    }
+
+    #[test]
+    fn handle_settings_change_records_user_explicit_and_skips_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let initial = json!({
+            "model": "sonnet",
+            "env": {
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2",
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "250000",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "250000"
+            }
+        });
+        std::fs::write(&path, initial.to_string()).unwrap();
+
+        let provider = Mutex::new(Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "env": { "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2" },
+                "contextWindows": { "ANTHROPIC_DEFAULT_SONNET_MODEL": 200000 },
+                "autoSyncContextWindow": true,
+                "autoSyncCompactRatio": 0.8,
+                "autoSyncState": {
+                    "lastWritten": { "ACW": "160000", "MAX": "200000" }
+                }
+            }),
+            None,
+        ));
+        let state = Mutex::new(None);
+
+        handle_settings_change(&path, &provider, &state);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "250000");
+        assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "250000");
+
+        let provider_guard = provider.lock().unwrap();
+        assert_eq!(
+            provider_guard.settings_config["autoSyncState"]["userExplicit"]["ACW"],
+            json!("250000")
+        );
+        assert_eq!(
+            provider_guard.settings_config["autoSyncState"]["userExplicit"]["MAX"],
+            json!("250000")
+        );
+        assert_eq!(
+            provider_guard.settings_config["autoSyncState"]["lastWritten"],
+            json!({ "ACW": "160000", "MAX": "200000" })
+        );
+    }
+
+    #[test]
+    fn verify_file_unchanged_detects_concurrent_modification() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "first").unwrap();
+        assert!(verify_file_unchanged(&path, "first").is_ok());
+        std::fs::write(&path, "second").unwrap();
+        assert!(verify_file_unchanged(&path, "first").is_err());
     }
 }

@@ -901,7 +901,7 @@ pub(crate) fn build_effective_settings_with_common_config(
             }
         }
         if settings_path.parent().map(|p| p.exists()).unwrap_or(false) {
-            let provider_arc = std::sync::Arc::new(provider.clone());
+            let provider_arc = std::sync::Arc::new(std::sync::Mutex::new(provider.clone()));
             match crate::claude_settings_watcher::spawn_claude_settings_watcher(
                 settings_path,
                 provider_arc,
