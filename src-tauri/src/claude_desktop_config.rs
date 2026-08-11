@@ -140,7 +140,9 @@ pub(crate) fn migrate_legacy_suffix_to_context_windows(
         return false;
     };
     for (key, _, window) in pending {
-        windows.insert(key.to_string(), json!(window));
+        if !windows.contains_key(key) {
+            windows.insert(key.to_string(), json!(window));
+        }
     }
     true
 }
@@ -2419,6 +2421,21 @@ mod tests {
             resolve_context_window(&config, "ANTHROPIC_DEFAULT_SONNET_MODEL"),
             Some(200000)
         );
+    }
+
+    #[test]
+    fn migrate_legacy_suffix_preserves_explicit_context_window() {
+        let mut config = json!({
+            "env": {
+                "ANTHROPIC_MODEL": "model[200k]"
+            },
+            "contextWindows": {
+                "ANTHROPIC_MODEL": 500000
+            }
+        });
+        assert!(migrate_legacy_suffix_to_context_windows(&mut config));
+        assert_eq!(config["env"]["ANTHROPIC_MODEL"], "model");
+        assert_eq!(config["contextWindows"]["ANTHROPIC_MODEL"], 500000);
     }
 
     #[test]
