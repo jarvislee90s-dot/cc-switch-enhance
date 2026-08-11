@@ -5684,11 +5684,76 @@ model = "gpt-5.1-codex"
             .await
             .expect("get live backup")
             .expect("backup exists");
-        // apply_context_window_defaults injects ACW=80%/MAX from the [1M]/[1m] suffixes
-        // 切换 provider 不再自动注入 ACW/MAX，只在终端模型切换时由 watcher 写入
-        let expected = provider_b.settings_config.clone();
-        let expected = serde_json::to_string(&expected).expect("serialize");
-        assert_eq!(backup.original_config, expected);
+        // 热切换备份保存 effective settings：迁移后的 contextWindows、注入的
+        // ACW/MAX、staticInjected，以及被清理的模型名，供接管释放后回填。
+        let backup_config: Value =
+            serde_json::from_str(&backup.original_config).expect("parse backup config");
+        let backup_env = backup_config
+            .get("env")
+            .and_then(Value::as_object)
+            .expect("backup env object");
+
+        assert_eq!(
+            backup_config["contextWindows"]["ANTHROPIC_DEFAULT_SONNET_MODEL"],
+            json!(1_000_000)
+        );
+        assert_eq!(
+            backup_config["contextWindows"]["ANTHROPIC_DEFAULT_OPUS_MODEL"],
+            json!(1_000_000)
+        );
+        assert_eq!(
+            backup_config["contextWindows"]["CLAUDE_CODE_SUBAGENT_MODEL"],
+            json!(1_000_000)
+        );
+
+        assert_eq!(
+            backup_env
+                .get("ANTHROPIC_DEFAULT_SONNET_MODEL")
+                .and_then(Value::as_str),
+            Some("deepseek-v4-pro")
+        );
+        assert_eq!(
+            backup_env
+                .get("ANTHROPIC_DEFAULT_OPUS_MODEL")
+                .and_then(Value::as_str),
+            Some("deepseek-v4-ultra")
+        );
+
+        let expected_writes = crate::claude_settings_watcher::build_env_writes(
+            1_000_000,
+            crate::claude_settings_watcher::provider_compact_ratio(&provider_b),
+        );
+        for (key, value) in expected_writes {
+            assert_eq!(
+                backup_env.get(key).and_then(Value::as_str),
+                Some(value.as_str()),
+                "backup should carry injected {key}"
+            );
+        }
+        assert_eq!(
+            backup_config["autoSyncState"]["staticInjected"]["ACW"],
+            json!("1000000")
+        );
+        assert_eq!(
+            backup_config["autoSyncState"]["staticInjected"]["MAX"],
+            json!("1000000")
+        );
+
+        assert_eq!(
+            backup_env.get("ANTHROPIC_API_KEY").and_then(Value::as_str),
+            Some("b-key")
+        );
+        assert_eq!(
+            backup_env
+                .get("ANTHROPIC_BASE_URL")
+                .and_then(Value::as_str),
+            Some("https://api.b.example")
+        );
+        assert_eq!(
+            backup_config.get("permissions"),
+            provider_b.settings_config.get("permissions"),
+            "non-internal provider fields should remain in the effective backup"
+        );
     }
 
     #[tokio::test]
