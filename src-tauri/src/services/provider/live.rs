@@ -3,6 +3,7 @@
 //! Handles reading and writing live configuration files for Claude, Codex, and Gemini.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use toml_edit::{DocumentMut, Item, TableLike};
@@ -852,6 +853,29 @@ fn apply_common_config_to_settings(
     }
 }
 
+fn merge_watcher_auto_sync_state(stored_settings: &mut Value, watcher_settings: &Value) {
+    let Some(watcher_state) = watcher_settings.get("autoSyncState") else {
+        return;
+    };
+    let Some(stored_obj) = stored_settings.as_object_mut() else {
+        return;
+    };
+    let stored_state = stored_obj
+        .entry("autoSyncState".to_string())
+        .or_insert_with(|| json!({}));
+    if !stored_state.is_object() {
+        *stored_state = json!({});
+    }
+    json_deep_merge(stored_state, watcher_state);
+}
+
+/// watcher 应使用写入 live 时的 effective settings 快照，而不是原始 provider 配置。
+fn watcher_provider_from_effective(provider: &Provider, effective_settings: &Value) -> Provider {
+    let mut watcher_provider = provider.clone();
+    watcher_provider.settings_config = effective_settings.clone();
+    watcher_provider
+}
+
 fn claude_watcher_persist_callback(
     db: &Database,
     app_type: &AppType,
@@ -872,10 +896,23 @@ fn claude_watcher_persist_callback(
             return Err("cannot persist watcher state to in-memory database".to_string());
         };
         let conn = rusqlite::Connection::open(db_path).map_err(|e| e.to_string())?;
+        // watcher 线程可能与应用主连接并发写同一 DB，避免立刻 SQLITE_BUSY 失败。
+        conn.busy_timeout(Duration::from_secs(5))
+            .map_err(|e| format!("set watcher DB busy_timeout: {e}"))?;
         let db = Database {
             conn: std::sync::Mutex::new(conn),
         };
-        db.update_provider_settings_config(&app_type_str, &provider_id, &settings)
+        let Some(stored) = db
+            .get_provider_by_id(&provider_id, &app_type_str)
+            .map_err(|e| e.to_string())?
+        else {
+            return Err(format!(
+                "provider {provider_id} not found while persisting watcher state"
+            ));
+        };
+        let mut stored_settings = stored.settings_config;
+        merge_watcher_auto_sync_state(&mut stored_settings, &settings);
+        db.update_provider_settings_config(&app_type_str, &provider_id, &stored_settings)
             .map_err(|e| e.to_string())
     })
 }
@@ -930,7 +967,8 @@ pub(crate) fn build_effective_settings_with_common_config(
         }
         if settings_path.parent().map(|p| p.exists()).unwrap_or(false) {
             let persist = claude_watcher_persist_callback(db, app_type, &provider.id);
-            let provider_arc = std::sync::Arc::new(std::sync::Mutex::new(provider.clone()));
+            let watcher_provider = watcher_provider_from_effective(provider, &effective_settings);
+            let provider_arc = std::sync::Arc::new(std::sync::Mutex::new(watcher_provider));
             match crate::claude_settings_watcher::spawn_claude_settings_watcher(
                 settings_path,
                 provider_arc,
@@ -2372,6 +2410,46 @@ mod tests {
     }
 
     #[test]
+    fn watcher_provider_snapshot_uses_effective_settings_and_keeps_provider_fields() {
+        let mut provider = Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({ "env": { "ANTHROPIC_MODEL": "raw-model" } }),
+            Some("https://example.com".to_string()),
+        );
+        provider.meta = Some(crate::provider::ProviderMeta {
+            provider_type: Some("codex_oauth".to_string()),
+            ..Default::default()
+        });
+        let effective = json!({
+            "env": {
+                "ANTHROPIC_MODEL": "gpt-5.6",
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "372000",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "372000"
+            },
+            "autoSyncState": { "staticInjected": { "ACW": "372000", "MAX": "372000" } }
+        });
+
+        let snapshot = watcher_provider_from_effective(&provider, &effective);
+
+        assert_eq!(snapshot.id, "p");
+        assert_eq!(snapshot.name, "P");
+        assert_eq!(snapshot.website_url.as_deref(), Some("https://example.com"));
+        assert_eq!(
+            snapshot
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.provider_type.as_deref()),
+            Some("codex_oauth")
+        );
+        assert_eq!(snapshot.settings_config, effective);
+        assert_eq!(
+            provider.settings_config["env"]["ANTHROPIC_MODEL"],
+            "raw-model"
+        );
+    }
+
+    #[test]
     #[serial]
     fn claude_watcher_persist_callback_writes_auto_sync_state_to_db() {
         let _home = TempHome::new();
@@ -2400,6 +2478,72 @@ mod tests {
         assert_eq!(
             stored.settings_config["autoSyncState"]["userExplicit"],
             json!({ "ACW": "1", "MAX": "2" })
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn claude_watcher_persist_callback_merges_only_auto_sync_state_into_db() {
+        let _home = TempHome::new();
+        let db = Database::init().expect("file database");
+        let provider = Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_AUTH_TOKEN": "db-token",
+                    "ANTHROPIC_MODEL": "db-model"
+                },
+                "autoSyncContextWindow": true,
+                "contextWindows": { "ANTHROPIC_DEFAULT_SONNET_MODEL": 200000 },
+                "autoSyncState": {
+                    "extraState": { "keep": true },
+                    "lastWritten": { "ACW": "1", "MAX": "2" }
+                }
+            }),
+            None,
+        );
+        db.save_provider(AppType::Claude.as_str(), &provider)
+            .expect("save provider");
+        let persist = claude_watcher_persist_callback(&db, &AppType::Claude, &provider.id);
+        let watcher_settings = json!({
+            "env": {
+                "ANTHROPIC_AUTH_TOKEN": "stale-token",
+                "ANTHROPIC_MODEL": "stale-model"
+            },
+            "autoSyncContextWindow": false,
+            "contextWindows": {},
+            "autoSyncState": {
+                "lastWritten": { "ACW": "160000", "MAX": "200000" },
+                "userExplicit": {}
+            }
+        });
+        persist(watcher_settings).expect("persist settings");
+        let stored = db
+            .get_provider_by_id("p", AppType::Claude.as_str())
+            .expect("get provider")
+            .expect("stored provider exists");
+        assert_eq!(
+            stored.settings_config["env"]["ANTHROPIC_AUTH_TOKEN"],
+            "db-token"
+        );
+        assert_eq!(stored.settings_config["env"]["ANTHROPIC_MODEL"], "db-model");
+        assert_eq!(stored.settings_config["autoSyncContextWindow"], json!(true));
+        assert_eq!(
+            stored.settings_config["contextWindows"]["ANTHROPIC_DEFAULT_SONNET_MODEL"],
+            200000
+        );
+        assert_eq!(
+            stored.settings_config["autoSyncState"]["lastWritten"],
+            json!({ "ACW": "160000", "MAX": "200000" })
+        );
+        assert_eq!(
+            stored.settings_config["autoSyncState"]["userExplicit"],
+            json!({})
+        );
+        assert_eq!(
+            stored.settings_config["autoSyncState"]["extraState"],
+            json!({ "keep": true })
         );
     }
 
