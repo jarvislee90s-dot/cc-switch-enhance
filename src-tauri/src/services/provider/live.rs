@@ -1172,6 +1172,116 @@ fn strip_injected_model_suffix_context_defaults(settings: &mut Value, provider: 
     }
 }
 
+const CLAUDE_BACKFILL_CONTEXT_KEYS: [(&str, &str); 2] = [
+    ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "ACW"),
+    ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "MAX"),
+];
+
+fn auto_sync_ledger_value_relevant(value: &Value) -> bool {
+    !value.is_null() && value.as_bool() != Some(false)
+}
+
+fn auto_sync_state_has_context_ledger(state: &serde_json::Map<String, Value>) -> bool {
+    ["userExplicit", "lastWritten", "staticInjected"]
+        .iter()
+        .any(|source| {
+            state
+                .get(*source)
+                .and_then(Value::as_object)
+                .is_some_and(|source_obj| {
+                    CLAUDE_BACKFILL_CONTEXT_KEYS
+                        .iter()
+                        .any(|(env_key, short_key)| {
+                            source_obj
+                                .get(*short_key)
+                                .is_some_and(auto_sync_ledger_value_relevant)
+                                || source_obj
+                                    .get(*env_key)
+                                    .is_some_and(auto_sync_ledger_value_relevant)
+                        })
+                })
+        })
+}
+
+fn backfill_user_explicit_value(
+    state: &serde_json::Map<String, Value>,
+    short_key: &str,
+    env_key: &str,
+    live_value: &str,
+) -> bool {
+    let Some(explicit) = state.get("userExplicit").and_then(Value::as_object) else {
+        return false;
+    };
+    if let Some(value) = explicit.get(short_key) {
+        if value.is_null() {
+            return false;
+        }
+        // 短键新账本保存实际字符串；旧形状允许 true/null 之外的标记兜底。
+        return value.as_str() == Some(live_value) || !value.is_string();
+    }
+    if let Some(value) = explicit.get(env_key) {
+        if value.is_null() || value.as_bool() == Some(false) {
+            return false;
+        }
+        return value.as_bool() == Some(true) || value.as_str() == Some(live_value);
+    }
+    false
+}
+
+fn backfill_auto_source_value(
+    state: &serde_json::Map<String, Value>,
+    short_key: &str,
+    env_key: &str,
+    live_value: &str,
+) -> bool {
+    ["lastWritten", "staticInjected"].iter().any(|source| {
+        state
+            .get(*source)
+            .and_then(Value::as_object)
+            .is_some_and(|source_obj| {
+                source_obj.get(short_key).and_then(Value::as_str) == Some(live_value)
+                    || source_obj.get(env_key).and_then(Value::as_str) == Some(live_value)
+            })
+    })
+}
+
+fn strip_legacy_context_defaults_for_backfill(settings: &mut Value, provider: &Provider) {
+    strip_injected_codex_oauth_context_defaults(settings, provider);
+    strip_injected_kimi_for_coding_context_defaults(settings, provider);
+    strip_injected_model_suffix_context_defaults(settings, provider);
+}
+
+/// 优先按 autoSyncState 三来源判定：userExplicit 保留，lastWritten/staticInjected
+/// 匹配时删除。无账本或账本没有 ACW/MAX 记录时退回旧的窗口剥离逻辑。
+fn strip_auto_synced_context_defaults(settings: &mut Value, provider: &Provider) {
+    let Some(state) = provider
+        .settings_config
+        .get("autoSyncState")
+        .and_then(Value::as_object)
+    else {
+        strip_legacy_context_defaults_for_backfill(settings, provider);
+        return;
+    };
+    if !auto_sync_state_has_context_ledger(state) {
+        strip_legacy_context_defaults_for_backfill(settings, provider);
+        return;
+    }
+    let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for (env_key, short_key) in CLAUDE_BACKFILL_CONTEXT_KEYS {
+        let Some(live_value) = env.get(env_key).and_then(Value::as_str) else {
+            continue;
+        };
+        if backfill_user_explicit_value(state, short_key, env_key, live_value) {
+            continue;
+        }
+        if backfill_auto_source_value(state, short_key, env_key, live_value) {
+            env.remove(env_key);
+        }
+    }
+}
+
 fn restore_claude_internal_fields_for_backfill(settings: &mut Value, provider: &Provider) {
     // provider 可能仍只有 legacy 模型后缀，写 live 时 sanitize 会把迁移后的
     // contextWindows 剥掉；回填时必须基于迁移结果恢复窗口信息。
@@ -1226,10 +1336,8 @@ fn restore_live_settings_for_provider_backfill(
 ) -> Value {
     if matches!(app_type, AppType::Claude) {
         let mut settings = live_settings;
-        strip_injected_codex_oauth_context_defaults(&mut settings, provider);
-        strip_injected_kimi_for_coding_context_defaults(&mut settings, provider);
         restore_claude_internal_fields_for_backfill(&mut settings, provider);
-        strip_injected_model_suffix_context_defaults(&mut settings, provider);
+        strip_auto_synced_context_defaults(&mut settings, provider);
         strip_legacy_suffixes_from_claude_models(&mut settings);
         return settings;
     }
@@ -4348,6 +4456,117 @@ base_url = "https://a.example/v1"
         assert_eq!(
             backfilled["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
             json!("765432")
+        );
+    }
+
+    #[test]
+    fn backfill_keeps_user_explicit_and_removes_auto_synced_values() {
+        let mut settings = json!({
+            "env": {
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "160000",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "250000"
+            }
+        });
+        let provider = Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "autoSyncState": {
+                    "lastWritten": { "ACW": "160000", "MAX": "200000" },
+                    "staticInjected": { "ACW": "262144", "MAX": "262144" },
+                    "userExplicit": { "ACW": null, "MAX": "250000" }
+                }
+            }),
+            None,
+        );
+        strip_auto_synced_context_defaults(&mut settings, &provider);
+        assert!(settings["env"]
+            .get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+            .is_none());
+        assert_eq!(
+            settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
+            json!("250000")
+        );
+    }
+
+    #[test]
+    fn backfill_removes_auto_value_when_user_explicit_holds_a_different_value() {
+        let mut settings = json!({
+            "env": {
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "160000",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "200000"
+            }
+        });
+        let provider = Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "autoSyncState": {
+                    "lastWritten": { "ACW": "160000", "MAX": "200000" },
+                    "staticInjected": { "ACW": "262144", "MAX": "262144" },
+                    "userExplicit": { "ACW": null, "MAX": "250000" }
+                }
+            }),
+            None,
+        );
+        strip_auto_synced_context_defaults(&mut settings, &provider);
+        assert!(settings["env"]
+            .get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+            .is_none());
+        assert!(settings["env"]
+            .get("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+            .is_none());
+    }
+
+    #[test]
+    fn backfill_removes_static_injected_values_when_not_user_explicit() {
+        let mut settings = json!({
+            "env": {
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "262144",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "262144"
+            }
+        });
+        let provider = Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "autoSyncState": {
+                    "lastWritten": { "ACW": "160000", "MAX": "200000" },
+                    "staticInjected": { "ACW": "262144", "MAX": "262144" },
+                    "userExplicit": {}
+                }
+            }),
+            None,
+        );
+        strip_auto_synced_context_defaults(&mut settings, &provider);
+        assert!(settings["env"]
+            .get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+            .is_none());
+        assert!(settings["env"]
+            .get("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+            .is_none());
+    }
+
+    #[test]
+    fn backfill_honors_legacy_full_env_key_user_explicit_marker() {
+        let mut settings = json!({
+            "env": { "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "200000" }
+        });
+        let provider = Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "autoSyncState": {
+                    "lastWritten": { "MAX": "200000" },
+                    "userExplicit": { "CLAUDE_CODE_MAX_CONTEXT_TOKENS": true }
+                }
+            }),
+            None,
+        );
+        strip_auto_synced_context_defaults(&mut settings, &provider);
+        assert_eq!(
+            settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
+            json!("200000")
         );
     }
 
