@@ -94,9 +94,16 @@ const WATCHER_ROLE_ENV_KEYS: [&str; 6] = [
     "CLAUDE_CODE_SUBAGENT_MODEL",
 ];
 
+/// 自动目标：普通角色窗口按压缩比例换算，静态兜底按原始 ACW/MAX 字符串匹配。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoTarget {
+    Window(u64),
+    RawAcwMax(&'static str, &'static str),
+}
+
 /// 收集 provider 中所有角色可用窗口：contextWindows 优先，其次模型名后缀，
-/// 并额外包含 Codex OAuth / Kimi 的固定兜底窗口。
-fn configured_role_target_windows(provider: &Provider) -> Vec<u64> {
+/// 并额外包含 Codex OAuth / Kimi 的固定兜底 ACW/MAX 原始对。
+fn configured_role_auto_targets(provider: &Provider) -> Vec<AutoTarget> {
     let provider_env = provider
         .settings_config
         .get("env")
@@ -104,14 +111,14 @@ fn configured_role_target_windows(provider: &Provider) -> Vec<u64> {
     let static_fallback = if provider.is_codex_oauth()
         && crate::services::provider::provider_env_targets_gpt56(provider_env)
     {
-        Some(372000)
+        Some(("372000", "372000"))
     } else if crate::services::provider::is_kimi_for_coding_provider(provider) {
-        Some(262144)
+        Some(("262144", "262144"))
     } else {
         None
     };
 
-    let mut windows = WATCHER_ROLE_ENV_KEYS
+    let mut targets = WATCHER_ROLE_ENV_KEYS
         .iter()
         .filter_map(|role_key| {
             crate::claude_desktop_config::resolve_context_window(
@@ -119,13 +126,15 @@ fn configured_role_target_windows(provider: &Provider) -> Vec<u64> {
                 role_key,
             )
         })
+        .map(AutoTarget::Window)
         .collect::<Vec<_>>();
-    if let Some(fallback) = static_fallback {
-        windows.push(fallback);
-    }
-    windows.sort_unstable();
-    windows.dedup();
-    windows
+    targets.extend(static_fallback.map(|(acw, max)| AutoTarget::RawAcwMax(acw, max)));
+    targets.sort_unstable_by_key(|target| match target {
+        AutoTarget::Window(window) => *window,
+        AutoTarget::RawAcwMax(acw, _) => acw.parse().unwrap_or(u64::MAX),
+    });
+    targets.dedup();
+    targets
 }
 
 /// 根据窗口值和压缩比例生成要写入 settings.json.env 的两个 env 项。
@@ -552,12 +561,17 @@ fn is_auto_target_value(_settings: &Value, provider: &Provider, key: &str, value
         return false;
     };
     let ratio = provider_compact_ratio(provider);
-    configured_role_target_windows(provider)
+    configured_role_auto_targets(provider)
         .iter()
-        .any(|window| {
-            build_env_writes(*window, ratio)
+        .any(|target| match target {
+            AutoTarget::Window(window) => build_env_writes(*window, ratio)
                 .iter()
-                .any(|(write_key, expected)| *write_key == env_key && expected.as_str() == value)
+                .any(|(write_key, expected)| *write_key == env_key && expected.as_str() == value),
+            AutoTarget::RawAcwMax(acw, max) => match env_key {
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW" => *acw == value,
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS" => *max == value,
+                _ => false,
+            },
         })
 }
 
@@ -1950,6 +1964,166 @@ mod tests {
         assert_eq!(
             provider_guard.settings_config["autoSyncState"]["lastWritten"],
             json!({ "ACW": "24000", "MAX": "30000" })
+        );
+    }
+
+    #[test]
+    fn handle_settings_change_kimi_raw_static_target_without_ledger_is_auto() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let initial = json!({
+            "model": "haiku",
+            "env": {
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "kimi-for-coding",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "kimi-for-coding",
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "262144",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "262144"
+            }
+        });
+        fs::write(&path, initial.to_string()).unwrap();
+
+        let provider = Mutex::new(Provider::with_id(
+            "kimi".to_string(),
+            "Kimi For Coding".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding/",
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "kimi-for-coding",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "kimi-for-coding"
+                },
+                "autoSyncContextWindow": true,
+                "autoSyncCompactRatio": 0.8,
+                "autoSyncState": { "lastWritten": {} }
+            }),
+            None,
+        ));
+        let state = Mutex::new(Some(WatcherSnapshot {
+            model: Some("sonnet".to_string()),
+            acw: None,
+            max: None,
+        }));
+
+        handle_settings_change(&path, &provider, &state, &noop_persist());
+
+        let provider_guard = provider.lock().unwrap();
+        assert!(provider_guard
+            .settings_config
+            .pointer("/autoSyncState/userExplicit")
+            .is_none());
+        drop(provider_guard);
+        let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "262144");
+        assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "262144");
+    }
+
+    #[test]
+    fn handle_settings_change_codex_oauth_raw_static_target_without_ledger_is_auto() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let initial = json!({
+            "model": "haiku",
+            "env": {
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-5.6-mini",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "gpt-5.6",
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "372000",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "372000"
+            }
+        });
+        fs::write(&path, initial.to_string()).unwrap();
+
+        let provider = Mutex::new(Provider::with_id(
+            "codex-oauth".to_string(),
+            "Codex".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-5.6-mini",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "gpt-5.6"
+                },
+                "autoSyncContextWindow": true,
+                "autoSyncCompactRatio": 0.8,
+                "autoSyncState": { "lastWritten": {} }
+            }),
+            None,
+        ));
+        provider.lock().unwrap().meta = Some(crate::provider::ProviderMeta {
+            provider_type: Some("codex_oauth".to_string()),
+            ..Default::default()
+        });
+        let state = Mutex::new(Some(WatcherSnapshot {
+            model: Some("sonnet".to_string()),
+            acw: None,
+            max: None,
+        }));
+
+        handle_settings_change(&path, &provider, &state, &noop_persist());
+
+        let provider_guard = provider.lock().unwrap();
+        assert!(provider_guard
+            .settings_config
+            .pointer("/autoSyncState/userExplicit")
+            .is_none());
+        drop(provider_guard);
+        let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "372000");
+        assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "372000");
+    }
+
+    #[test]
+    fn handle_settings_change_codex_oauth_ratio_scaled_acw_still_records_user_explicit() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let initial = json!({
+            "model": "haiku",
+            "env": {
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-5.6-mini",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "gpt-5.6",
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "297600",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "372000"
+            }
+        });
+        fs::write(&path, initial.to_string()).unwrap();
+
+        let provider = Mutex::new(Provider::with_id(
+            "codex-oauth".to_string(),
+            "Codex".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-5.6-mini",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "gpt-5.6"
+                },
+                "autoSyncContextWindow": true,
+                "autoSyncCompactRatio": 0.8,
+                "autoSyncState": { "lastWritten": {} }
+            }),
+            None,
+        ));
+        provider.lock().unwrap().meta = Some(crate::provider::ProviderMeta {
+            provider_type: Some("codex_oauth".to_string()),
+            ..Default::default()
+        });
+        let state = Mutex::new(Some(WatcherSnapshot {
+            model: Some("sonnet".to_string()),
+            acw: None,
+            max: None,
+        }));
+
+        handle_settings_change(&path, &provider, &state, &noop_persist());
+
+        let provider_guard = provider.lock().unwrap();
+        assert_eq!(
+            provider_guard.settings_config["autoSyncState"]["userExplicit"]["ACW"],
+            json!("297600")
+        );
+        assert!(
+            provider_guard.settings_config["autoSyncState"]["userExplicit"]
+                .get("MAX")
+                .is_none()
         );
     }
 
