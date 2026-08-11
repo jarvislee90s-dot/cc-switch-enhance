@@ -84,6 +84,50 @@ pub(crate) fn provider_compact_ratio(provider: &Provider) -> f64 {
         .unwrap_or(1.0)
 }
 
+/// Claude Code 中可配置模型角色对应的 env key，和 live 注入逻辑保持一致。
+const WATCHER_ROLE_ENV_KEYS: [&str; 6] = [
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+];
+
+/// 收集 provider 中所有角色可用窗口：contextWindows 优先，其次模型名后缀，
+/// 并额外包含 Codex OAuth / Kimi 的固定兜底窗口。
+fn configured_role_target_windows(provider: &Provider) -> Vec<u64> {
+    let provider_env = provider
+        .settings_config
+        .get("env")
+        .and_then(Value::as_object);
+    let static_fallback = if provider.is_codex_oauth()
+        && crate::services::provider::provider_env_targets_gpt56(provider_env)
+    {
+        Some(372000)
+    } else if crate::services::provider::is_kimi_for_coding_provider(provider) {
+        Some(262144)
+    } else {
+        None
+    };
+
+    let mut windows = WATCHER_ROLE_ENV_KEYS
+        .iter()
+        .filter_map(|role_key| {
+            crate::claude_desktop_config::resolve_context_window(
+                &provider.settings_config,
+                role_key,
+            )
+        })
+        .collect::<Vec<_>>();
+    if let Some(fallback) = static_fallback {
+        windows.push(fallback);
+    }
+    windows.sort_unstable();
+    windows.dedup();
+    windows
+}
+
 /// 根据窗口值和压缩比例生成要写入 settings.json.env 的两个 env 项。
 /// ACW = 窗口 × ratio（向下取整），MAX = 窗口本身。
 pub(crate) fn build_env_writes(window: u64, ratio: f64) -> Vec<(&'static str, String)> {
@@ -99,25 +143,21 @@ pub(crate) fn build_env_writes(window: u64, ratio: f64) -> Vec<(&'static str, St
     ]
 }
 
-/// 检查新事件的 model + ACW/MAX 是否需要处理（与上次快照不同则处理）。
-/// watcher 写入成功后会把 state 更新为新值，避免自身写入再次触发。
+/// 检查新事件的 model + ACW/MAX 是否与上次快照不同。
+/// 这里只声明候选，不修改 state；只有写入/持久化成功路径才提交快照。
 fn should_process(
     state: &Mutex<Option<WatcherSnapshot>>,
     new_model: Option<&str>,
     new_acw: Option<&str>,
     new_max: Option<&str>,
 ) -> bool {
-    let mut guard = state.lock().expect("settings watcher mutex poisoned");
+    let guard = state.lock().expect("settings watcher mutex poisoned");
     let next = WatcherSnapshot {
         model: new_model.map(|s| s.to_string()),
         acw: new_acw.map(|s| s.to_string()),
         max: new_max.map(|s| s.to_string()),
     };
-    if *guard == Some(next.clone()) {
-        return false;
-    }
-    *guard = Some(next);
-    true
+    *guard != Some(next)
 }
 
 fn record_processed_state(
@@ -315,7 +355,7 @@ fn handle_settings_change(
     }
 
     // 5. 写前检测用户手填：先看 userExplicit，再比较 lastWritten/staticInjected。
-    // 以及当前 model 的自动目标值。该检测必须在静态注入/无 active window
+    // 以及所有已配置角色的自动目标值。该检测必须在静态注入/无 active window
     // 早退之前，保证用户手改会被记账；键结构按 spec 固定为 ACW / MAX 短键。
     let explicit_acw = new_acw.filter(|value| {
         !is_user_explicit(&provider, "ACW") && !is_auto_target_value(&v, &provider, "ACW", value)
@@ -330,6 +370,7 @@ fn handle_settings_change(
             *state.lock().expect("settings watcher mutex poisoned") = previous_snapshot;
             return;
         }
+        record_processed_state(state, new_model, new_acw, new_max);
     }
     if is_user_explicit(&provider, "ACW") || is_user_explicit(&provider, "MAX") {
         log::debug!("[ClaudeSettingsWatcher] user explicit ACW/MAX, skip rewrite");
@@ -501,22 +542,23 @@ fn is_auto_source_value(provider: &Provider, key: &str, value: &str) -> bool {
     })
 }
 
-/// live 值与 DB 账本、staticInjected，或当前 model 的自动目标一致时，视为自动来源。
+/// live 值与 DB 账本、staticInjected，或任意已配置角色的自动目标一致时，视为自动来源。
 /// 用于 watcher 重建后 DB lastWritten 缺失/过期时，仍不会把自动写入误判为 userExplicit。
-fn is_auto_target_value(settings: &Value, provider: &Provider, key: &str, value: &str) -> bool {
+fn is_auto_target_value(_settings: &Value, provider: &Provider, key: &str, value: &str) -> bool {
     if is_auto_source_value(provider, key, value) {
         return true;
     }
-    let Some(active) = resolve_active_model_window(settings, provider) else {
-        return false;
-    };
-    let writes = build_env_writes(active.window, provider_compact_ratio(provider));
     let Some(env_key) = legacy_env_key(key) else {
         return false;
     };
-    writes
+    let ratio = provider_compact_ratio(provider);
+    configured_role_target_windows(provider)
         .iter()
-        .any(|(write_key, expected)| *write_key == env_key && expected.as_str() == value)
+        .any(|window| {
+            build_env_writes(*window, ratio)
+                .iter()
+                .any(|(write_key, expected)| *write_key == env_key && expected.as_str() == value)
+        })
 }
 
 fn verify_file_unchanged(path: &std::path::Path, expected: &str) -> Result<(), String> {
@@ -920,6 +962,9 @@ mod tests {
     fn loop_same_model_consecutive_triggers() {
         let state = Mutex::new(None);
         assert!(should_process(&state, Some("haiku"), None, None));
+        // 尚未成功提交前，相同事件仍是候选，后续失败/早退路径可以重试。
+        assert!(should_process(&state, Some("haiku"), None, None));
+        record_processed_state(&state, Some("haiku"), None, None);
         assert!(!should_process(&state, Some("haiku"), None, None));
         assert!(!should_process(&state, Some("haiku"), None, None));
     }
@@ -931,13 +976,18 @@ mod tests {
         assert!(should_process(&state, Some("sonnet"), None, None));
         assert!(should_process(&state, Some("haiku"), None, None));
         assert!(should_process(&state, Some("sonnet"), None, None));
+        record_processed_state(&state, Some("sonnet"), None, None);
+        assert!(!should_process(&state, Some("sonnet"), None, None));
     }
 
     #[test]
     fn loop_model_to_none_to_same() {
         let state = Mutex::new(None);
         assert!(should_process(&state, Some("haiku"), None, None));
+        record_processed_state(&state, Some("haiku"), None, None);
+        assert!(!should_process(&state, Some("haiku"), None, None));
         assert!(should_process(&state, None, None, None)); // model 被删
+        record_processed_state(&state, None, None, None);
         assert!(should_process(&state, Some("haiku"), None, None)); // 重新出现
     }
 
@@ -946,6 +996,7 @@ mod tests {
         let state = Mutex::new(None);
         assert!(should_process(&state, Some("haiku"), None, None));
         assert!(should_process(&state, None, None, None));
+        record_processed_state(&state, None, None, None);
         // 后续 None 事件都算"无变化" → 跳过
         assert!(!should_process(&state, None, None, None));
         assert!(!should_process(&state, None, None, None));
@@ -963,6 +1014,9 @@ mod tests {
         assert!(!should_process(&state, Some("haiku"), None, None));
         // 切到别的 → 处理
         assert!(should_process(&state, Some("sonnet"), None, None));
+        assert!(should_process(&state, Some("sonnet"), None, None));
+        record_processed_state(&state, Some("sonnet"), None, None);
+        assert!(!should_process(&state, Some("sonnet"), None, None));
     }
 
     // ========== Task 6: 文件系统集成测试 ==========
@@ -1531,6 +1585,33 @@ mod tests {
     }
 
     #[test]
+    fn should_process_declares_candidate_without_committing_state() {
+        let state = Mutex::new(None);
+        assert!(should_process(
+            &state,
+            Some("sonnet"),
+            Some("160000"),
+            Some("200000")
+        ));
+        // 失败/早退路径必须保留旧快照，后续同一事件才能重试。
+        assert!(should_process(
+            &state,
+            Some("sonnet"),
+            Some("160000"),
+            Some("200000")
+        ));
+        assert_eq!(*state.lock().unwrap(), None);
+
+        record_processed_state(&state, Some("sonnet"), Some("160000"), Some("200000"));
+        assert!(!should_process(
+            &state,
+            Some("sonnet"),
+            Some("160000"),
+            Some("200000")
+        ));
+    }
+
+    #[test]
     fn should_process_tracks_acw_max_changes() {
         let state = Mutex::new(None);
         assert!(should_process(
@@ -1539,6 +1620,13 @@ mod tests {
             Some("160000"),
             Some("200000")
         ));
+        assert!(should_process(
+            &state,
+            Some("sonnet"),
+            Some("160000"),
+            Some("200000")
+        ));
+        record_processed_state(&state, Some("sonnet"), Some("160000"), Some("200000"));
         assert!(!should_process(
             &state,
             Some("sonnet"),
@@ -1551,6 +1639,13 @@ mod tests {
             Some("250000"),
             Some("250000")
         ));
+        assert!(should_process(
+            &state,
+            Some("sonnet"),
+            Some("250000"),
+            Some("250000")
+        ));
+        record_processed_state(&state, Some("sonnet"), Some("250000"), Some("250000"));
         assert!(!should_process(
             &state,
             Some("sonnet"),
@@ -1802,6 +1897,63 @@ mod tests {
     }
 
     #[test]
+    fn handle_settings_change_calibrates_against_all_configured_role_targets() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let initial = json!({
+            "model": "haiku",
+            "env": {
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "haiku-model",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "sonnet-model",
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "160000",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "200000"
+            }
+        });
+        fs::write(&path, initial.to_string()).unwrap();
+
+        // live 保留 sonnet 的自动写入值，但 DB lastWritten 缺失、当前 model 已是 haiku。
+        // 只有把 sonnet 角色也纳入自动目标校准，才不会误记为 userExplicit。
+        let provider = Mutex::new(Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "haiku-model",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "sonnet-model"
+                },
+                "contextWindows": {
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": 30000,
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": 200000
+                },
+                "autoSyncContextWindow": true,
+                "autoSyncCompactRatio": 0.8,
+                "autoSyncState": { "lastWritten": {} }
+            }),
+            None,
+        ));
+        let state = Mutex::new(None);
+
+        handle_settings_change(&path, &provider, &state, &noop_persist());
+
+        let content = fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "24000");
+        assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "30000");
+
+        let provider_guard = provider.lock().unwrap();
+        assert!(provider_guard
+            .settings_config
+            .pointer("/autoSyncState/userExplicit")
+            .is_none());
+        assert_eq!(
+            provider_guard.settings_config["autoSyncState"]["lastWritten"],
+            json!({ "ACW": "24000", "MAX": "30000" })
+        );
+    }
+
+    #[test]
     fn failing_persist_retry_after_state_reset_does_not_mark_auto_target_explicit() {
         use std::fs;
 
@@ -1968,6 +2120,71 @@ mod tests {
         assert_eq!(
             provider_guard.settings_config["autoSyncState"]["lastWritten"],
             json!({ "ACW": "1", "MAX": "2" })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_settings_change_retries_same_event_after_atomic_write_fails() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let initial = json!({
+            "model": "haiku",
+            "env": { "ANTHROPIC_DEFAULT_HAIKU_MODEL": "haiku-model" }
+        });
+        fs::write(&path, initial.to_string()).unwrap();
+
+        let provider = Mutex::new(Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "env": { "ANTHROPIC_DEFAULT_HAIKU_MODEL": "haiku-model" },
+                "contextWindows": { "ANTHROPIC_DEFAULT_HAIKU_MODEL": 30000 },
+                "autoSyncContextWindow": true,
+                "autoSyncState": { "lastWritten": { "ACW": "1", "MAX": "2" } }
+            }),
+            None,
+        ));
+        let previous = Some(WatcherSnapshot {
+            model: Some("sonnet".to_string()),
+            acw: None,
+            max: None,
+        });
+        let state = Mutex::new(previous.clone());
+
+        let mut permissions = fs::metadata(dir.path()).unwrap().permissions();
+        permissions.set_mode(0o555);
+        fs::set_permissions(dir.path(), permissions).unwrap();
+        handle_settings_change(&path, &provider, &state, &noop_persist());
+
+        // 失败路径不得提交新快照，因此恢复目录权限后同一事件仍会重试写入。
+        assert_eq!(*state.lock().unwrap(), previous);
+        let provider_guard = provider.lock().unwrap();
+        assert_eq!(
+            provider_guard.settings_config["autoSyncState"]["lastWritten"],
+            json!({ "ACW": "1", "MAX": "2" })
+        );
+        drop(provider_guard);
+
+        let mut permissions = fs::metadata(dir.path()).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(dir.path(), permissions).unwrap();
+        handle_settings_change(&path, &provider, &state, &noop_persist());
+
+        let content = fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "30000");
+        assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "30000");
+        assert_eq!(
+            *state.lock().unwrap(),
+            Some(WatcherSnapshot {
+                model: Some("haiku".to_string()),
+                acw: Some("30000".to_string()),
+                max: Some("30000".to_string()),
+            })
         );
     }
 
