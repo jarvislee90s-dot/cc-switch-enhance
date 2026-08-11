@@ -852,6 +852,34 @@ fn apply_common_config_to_settings(
     }
 }
 
+fn claude_watcher_persist_callback(
+    db: &Database,
+    app_type: &AppType,
+    provider_id: &str,
+) -> crate::claude_settings_watcher::PersistSettingsCallback {
+    // notify 后台线程要求回调 'static，Database 不是 Clone；这里从当前连接拿到
+    // DB 文件路径，回调内打开同一文件再调用 update_provider_settings_config。
+    let db_path = db
+        .conn
+        .lock()
+        .ok()
+        .and_then(|conn| conn.path().map(std::path::PathBuf::from))
+        .filter(|path| !path.as_os_str().is_empty());
+    let app_type_str = app_type.as_str().to_string();
+    let provider_id = provider_id.to_string();
+    std::sync::Arc::new(move |settings| {
+        let Some(db_path) = db_path.as_ref() else {
+            return Err("cannot persist watcher state to in-memory database".to_string());
+        };
+        let conn = rusqlite::Connection::open(db_path).map_err(|e| e.to_string())?;
+        let db = Database {
+            conn: std::sync::Mutex::new(conn),
+        };
+        db.update_provider_settings_config(&app_type_str, &provider_id, &settings)
+            .map_err(|e| e.to_string())
+    })
+}
+
 pub(crate) fn build_effective_settings_with_common_config(
     db: &Database,
     app_type: &AppType,
@@ -901,10 +929,12 @@ pub(crate) fn build_effective_settings_with_common_config(
             }
         }
         if settings_path.parent().map(|p| p.exists()).unwrap_or(false) {
+            let persist = claude_watcher_persist_callback(db, app_type, &provider.id);
             let provider_arc = std::sync::Arc::new(std::sync::Mutex::new(provider.clone()));
             match crate::claude_settings_watcher::spawn_claude_settings_watcher(
                 settings_path,
                 provider_arc,
+                persist,
             ) {
                 // Ok(watcher) 必须交给 replace_watcher 存进进程单例，
                 // 否则返回值在 match 表达式结束时被 Drop，notify 监听线程退出，
@@ -2339,6 +2369,38 @@ mod tests {
                 None => env::remove_var("CC_SWITCH_TEST_HOME"),
             }
         }
+    }
+
+    #[test]
+    #[serial]
+    fn claude_watcher_persist_callback_writes_auto_sync_state_to_db() {
+        let _home = TempHome::new();
+        let db = Database::init().expect("file database");
+        let provider =
+            Provider::with_id("p".to_string(), "P".to_string(), json!({ "env": {} }), None);
+        db.save_provider(AppType::Claude.as_str(), &provider)
+            .expect("save provider");
+        let persist = claude_watcher_persist_callback(&db, &AppType::Claude, &provider.id);
+        let settings = json!({
+            "env": {},
+            "autoSyncState": {
+                "lastWritten": { "ACW": "1", "MAX": "2" },
+                "userExplicit": { "ACW": "1", "MAX": "2" }
+            }
+        });
+        persist(settings).expect("persist settings");
+        let stored = db
+            .get_provider_by_id("p", AppType::Claude.as_str())
+            .expect("get provider")
+            .expect("stored provider exists");
+        assert_eq!(
+            stored.settings_config["autoSyncState"]["lastWritten"],
+            json!({ "ACW": "1", "MAX": "2" })
+        );
+        assert_eq!(
+            stored.settings_config["autoSyncState"]["userExplicit"],
+            json!({ "ACW": "1", "MAX": "2" })
+        );
     }
 
     #[test]

@@ -12,6 +12,9 @@ use serde_json::Value;
 use crate::error::AppError;
 use crate::provider::Provider;
 
+/// watcher 更新 autoSyncState 后把 provider 配置持久化到 DB 的回调。
+pub(crate) type PersistSettingsCallback = Arc<dyn Fn(Value) -> Result<(), String> + Send + Sync>;
+
 /// 监听 settings.json 后决定的当前激活模型窗口
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ActiveModelWindow {
@@ -155,6 +158,7 @@ impl Drop for ClaudeSettingsWatcher {
 pub(crate) fn spawn_claude_settings_watcher(
     settings_path: PathBuf,
     provider: Arc<Mutex<Provider>>,
+    persist: PersistSettingsCallback,
 ) -> Result<ClaudeSettingsWatcher, AppError> {
     let state = Arc::new(Mutex::new(None));
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -180,6 +184,7 @@ pub(crate) fn spawn_claude_settings_watcher(
     let shutdown_clone = shutdown.clone();
     let provider_clone = provider.clone();
     let path_clone = settings_path.clone();
+    let persist_clone = persist.clone();
 
     let mut debouncer = new_debouncer(
         Duration::from_millis(200),
@@ -200,7 +205,12 @@ pub(crate) fn spawn_claude_settings_watcher(
             // 平台（如 macOS FSEvents）可能报告目录级别事件，file_name
             // 过滤会漏掉。
             for _event in events {
-                handle_settings_change(&path_clone, provider_clone.as_ref(), &state_clone);
+                handle_settings_change(
+                    &path_clone,
+                    provider_clone.as_ref(),
+                    &state_clone,
+                    &persist_clone,
+                );
             }
         },
     )
@@ -252,6 +262,7 @@ fn handle_settings_change(
     path: &std::path::Path,
     provider: &Mutex<Provider>,
     state: &Mutex<Option<WatcherSnapshot>>,
+    persist: &PersistSettingsCallback,
 ) {
     // 1. 读最新内容
     let content = match std::fs::read_to_string(path) {
@@ -297,7 +308,25 @@ fn handle_settings_change(
         return;
     }
 
-    // 只有静态注入实际生效的路径需要跳过：Kimi 固定注入，或 Codex OAuth 的
+    // 5. 写前检测用户手填：先看 userExplicit，再比较 lastWritten/staticInjected。
+    // 该检测必须在静态注入/无 active window 早退之前，保证用户手改会被记账。
+    // 键结构按 spec 固定为 ACW / MAX 短键。
+    let explicit_acw = new_acw.filter(|value| {
+        !is_user_explicit(&provider, "ACW") && !is_auto_source_value(&provider, "ACW", value)
+    });
+    let explicit_max = new_max.filter(|value| {
+        !is_user_explicit(&provider, "MAX") && !is_auto_source_value(&provider, "MAX", value)
+    });
+    if explicit_acw.is_some() || explicit_max.is_some() {
+        record_user_explicit(&mut *provider, explicit_acw, explicit_max);
+        persist_settings(persist, &provider);
+    }
+    if is_user_explicit(&provider, "ACW") || is_user_explicit(&provider, "MAX") {
+        log::debug!("[ClaudeSettingsWatcher] user explicit ACW/MAX, skip rewrite");
+        return;
+    }
+
+    // 6. 只有静态注入实际生效的路径需要跳过：Kimi 固定注入，或 Codex OAuth 的
     // env 模型全部指向 gpt-5.6。其他 Codex OAuth 配置仍按 contextWindows 增强。
     let provider_env = provider
         .settings_config
@@ -314,7 +343,7 @@ fn handle_settings_change(
         return;
     }
 
-    // 5. 决定要写的窗口值
+    // 7. 决定要写的窗口值
     let active = match resolve_active_model_window(&v, &provider) {
         Some(a) => a,
         None => {
@@ -322,22 +351,6 @@ fn handle_settings_change(
             return;
         }
     };
-
-    // 6. 写前检测用户手填：先看 userExplicit，再比较 lastWritten/staticInjected。
-    // 发现非自动来源值就记账，并在已有用户显式时完全跳过 watcher 重写。
-    let explicit_acw = new_acw.filter(|value| {
-        !is_user_explicit(&provider, "ACW") && !is_auto_source_value(&provider, "ACW", value)
-    });
-    let explicit_max = new_max.filter(|value| {
-        !is_user_explicit(&provider, "MAX") && !is_auto_source_value(&provider, "MAX", value)
-    });
-    if explicit_acw.is_some() || explicit_max.is_some() {
-        record_user_explicit(&mut *provider, explicit_acw, explicit_max);
-    }
-    if is_user_explicit(&provider, "ACW") || is_user_explicit(&provider, "MAX") {
-        log::debug!("[ClaudeSettingsWatcher] user explicit ACW/MAX, skip rewrite");
-        return;
-    }
 
     // 7. 生成 ACW/MAX 并做写前二次校验，避免覆盖并发修改。
     let writes = build_env_writes(active.window, provider_compact_ratio(&provider));
@@ -359,6 +372,7 @@ fn handle_settings_change(
         log::warn!("[ClaudeSettingsWatcher] write failed: {e}");
     } else {
         record_last_written(&mut *provider, &writes[0].1, &writes[1].1);
+        persist_settings(persist, &provider);
         record_processed_state(
             state,
             Some(active.model.as_str()),
@@ -370,6 +384,12 @@ fn handle_settings_change(
             active.model,
             active.window
         );
+    }
+}
+
+fn persist_settings(persist: &PersistSettingsCallback, provider: &Provider) {
+    if let Err(e) = persist(provider.settings_config.clone()) {
+        log::warn!("[ClaudeSettingsWatcher] failed to persist autoSyncState: {e}");
     }
 }
 
@@ -447,6 +467,8 @@ fn update_env_fields(content: &str, writes: &[(&'static str, String)]) -> Result
     if !v.is_object() {
         return Err("top-level not object".to_string());
     }
+    // cc-switch 内部字段（contextWindows / autoSyncState 等）不能写回 settings.json。
+    v = crate::services::provider::sanitize_claude_settings_for_live(&v);
     let obj = v.as_object_mut().unwrap();
     let env = obj
         .entry("env".to_string())
@@ -474,6 +496,21 @@ mod tests {
             json!({ "env": env }),
             None,
         )
+    }
+
+    fn noop_persist() -> Arc<dyn Fn(Value) -> Result<(), String> + Send + Sync> {
+        Arc::new(|_| Ok(()))
+    }
+
+    fn recording_persist(
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        captured: Arc<Mutex<Option<Value>>>,
+    ) -> Arc<dyn Fn(Value) -> Result<(), String> + Send + Sync> {
+        Arc::new(move |settings| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            *captured.lock().unwrap() = Some(settings);
+            Ok(())
+        })
     }
 
     // ========== Task 2: 角色映射测试 ==========
@@ -897,6 +934,24 @@ mod tests {
         assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "30000");
     }
 
+    #[test]
+    fn update_env_fields_strips_internal_fields_before_writing() {
+        let original = r#"{"model":"sonnet","contextWindows":{"ANTHROPIC_DEFAULT_SONNET_MODEL":200000},"autoSyncContextWindow":true,"autoSyncCompactRatio":0.8,"autoSyncState":{"lastWritten":{"ACW":"160000","MAX":"200000"}},"env":{}}"#;
+        let writes = build_env_writes(200000, 0.8);
+        let result = update_env_fields(original, &writes).unwrap();
+        let v: Value = serde_json::from_str(&result).unwrap();
+        for key in [
+            "contextWindows",
+            "autoSyncContextWindow",
+            "autoSyncCompactRatio",
+            "autoSyncState",
+        ] {
+            assert!(v.get(key).is_none(), "{key} leaked into live settings");
+        }
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "160000");
+        assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "200000");
+    }
+
     /// 用 tempfile 创建临时目录，验证真实 fs 事件的 watcher 行为
     #[test]
     fn fs_real_watcher_external_model_change() {
@@ -925,7 +980,8 @@ mod tests {
             None,
         )));
 
-        let watcher = spawn_claude_settings_watcher(path.clone(), provider).unwrap();
+        let watcher =
+            spawn_claude_settings_watcher(path.clone(), provider, noop_persist()).unwrap();
 
         // 模拟外部程序修改 model 字段
         let new_content = json!({
@@ -982,7 +1038,8 @@ mod tests {
             None,
         )));
 
-        let watcher = spawn_claude_settings_watcher(path.clone(), provider).unwrap();
+        let watcher =
+            spawn_claude_settings_watcher(path.clone(), provider, noop_persist()).unwrap();
 
         let new_content = json!({
             "model": "haiku",
@@ -1038,7 +1095,7 @@ mod tests {
         ));
 
         let state = Mutex::new(None);
-        handle_settings_change(&path, &provider, &state);
+        handle_settings_change(&path, &provider, &state, &noop_persist());
 
         let content = fs::read_to_string(&path).unwrap();
         let v: Value = serde_json::from_str(&content).unwrap();
@@ -1080,7 +1137,7 @@ mod tests {
         });
 
         let state = Mutex::new(None);
-        handle_settings_change(&path, &provider, &state);
+        handle_settings_change(&path, &provider, &state, &noop_persist());
 
         let content = fs::read_to_string(&path).unwrap();
         let v: Value = serde_json::from_str(&content).unwrap();
@@ -1127,7 +1184,7 @@ mod tests {
             acw: None,
             max: None,
         }));
-        handle_settings_change(&path, &provider, &state);
+        handle_settings_change(&path, &provider, &state, &noop_persist());
 
         let content = fs::read_to_string(&path).unwrap();
         let v: Value = serde_json::from_str(&content).unwrap();
@@ -1153,7 +1210,8 @@ mod tests {
             "ANTHROPIC_DEFAULT_SONNET_MODEL":"MiniMax-M3[1M]","ANTHROPIC_DEFAULT_HAIKU_MODEL":"Kimi-K2.7-Code[30k]"
         }))));
 
-        let watcher = spawn_claude_settings_watcher(path.clone(), provider).unwrap();
+        let watcher =
+            spawn_claude_settings_watcher(path.clone(), provider, noop_persist()).unwrap();
 
         // 只改 effortLevel
         let new_content = json!({
@@ -1186,7 +1244,7 @@ mod tests {
             "ANTHROPIC_DEFAULT_SONNET_MODEL":"MiniMax-M3[1M]","ANTHROPIC_DEFAULT_HAIKU_MODEL":"Kimi-K2.7-Code[30k]"
         }))));
 
-        let result = spawn_claude_settings_watcher(path, provider);
+        let result = spawn_claude_settings_watcher(path, provider, noop_persist());
         // 文件不存在 → 应该出错（watch 失败）
         assert!(
             result.is_ok(),
@@ -1232,7 +1290,8 @@ mod tests {
 
         // 模拟 production 调用：spawn 后立即存进进程单例，不保留局部绑定。
         // spawned 在这里 move 进 replace_watcher，没有局部变量持有 watcher。
-        let spawned = spawn_claude_settings_watcher(path.clone(), provider).unwrap();
+        let spawned =
+            spawn_claude_settings_watcher(path.clone(), provider, noop_persist()).unwrap();
         replace_watcher(spawned);
 
         // 改 model 字段，模拟 Claude Code /model 切换 sonnet -> haiku
@@ -1288,7 +1347,8 @@ mod tests {
             None,
         )));
 
-        let spawned = spawn_claude_settings_watcher(path.clone(), provider).unwrap();
+        let spawned =
+            spawn_claude_settings_watcher(path.clone(), provider, noop_persist()).unwrap();
         replace_watcher(spawned);
 
         // 改 model 字段 sonnet -> haiku
@@ -1352,7 +1412,8 @@ mod tests {
             None,
         )));
 
-        let spawned = spawn_claude_settings_watcher(path.clone(), provider).unwrap();
+        let spawned =
+            spawn_claude_settings_watcher(path.clone(), provider, noop_persist()).unwrap();
         replace_watcher(spawned);
 
         // 用 atomic_write 覆盖 settings.json（模拟 write_live_snapshot）
@@ -1440,7 +1501,10 @@ mod tests {
         ));
         let state = Mutex::new(None);
 
-        handle_settings_change(&path, &provider, &state);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let captured = Arc::new(Mutex::new(None));
+        let persist = recording_persist(calls.clone(), captured.clone());
+        handle_settings_change(&path, &provider, &state, &persist);
 
         let content = std::fs::read_to_string(&path).unwrap();
         let v: Value = serde_json::from_str(&content).unwrap();
@@ -1451,8 +1515,15 @@ mod tests {
             provider_guard.settings_config["autoSyncState"]["lastWritten"],
             json!({ "ACW": "160000", "MAX": "200000" })
         );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let captured_guard = captured.lock().unwrap();
+        assert_eq!(
+            captured_guard.as_ref().unwrap()["autoSyncState"]["lastWritten"],
+            json!({ "ACW": "160000", "MAX": "200000" })
+        );
     }
 
+    #[cfg(unix)]
     #[test]
     fn handle_settings_change_keeps_last_written_when_update_fails() {
         let dir = tempfile::tempdir().unwrap();
@@ -1476,7 +1547,23 @@ mod tests {
         ));
         let state = Mutex::new(None);
 
-        handle_settings_change(&path, &provider, &state);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(dir.path()).unwrap().permissions();
+            permissions.set_mode(0o555);
+            std::fs::set_permissions(dir.path(), permissions).unwrap();
+        }
+
+        handle_settings_change(&path, &provider, &state, &noop_persist());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(dir.path()).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(dir.path(), permissions).unwrap();
+        }
 
         let provider_guard = provider.lock().unwrap();
         assert_eq!(
@@ -1515,7 +1602,10 @@ mod tests {
         ));
         let state = Mutex::new(None);
 
-        handle_settings_change(&path, &provider, &state);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let captured = Arc::new(Mutex::new(None));
+        let persist = recording_persist(calls.clone(), captured.clone());
+        handle_settings_change(&path, &provider, &state, &persist);
 
         let content = std::fs::read_to_string(&path).unwrap();
         let v: Value = serde_json::from_str(&content).unwrap();
@@ -1535,6 +1625,127 @@ mod tests {
             provider_guard.settings_config["autoSyncState"]["lastWritten"],
             json!({ "ACW": "160000", "MAX": "200000" })
         );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let captured_guard = captured.lock().unwrap();
+        assert_eq!(
+            captured_guard.as_ref().unwrap()["autoSyncState"]["userExplicit"],
+            json!({ "ACW": "250000", "MAX": "250000" })
+        );
+        assert!(
+            captured_guard.as_ref().unwrap()["autoSyncState"]["userExplicit"]
+                .get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+                .is_none()
+        );
+        assert!(
+            captured_guard.as_ref().unwrap()["autoSyncState"]["userExplicit"]
+                .get("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn handle_settings_change_records_user_explicit_before_static_injection_early_return() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let initial = json!({
+            "model": "sonnet",
+            "env": {
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "kimi-for-coding",
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "111111",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "111111"
+            },
+            "autoSyncState": { "staticInjected": { "ACW": "262144", "MAX": "262144" } }
+        });
+        fs::write(&path, initial.to_string()).unwrap();
+
+        let provider = Mutex::new(Provider::with_id(
+            "kimi".to_string(),
+            "Kimi For Coding".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding/",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "kimi-for-coding"
+                },
+                "autoSyncContextWindow": true,
+                "autoSyncCompactRatio": 0.8,
+                "autoSyncState": { "staticInjected": { "ACW": "262144", "MAX": "262144" } }
+            }),
+            None,
+        ));
+
+        let state = Mutex::new(None);
+        handle_settings_change(&path, &provider, &state, &noop_persist());
+
+        let content = fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "111111");
+        assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "111111");
+
+        let provider_guard = provider.lock().unwrap();
+        assert_eq!(
+            provider_guard.settings_config["autoSyncState"]["userExplicit"],
+            json!({ "ACW": "111111", "MAX": "111111" })
+        );
+    }
+
+    #[test]
+    fn handle_settings_change_records_user_explicit_when_no_active_model_window() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let initial = json!({
+            "model": "subagent",
+            "env": {
+                "CLAUDE_CODE_SUBAGENT_MODEL": "deepseek-v4-flash",
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "111111",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "111111"
+            }
+        });
+        fs::write(&path, initial.to_string()).unwrap();
+
+        let provider = Mutex::new(Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "env": { "CLAUDE_CODE_SUBAGENT_MODEL": "deepseek-v4-flash" },
+                "contextWindows": {},
+                "autoSyncContextWindow": true
+            }),
+            None,
+        ));
+
+        let state = Mutex::new(None);
+        handle_settings_change(&path, &provider, &state, &noop_persist());
+
+        let content = fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "111111");
+        assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "111111");
+
+        let provider_guard = provider.lock().unwrap();
+        assert_eq!(
+            provider_guard.settings_config["autoSyncState"]["userExplicit"],
+            json!({ "ACW": "111111", "MAX": "111111" })
+        );
+    }
+
+    #[test]
+    fn record_user_explicit_uses_short_keys() {
+        let mut provider = make_provider(json!({ "autoSyncContextWindow": true }));
+        record_user_explicit(&mut provider, Some("1"), Some("2"));
+        assert_eq!(
+            provider.settings_config["autoSyncState"]["userExplicit"],
+            json!({ "ACW": "1", "MAX": "2" })
+        );
+        assert!(provider.settings_config["autoSyncState"]["userExplicit"]
+            .get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+            .is_none());
+        assert!(provider.settings_config["autoSyncState"]["userExplicit"]
+            .get("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+            .is_none());
     }
 
     #[test]
