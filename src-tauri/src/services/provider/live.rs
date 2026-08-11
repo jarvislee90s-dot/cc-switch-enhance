@@ -215,31 +215,37 @@ fn apply_context_window_defaults(settings: &mut Value, provider: &Provider) {
 /// proxy 接管需要 subagent 的本地 1M 标记；直连写 live 前再由
 /// `strip_legacy_suffixes_from_claude_models` 统一剥离。
 fn restore_claude_subagent_local_marker_for_effective(settings: &mut Value, provider: &Provider) {
-    let Some(provider_env) = provider
-        .settings_config
-        .get("env")
-        .and_then(Value::as_object)
-    else {
+    let Some(window) = crate::claude_desktop_config::resolve_context_window(
+        &provider.settings_config,
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+    ) else {
         return;
     };
-    let Some(model) = provider_env
+    if window < 1_000_000 {
+        return;
+    }
+
+    let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let Some(model) = env
         .get("CLAUDE_CODE_SUBAGENT_MODEL")
         .and_then(Value::as_str)
     else {
         return;
     };
-    if !crate::claude_desktop_config::parse_context_window_suffix(model)
+
+    if crate::claude_desktop_config::parse_context_window_suffix(model)
         .1
-        .is_some_and(|window| window >= 1_000_000)
+        .is_some()
     {
         return;
     }
-    if let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) {
-        env.insert(
-            "CLAUDE_CODE_SUBAGENT_MODEL".to_string(),
-            Value::String(model.to_string()),
-        );
-    }
+
+    env.insert(
+        "CLAUDE_CODE_SUBAGENT_MODEL".to_string(),
+        Value::String(format!("{model}[1M]")),
+    );
 }
 
 pub(crate) fn strip_legacy_suffixes_from_claude_models(settings: &mut Value) {
@@ -2347,6 +2353,45 @@ mod tests {
     }
 
     #[test]
+    fn restore_subagent_local_marker_uses_context_windows_when_env_is_clean() {
+        let provider_200k = Provider::with_id(
+            "p-clean-200k".to_string(),
+            "P Clean 200k".to_string(),
+            json!({
+                "env": { "CLAUDE_CODE_SUBAGENT_MODEL": "subagent-model" },
+                "contextWindows": { "CLAUDE_CODE_SUBAGENT_MODEL": 200000 }
+            }),
+            None,
+        );
+        let mut effective_200k = json!({
+            "env": { "CLAUDE_CODE_SUBAGENT_MODEL": "subagent-model" }
+        });
+        restore_claude_subagent_local_marker_for_effective(&mut effective_200k, &provider_200k);
+        assert_eq!(
+            effective_200k["env"]["CLAUDE_CODE_SUBAGENT_MODEL"],
+            "subagent-model"
+        );
+
+        let provider_1m = Provider::with_id(
+            "p-clean-1m".to_string(),
+            "P Clean 1M".to_string(),
+            json!({
+                "env": { "CLAUDE_CODE_SUBAGENT_MODEL": "subagent-model" },
+                "contextWindows": { "CLAUDE_CODE_SUBAGENT_MODEL": 1000000 }
+            }),
+            None,
+        );
+        let mut effective_1m = json!({
+            "env": { "CLAUDE_CODE_SUBAGENT_MODEL": "subagent-model" }
+        });
+        restore_claude_subagent_local_marker_for_effective(&mut effective_1m, &provider_1m);
+        assert_eq!(
+            effective_1m["env"]["CLAUDE_CODE_SUBAGENT_MODEL"],
+            "subagent-model[1M]"
+        );
+    }
+
+    #[test]
     #[serial]
     fn direct_live_writes_clean_models_and_persists_static_injected() {
         let _home = TempHome::new();
@@ -3390,6 +3435,44 @@ base_url = "https://a.example/v1"
         assert!(
             settings["autoSyncState"].get("staticInjected").is_none(),
             "empty contextWindows must clear stale staticInjected"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn write_live_with_common_config_clears_stale_static_injected_in_db() {
+        let _home = TempHome::new();
+        let db = Database::memory().expect("create memory db");
+        let provider = Provider::with_id(
+            "clear-stale-db".to_string(),
+            "Clear Stale DB".to_string(),
+            json!({
+                "env": { "ANTHROPIC_MODEL": "fallback-model" },
+                "contextWindows": {},
+                "autoSyncState": {
+                    "lastWritten": { "model": "sonnet" },
+                    "staticInjected": { "ACW": "1000000", "MAX": "1000000" }
+                }
+            }),
+            None,
+        );
+        db.save_provider(AppType::Claude.as_str(), &provider)
+            .expect("save provider");
+        write_live_with_common_config(&db, &AppType::Claude, &provider).expect("write live");
+
+        let stored = db
+            .get_provider_by_id("clear-stale-db", AppType::Claude.as_str())
+            .expect("get stored provider")
+            .expect("stored provider exists");
+        assert_eq!(
+            stored.settings_config["autoSyncState"]["lastWritten"],
+            json!({ "model": "sonnet" })
+        );
+        assert!(
+            stored.settings_config["autoSyncState"]
+                .get("staticInjected")
+                .is_none(),
+            "empty contextWindows must remove stale staticInjected from DB"
         );
     }
 
