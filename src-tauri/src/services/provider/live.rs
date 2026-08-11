@@ -8,6 +8,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use toml_edit::{DocumentMut, Item, TableLike};
 
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
+
 use crate::app_config::AppType;
 use crate::codex_config::{get_codex_auth_path, get_codex_config_path};
 use crate::config::{delete_file, get_claude_settings_path, read_json_file, write_json_file};
@@ -882,7 +884,7 @@ fn claude_watcher_persist_callback(
     provider_id: &str,
 ) -> crate::claude_settings_watcher::PersistSettingsCallback {
     // notify 后台线程要求回调 'static，Database 不是 Clone；这里从当前连接拿到
-    // DB 文件路径，回调内打开同一文件再调用 update_provider_settings_config。
+    // DB 文件路径，回调内打开同一文件并在事务里只合并 autoSyncState 后更新。
     let db_path = db
         .conn
         .lock()
@@ -895,25 +897,40 @@ fn claude_watcher_persist_callback(
         let Some(db_path) = db_path.as_ref() else {
             return Err("cannot persist watcher state to in-memory database".to_string());
         };
-        let conn = rusqlite::Connection::open(db_path).map_err(|e| e.to_string())?;
+        let mut conn = rusqlite::Connection::open(db_path).map_err(|e| e.to_string())?;
         // watcher 线程可能与应用主连接并发写同一 DB，避免立刻 SQLITE_BUSY 失败。
         conn.busy_timeout(Duration::from_secs(5))
             .map_err(|e| format!("set watcher DB busy_timeout: {e}"))?;
-        let db = Database {
-            conn: std::sync::Mutex::new(conn),
-        };
-        let Some(stored) = db
-            .get_provider_by_id(&provider_id, &app_type_str)
-            .map_err(|e| e.to_string())?
-        else {
+        // 用 BEGIN IMMEDIATE 事务包住 read-modify-write，避免与应用主连接并发更新时互相覆盖。
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let stored_settings: Option<String> = tx
+            .query_row(
+                "SELECT settings_config FROM providers WHERE id = ?1 AND app_type = ?2",
+                params![provider_id, app_type_str],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some(stored_settings) = stored_settings else {
             return Err(format!(
                 "provider {provider_id} not found while persisting watcher state"
             ));
         };
-        let mut stored_settings = stored.settings_config;
+        let mut stored_settings: Value =
+            serde_json::from_str(&stored_settings).map_err(|e| e.to_string())?;
         merge_watcher_auto_sync_state(&mut stored_settings, &settings);
-        db.update_provider_settings_config(&app_type_str, &provider_id, &stored_settings)
-            .map_err(|e| e.to_string())
+        tx.execute(
+            "UPDATE providers SET settings_config = ?1 WHERE id = ?2 AND app_type = ?3",
+            params![
+                serde_json::to_string(&stored_settings).map_err(|e| e.to_string())?,
+                provider_id,
+                app_type_str
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
     })
 }
 
