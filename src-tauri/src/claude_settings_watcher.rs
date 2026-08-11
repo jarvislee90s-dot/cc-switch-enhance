@@ -288,6 +288,11 @@ fn handle_settings_change(
         .pointer("/env/CLAUDE_CODE_MAX_CONTEXT_TOKENS")
         .and_then(Value::as_str);
 
+    let previous_snapshot = state
+        .lock()
+        .expect("settings watcher mutex poisoned")
+        .clone();
+
     // 3. 检查 model / ACW / MAX 任一变化（防循环）
     if !should_process(state, new_model, new_acw, new_max) {
         return;
@@ -296,6 +301,7 @@ fn handle_settings_change(
     let mut provider = provider
         .lock()
         .expect("settings watcher provider mutex poisoned");
+    let previous_settings = provider.settings_config.clone();
 
     // 4. 检查 provider 的 autoSyncContextWindow 开关
     let auto_sync = provider
@@ -319,7 +325,11 @@ fn handle_settings_change(
     });
     if explicit_acw.is_some() || explicit_max.is_some() {
         record_user_explicit(&mut *provider, explicit_acw, explicit_max);
-        persist_settings(persist, &provider);
+        if !persist_settings(persist, &provider) {
+            provider.settings_config = previous_settings;
+            *state.lock().expect("settings watcher mutex poisoned") = previous_snapshot;
+            return;
+        }
     }
     if is_user_explicit(&provider, "ACW") || is_user_explicit(&provider, "MAX") {
         log::debug!("[ClaudeSettingsWatcher] user explicit ACW/MAX, skip rewrite");
@@ -372,24 +382,32 @@ fn handle_settings_change(
         log::warn!("[ClaudeSettingsWatcher] write failed: {e}");
     } else {
         record_last_written(&mut *provider, &writes[0].1, &writes[1].1);
-        persist_settings(persist, &provider);
-        record_processed_state(
-            state,
-            Some(active.model.as_str()),
-            Some(&writes[0].1),
-            Some(&writes[1].1),
-        );
-        log::info!(
-            "[ClaudeSettingsWatcher] wrote ACW/MAX for model={} window={}",
-            active.model,
-            active.window
-        );
+        if !persist_settings(persist, &provider) {
+            provider.settings_config = previous_settings;
+            *state.lock().expect("settings watcher mutex poisoned") = previous_snapshot;
+        } else {
+            record_processed_state(
+                state,
+                Some(active.model.as_str()),
+                Some(&writes[0].1),
+                Some(&writes[1].1),
+            );
+            log::info!(
+                "[ClaudeSettingsWatcher] wrote ACW/MAX for model={} window={}",
+                active.model,
+                active.window
+            );
+        }
     }
 }
 
-fn persist_settings(persist: &PersistSettingsCallback, provider: &Provider) {
-    if let Err(e) = persist(provider.settings_config.clone()) {
-        log::warn!("[ClaudeSettingsWatcher] failed to persist autoSyncState: {e}");
+fn persist_settings(persist: &PersistSettingsCallback, provider: &Provider) -> bool {
+    match persist(provider.settings_config.clone()) {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("[ClaudeSettingsWatcher] failed to persist autoSyncState: {e}");
+            false
+        }
     }
 }
 
@@ -511,6 +529,10 @@ mod tests {
             *captured.lock().unwrap() = Some(settings);
             Ok(())
         })
+    }
+
+    fn failing_persist() -> Arc<dyn Fn(Value) -> Result<(), String> + Send + Sync> {
+        Arc::new(|_| Err("db unavailable".to_string()))
     }
 
     // ========== Task 2: 角色映射测试 ==========
@@ -1523,14 +1545,126 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn handle_settings_change_keeps_last_written_when_update_fails() {
+    fn handle_settings_change_rolls_back_state_when_persist_fails_after_write() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let initial = json!({
+            "model": "haiku",
+            "env": { "ANTHROPIC_DEFAULT_HAIKU_MODEL": "Kimi-K2.7-Code[30k]" }
+        });
+        fs::write(&path, initial.to_string()).unwrap();
+
+        let provider = Mutex::new(Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "env": { "ANTHROPIC_DEFAULT_HAIKU_MODEL": "Kimi-K2.7-Code[30k]" },
+                "contextWindows": { "ANTHROPIC_DEFAULT_HAIKU_MODEL": 30000 },
+                "autoSyncContextWindow": true,
+                "autoSyncState": { "lastWritten": { "ACW": "1", "MAX": "2" } }
+            }),
+            None,
+        ));
+        let previous = Some(WatcherSnapshot {
+            model: Some("sonnet".to_string()),
+            acw: None,
+            max: None,
+        });
+        let state = Mutex::new(previous.clone());
+
+        handle_settings_change(&path, &provider, &state, &failing_persist());
+
+        let content = fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "30000");
+        assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "30000");
+
+        let provider_guard = provider.lock().unwrap();
+        assert_eq!(
+            provider_guard.settings_config["autoSyncState"]["lastWritten"],
+            json!({ "ACW": "1", "MAX": "2" })
+        );
+        drop(provider_guard);
+        assert_eq!(*state.lock().unwrap(), previous);
+        assert!(should_process(
+            &state,
+            Some("haiku"),
+            Some("30000"),
+            Some("30000")
+        ));
+    }
+
+    #[test]
+    fn handle_settings_change_rolls_back_state_when_persist_fails_for_user_explicit() {
+        use std::fs;
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         let initial = json!({
             "model": "sonnet",
-            "env": []
+            "env": {
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2",
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "250000",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "250000"
+            }
+        });
+        fs::write(&path, initial.to_string()).unwrap();
+
+        let provider = Mutex::new(Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "env": { "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2" },
+                "contextWindows": { "ANTHROPIC_DEFAULT_SONNET_MODEL": 200000 },
+                "autoSyncContextWindow": true,
+                "autoSyncState": { "lastWritten": { "ACW": "1", "MAX": "2" } }
+            }),
+            None,
+        ));
+        let previous = Some(WatcherSnapshot {
+            model: Some("sonnet".to_string()),
+            acw: None,
+            max: None,
+        });
+        let state = Mutex::new(previous.clone());
+
+        handle_settings_change(&path, &provider, &state, &failing_persist());
+
+        let content = fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "250000");
+        assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "250000");
+
+        let provider_guard = provider.lock().unwrap();
+        assert!(provider_guard
+            .settings_config
+            .pointer("/autoSyncState/userExplicit/ACW")
+            .is_none());
+        assert_eq!(
+            provider_guard.settings_config["autoSyncState"]["lastWritten"],
+            json!({ "ACW": "1", "MAX": "2" })
+        );
+        drop(provider_guard);
+        assert_eq!(*state.lock().unwrap(), previous);
+        assert!(should_process(
+            &state,
+            Some("sonnet"),
+            Some("250000"),
+            Some("250000")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_settings_change_keeps_last_written_when_atomic_write_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let initial = json!({
+            "model": "sonnet",
+            "env": { "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2" }
         });
         std::fs::write(&path, initial.to_string()).unwrap();
 
