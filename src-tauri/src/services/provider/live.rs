@@ -932,6 +932,12 @@ fn restore_claude_internal_fields_for_backfill(settings: &mut Value, provider: &
     if let Some(value) = provider.settings_config.get("autoSyncCompactRatio") {
         obj.insert("autoSyncCompactRatio".to_string(), value.clone());
     }
+    if let Some(value) = provider.settings_config.get("contextWindows") {
+        obj.insert("contextWindows".to_string(), value.clone());
+    }
+    if let Some(value) = provider.settings_config.get("autoSyncState") {
+        obj.insert("autoSyncState".to_string(), value.clone());
+    }
 }
 
 fn restore_live_settings_for_provider_backfill(
@@ -3107,7 +3113,51 @@ base_url = "https://a.example/v1"
     }
 
     #[test]
+    fn claude_backfill_preserves_all_internal_fields() {
+        let db = Database::memory().expect("create memory db");
+        let provider = Provider::with_id(
+            "test".to_string(),
+            "Test".to_string(),
+            json!({
+                "env": { "ANTHROPIC_MODEL": "fallback-model[1M]" },
+                "autoSyncContextWindow": false,
+                "autoSyncCompactRatio": 0.8,
+                "contextWindows": { "fallback-model[1M]": 1000000 },
+                "autoSyncState": { "lastWritten": {} }
+            }),
+            None,
+        );
 
+        // 写 live 时四个内部字段都会被 sanitize 移除，切走回填时必须从 provider 恢复。
+        let live = sanitize_claude_settings_for_live(
+            &build_effective_settings_with_common_config(&db, &AppType::Claude, &provider)
+                .expect("build effective settings"),
+        );
+        for key in [
+            "autoSyncContextWindow",
+            "autoSyncCompactRatio",
+            "contextWindows",
+            "autoSyncState",
+        ] {
+            assert!(live.get(key).is_none(), "{key} leaked into live settings");
+        }
+
+        let backfilled =
+            strip_common_config_from_live_settings(&db, &AppType::Claude, &provider, live);
+        assert_eq!(backfilled["autoSyncContextWindow"], json!(false));
+        assert_eq!(backfilled["autoSyncCompactRatio"], json!(0.8));
+        assert_eq!(
+            backfilled["contextWindows"],
+            json!({ "fallback-model[1M]": 1000000 })
+        );
+        assert_eq!(backfilled["autoSyncState"], json!({ "lastWritten": {} }));
+        assert_eq!(
+            backfilled["env"]["ANTHROPIC_MODEL"],
+            json!("fallback-model[1M]")
+        );
+    }
+
+    #[test]
     fn claude_backfill_preserves_auto_sync_context_window_flag() {
         let db = Database::memory().expect("create memory db");
         let provider = Provider::with_id(
