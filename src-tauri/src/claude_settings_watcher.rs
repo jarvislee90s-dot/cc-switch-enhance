@@ -248,10 +248,16 @@ fn handle_settings_change(
         return;
     }
 
-    // Kimi / Codex OAuth 的 ACW/MAX 由静态注入写入 live，watcher 不应再按
-    // autoSyncCompactRatio 重写；只有用户显式修改或下次切换供应商时才更新。
-    if crate::services::provider::is_kimi_for_coding_provider(provider) || provider.is_codex_oauth()
-    {
+    // 只有静态注入实际生效的路径需要跳过：Kimi 固定注入，或 Codex OAuth 的
+    // env 模型全部指向 gpt-5.6。其他 Codex OAuth 配置仍按 contextWindows 增强。
+    let provider_env = provider
+        .settings_config
+        .get("env")
+        .and_then(Value::as_object);
+    let static_injection_active = crate::services::provider::is_kimi_for_coding_provider(provider)
+        || (provider.is_codex_oauth()
+            && crate::services::provider::provider_env_targets_gpt56(provider_env));
+    if static_injection_active {
         log::debug!(
             "[ClaudeSettingsWatcher] static ACW/MAX for {}, skip watcher rewrite",
             provider.name
@@ -931,6 +937,51 @@ mod tests {
         let v: Value = serde_json::from_str(&content).unwrap();
         assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "372000");
         assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "372000");
+    }
+
+    #[test]
+    fn handle_settings_change_syncs_non_gpt56_codex_oauth_from_context_windows() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let initial = json!({
+            "model": "haiku",
+            "env": {
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-5.5-mini",
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "111111",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "222222"
+            }
+        });
+        fs::write(&path, initial.to_string()).unwrap();
+
+        let mut provider = Provider::with_id(
+            "codex-oauth-non-gpt56".to_string(),
+            "Codex Non-GPT56".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "gpt-5.5",
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-5.5-mini"
+                },
+                "contextWindows": { "ANTHROPIC_DEFAULT_HAIKU_MODEL": 432000 },
+                "autoSyncContextWindow": true,
+                "autoSyncCompactRatio": 0.8
+            }),
+            None,
+        );
+        provider.meta = Some(crate::provider::ProviderMeta {
+            provider_type: Some("codex_oauth".to_string()),
+            ..Default::default()
+        });
+
+        // 模拟 model 从 sonnet 切到 haiku，且 provider 不触发 gpt-5.6 静态注入。
+        let state = Mutex::new(Some("sonnet".to_string()));
+        handle_settings_change(&path, &provider, &state);
+
+        let content = fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "345600");
+        assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "432000");
     }
     #[test]
     fn fs_real_watcher_effort_change_no_trigger() {
