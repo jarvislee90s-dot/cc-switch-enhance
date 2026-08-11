@@ -248,37 +248,37 @@ impl ProxyService {
         Self::push_claude_takeover_role_fields(
             &mut fields,
             env,
+            config,
             "ANTHROPIC_DEFAULT_HAIKU_MODEL",
             "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
             CLAUDE_TAKEOVER_HAIKU_MODEL,
-            false,
             haiku_model,
         );
         Self::push_claude_takeover_role_fields(
             &mut fields,
             env,
+            config,
             "ANTHROPIC_DEFAULT_SONNET_MODEL",
             "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
             CLAUDE_TAKEOVER_SONNET_MODEL,
-            true,
             sonnet_model,
         );
         Self::push_claude_takeover_role_fields(
             &mut fields,
             env,
+            config,
             "ANTHROPIC_DEFAULT_OPUS_MODEL",
             "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
             CLAUDE_TAKEOVER_OPUS_MODEL,
-            true,
             opus_model,
         );
         Self::push_claude_takeover_role_fields(
             &mut fields,
             env,
+            config,
             "ANTHROPIC_DEFAULT_FABLE_MODEL",
             "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME",
             CLAUDE_TAKEOVER_FABLE_MODEL,
-            true,
             fable_model,
         );
         if let Some(subagent_model) = subagent_model {
@@ -290,10 +290,10 @@ impl ProxyService {
     fn push_claude_takeover_role_fields(
         fields: &mut Vec<(&'static str, String)>,
         env: &Map<String, Value>,
+        config: &Value,
         model_key: &'static str,
         name_key: &'static str,
         takeover_model: &'static str,
-        supports_one_m: bool,
         upstream_model: Option<&str>,
     ) {
         let Some(upstream_model) = upstream_model else {
@@ -301,7 +301,8 @@ impl ProxyService {
         };
 
         let mut client_model = takeover_model.to_string();
-        if supports_one_m && Self::has_claude_one_m_marker(upstream_model) {
+        let window = crate::claude_desktop_config::resolve_context_window(config, model_key);
+        if window.is_some_and(|w| w >= 1_000_000) {
             client_model.push_str(CLAUDE_ONE_M_MARKER_FOR_CLIENT);
         }
         fields.push((model_key, client_model));
@@ -319,12 +320,6 @@ impl ProxyService {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-    }
-
-    fn has_claude_one_m_marker(model: &str) -> bool {
-        crate::claude_desktop_config::parse_context_window_suffix(model)
-            .1
-            .is_some()
     }
 
     fn strip_claude_one_m_marker(model: &str) -> String {
@@ -3310,6 +3305,68 @@ mod tests {
             .expect("serialize models_cache"),
         )
         .expect("write models_cache.json");
+    }
+
+    #[test]
+    fn takeover_does_not_append_one_m_for_200k_window() {
+        let config = json!({
+            "env": {
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2"
+            },
+            "contextWindows": {
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": 200000
+            }
+        });
+        let fields = ProxyService::build_claude_takeover_model_fields(&config);
+        let sonnet = fields
+            .iter()
+            .find(|(k, _)| *k == "ANTHROPIC_DEFAULT_SONNET_MODEL")
+            .unwrap()
+            .1
+            .clone();
+        assert!(
+            !sonnet.contains("[1m]"),
+            "200K must not be declared as 1M: {sonnet}"
+        );
+    }
+
+    #[test]
+    fn takeover_does_not_append_one_m_for_200k_suffix() {
+        let config = json!({
+            "env": {
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2[200k]"
+            },
+            "contextWindows": {
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": 200000
+            }
+        });
+        let fields = ProxyService::build_claude_takeover_model_fields(&config);
+        let sonnet = fields
+            .iter()
+            .find(|(k, _)| *k == "ANTHROPIC_DEFAULT_SONNET_MODEL")
+            .unwrap()
+            .1
+            .clone();
+        assert!(
+            !sonnet.contains("[1m]"),
+            "200K suffix must not be declared as 1M: {sonnet}"
+        );
+    }
+
+    #[test]
+    fn takeover_appends_one_m_only_for_1m_window() {
+        let config = json!({
+            "env": { "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2" },
+            "contextWindows": { "ANTHROPIC_DEFAULT_SONNET_MODEL": 1000000 }
+        });
+        let fields = ProxyService::build_claude_takeover_model_fields(&config);
+        let sonnet = fields
+            .iter()
+            .find(|(k, _)| *k == "ANTHROPIC_DEFAULT_SONNET_MODEL")
+            .unwrap()
+            .1
+            .clone();
+        assert!(sonnet.contains("[1m]"));
     }
 
     #[test]
