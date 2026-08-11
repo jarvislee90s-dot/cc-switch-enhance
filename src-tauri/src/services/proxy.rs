@@ -1839,8 +1839,11 @@ impl ProxyService {
             .await
             .map_err(|e| format!("获取 {app_type_str} Live 备份失败: {e}"))?;
         if let Some(backup) = backup {
-            let config: Value = serde_json::from_str(&backup.original_config)
+            let mut config: Value = serde_json::from_str(&backup.original_config)
                 .map_err(|e| format!("解析 {app_type_str} 备份失败: {e}"))?;
+            if matches!(app_type, AppType::Claude) {
+                crate::services::provider::strip_legacy_suffixes_from_claude_models(&mut config);
+            }
 
             // 备份若是代理占位符（异常历史：上次 stop 失败导致 Live 留在了代理状态，
             // 下次接管时又被错误地备份成"原始 Live"），不能直接用 — 否则 stop 后
@@ -7097,6 +7100,10 @@ requires_openai_auth = true
             .restore_live_config_for_app_inner(&AppType::Claude)
             .await
             .expect("restore claude live");
+        service
+            .restore_live_config_for_app_with_fallback_inner(&AppType::Claude)
+            .await
+            .expect("restore claude live via fallback");
 
         let live = service.read_claude_live().expect("read live");
         let env = live
