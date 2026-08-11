@@ -85,6 +85,30 @@ const CLAUDE_CONTEXT_WINDOW_ENV_KEYS: [&str; 2] = [
     "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
 ];
 
+fn record_static_injected(settings: &mut Value, acw: &str, max: &str) {
+    let Some(obj) = settings.as_object_mut() else {
+        return;
+    };
+    let state = obj.entry("autoSyncState").or_insert_with(|| json!({}));
+    if !state.is_object() {
+        *state = json!({});
+    }
+    let state = state.as_object_mut().expect("autoSyncState object");
+    state.insert(
+        "staticInjected".to_string(),
+        json!({ "ACW": acw, "MAX": max }),
+    );
+}
+
+fn clear_static_injected(settings: &mut Value) {
+    if let Some(state) = settings
+        .get_mut("autoSyncState")
+        .and_then(Value::as_object_mut)
+    {
+        state.remove("staticInjected");
+    }
+}
+
 /// Claude Code assigns unknown non-Claude model ids a 200K context window.
 /// Codex OAuth deliberately exposes GPT ids through Claude Code, so enrich the
 /// effective live settings for both newly-created and already-saved providers.
@@ -95,19 +119,46 @@ fn apply_codex_oauth_claude_context_defaults(settings: &mut Value, provider: &Pr
         return;
     }
 
-    // 开启时只保留用户显式写入的值，不再自动注入固定默认。无后缀兜底
-    // 由 watcher 在终端切换模型时按 Codex OAuth 固定窗口写入。
     let provider_env = provider
         .settings_config
         .get("env")
         .and_then(Value::as_object);
-    let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) else {
-        return;
-    };
-    for key in CLAUDE_CONTEXT_WINDOW_ENV_KEYS {
-        if let Some(value) = provider_env.and_then(|provider_env| provider_env.get(key)) {
-            env.insert(key.to_string(), value.clone());
+    let inject_defaults = provider_env_targets_gpt56(provider_env);
+    let (has_explicit, injected_count) = {
+        let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) else {
+            return;
+        };
+        let mut has_explicit = false;
+        let mut injected_count = 0;
+        for (key, default_value) in [
+            (
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+                CODEX_OAUTH_CLAUDE_MAX_CONTEXT_TOKENS,
+            ),
+            (
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+                CODEX_OAUTH_CLAUDE_AUTO_COMPACT_WINDOW,
+            ),
+        ] {
+            if let Some(value) = provider_env.and_then(|provider_env| provider_env.get(key)) {
+                env.insert(key.to_string(), value.clone());
+                has_explicit = true;
+            } else if inject_defaults {
+                env.insert(key.to_string(), Value::String(default_value.to_string()));
+                injected_count += 1;
+            }
         }
+        (has_explicit, injected_count)
+    };
+
+    if has_explicit {
+        clear_static_injected(settings);
+    } else if injected_count == 2 {
+        record_static_injected(
+            settings,
+            CODEX_OAUTH_CLAUDE_AUTO_COMPACT_WINDOW,
+            CODEX_OAUTH_CLAUDE_MAX_CONTEXT_TOKENS,
+        );
     }
 }
 
@@ -121,19 +172,39 @@ fn apply_kimi_for_coding_context_defaults(settings: &mut Value, provider: &Provi
         return;
     }
 
-    // 开启时只保留用户显式写入的值，不再自动注入固定默认。无后缀兜底
-    // 由 watcher 在终端切换模型时按 Kimi 固定窗口写入。
     let provider_env = provider
         .settings_config
         .get("env")
         .and_then(Value::as_object);
-    let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) else {
-        return;
-    };
-    for key in CLAUDE_CONTEXT_WINDOW_ENV_KEYS {
-        if let Some(value) = provider_env.and_then(|provider_env| provider_env.get(key)) {
-            env.insert(key.to_string(), value.clone());
+    let (has_explicit, injected_count) = {
+        let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) else {
+            return;
+        };
+        let mut has_explicit = false;
+        let mut injected_count = 0;
+        for key in CLAUDE_CONTEXT_WINDOW_ENV_KEYS {
+            if let Some(value) = provider_env.and_then(|provider_env| provider_env.get(key)) {
+                env.insert(key.to_string(), value.clone());
+                has_explicit = true;
+            } else {
+                env.insert(
+                    key.to_string(),
+                    Value::String(KIMI_FOR_CODING_CONTEXT_TOKENS.to_string()),
+                );
+                injected_count += 1;
+            }
         }
+        (has_explicit, injected_count)
+    };
+
+    if has_explicit {
+        clear_static_injected(settings);
+    } else if injected_count == 2 {
+        record_static_injected(
+            settings,
+            KIMI_FOR_CODING_CONTEXT_TOKENS,
+            KIMI_FOR_CODING_CONTEXT_TOKENS,
+        );
     }
 }
 
@@ -825,9 +896,10 @@ pub(crate) fn build_effective_settings_with_common_config(
             &mut effective_settings,
         );
         restore_claude_subagent_local_marker_for_effective(&mut effective_settings, provider);
+        // contextWindows 先注入；Kimi/Codex OAuth 固定兜底后写，避免 staticInjected 被误判为显式清掉。
+        apply_context_window_defaults(&mut effective_settings, provider);
         apply_codex_oauth_claude_context_defaults(&mut effective_settings, provider);
         apply_kimi_for_coding_context_defaults(&mut effective_settings, provider);
-        apply_context_window_defaults(&mut effective_settings, provider);
     }
 
     // 启动 settings.json 监听器，在后台自动同步 ACW/MAX 当用户 /model 切换时
@@ -2504,13 +2576,18 @@ mod tests {
         let effective =
             build_effective_settings_with_common_config(&db, &AppType::Claude, &provider)
                 .expect("build effective settings");
-        // 不再自动补齐 MAX，只保留用户显式 ACW；MAX 由 watcher 在模型切换时写入
-        assert!(effective["env"]
-            .get("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
-            .is_none());
+        // 用户显式 ACW 保留；MAX 缺省时仍补静态默认 262144
+        assert_eq!(
+            effective["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
+            json!("262144")
+        );
         assert_eq!(
             effective["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
             json!("262144")
+        );
+        assert!(
+            effective["autoSyncState"].get("staticInjected").is_none(),
+            "user explicit ACW must suppress staticInjected"
         );
     }
 
@@ -2540,6 +2617,72 @@ mod tests {
         assert_eq!(
             effective["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
             json!("250000")
+        );
+        assert!(
+            effective["autoSyncState"].get("staticInjected").is_none(),
+            "user explicit ACW/MAX must not be marked as staticInjected"
+        );
+    }
+
+    #[test]
+    fn kimi_restores_static_262144_injection() {
+        let db = Database::memory().expect("create memory db");
+        let provider = Provider::with_id(
+            "kimi".to_string(),
+            "Kimi".to_string(),
+            json!({
+                "env": { "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding/" }
+            }),
+            None,
+        );
+
+        let effective =
+            build_effective_settings_with_common_config(&db, &AppType::Claude, &provider)
+                .expect("build effective settings");
+        assert_eq!(
+            effective["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
+            json!("262144")
+        );
+        assert_eq!(
+            effective["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
+            json!("262144")
+        );
+        assert_eq!(
+            effective["autoSyncState"]["staticInjected"],
+            json!({ "ACW": "262144", "MAX": "262144" })
+        );
+    }
+
+    #[test]
+    fn kimi_static_injection_wins_over_context_windows() {
+        let db = Database::memory().expect("create memory db");
+        let provider = Provider::with_id(
+            "kimi-with-context-windows".to_string(),
+            "Kimi With Context Windows".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding/",
+                    "ANTHROPIC_MODEL": "kimi-for-coding"
+                },
+                "contextWindows": { "ANTHROPIC_MODEL": 800000 }
+            }),
+            None,
+        );
+
+        let effective =
+            build_effective_settings_with_common_config(&db, &AppType::Claude, &provider)
+                .expect("build effective settings");
+        assert_eq!(
+            effective["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
+            json!("262144")
+        );
+        assert_eq!(
+            effective["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
+            json!("262144")
+        );
+        assert_eq!(
+            effective["autoSyncState"]["staticInjected"],
+            json!({ "ACW": "262144", "MAX": "262144" })
         );
     }
 
@@ -2592,13 +2735,18 @@ mod tests {
         let effective =
             build_effective_settings_with_common_config(&db, &AppType::Claude, &provider)
                 .expect("build effective settings");
-        // 切换 provider 不自动注入固定默认，由 watcher 在终端模型切换时写入
-        assert!(effective["env"]
-            .get("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
-            .is_none());
-        assert!(effective["env"]
-            .get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
-            .is_none());
+        assert_eq!(
+            effective["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
+            json!("372000")
+        );
+        assert_eq!(
+            effective["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
+            json!("372000")
+        );
+        assert_eq!(
+            effective["autoSyncState"]["staticInjected"],
+            json!({ "ACW": "372000", "MAX": "372000" })
+        );
     }
 
     #[test]
@@ -2631,10 +2779,79 @@ mod tests {
             effective["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
             json!("350000")
         );
+        assert!(
+            effective["autoSyncState"].get("staticInjected").is_none(),
+            "user explicit ACW/MAX must not be marked as staticInjected"
+        );
     }
 
     #[test]
-    fn codex_oauth_context_defaults_preserve_legacy_common_config_values() {
+    fn codex_oauth_restores_static_372000_injection() {
+        let db = Database::memory().expect("create memory db");
+        let mut provider = Provider::with_id(
+            "codex-oauth".to_string(),
+            "Codex".to_string(),
+            json!({ "env": { "ANTHROPIC_MODEL": "gpt-5.6" } }),
+            None,
+        );
+        provider.meta = Some(crate::provider::ProviderMeta {
+            provider_type: Some("codex_oauth".to_string()),
+            ..Default::default()
+        });
+
+        let effective =
+            build_effective_settings_with_common_config(&db, &AppType::Claude, &provider)
+                .expect("build effective settings");
+        assert_eq!(
+            effective["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
+            json!("372000")
+        );
+        assert_eq!(
+            effective["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
+            json!("372000")
+        );
+        assert_eq!(
+            effective["autoSyncState"]["staticInjected"],
+            json!({ "ACW": "372000", "MAX": "372000" })
+        );
+    }
+
+    #[test]
+    fn codex_oauth_static_injection_wins_over_context_windows() {
+        let db = Database::memory().expect("create memory db");
+        let mut provider = Provider::with_id(
+            "codex-oauth-context-windows".to_string(),
+            "Codex With Context Windows".to_string(),
+            json!({
+                "env": { "ANTHROPIC_MODEL": "gpt-5.6" },
+                "contextWindows": { "ANTHROPIC_MODEL": 800000 }
+            }),
+            None,
+        );
+        provider.meta = Some(crate::provider::ProviderMeta {
+            provider_type: Some("codex_oauth".to_string()),
+            ..Default::default()
+        });
+
+        let effective =
+            build_effective_settings_with_common_config(&db, &AppType::Claude, &provider)
+                .expect("build effective settings");
+        assert_eq!(
+            effective["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
+            json!("372000")
+        );
+        assert_eq!(
+            effective["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
+            json!("372000")
+        );
+        assert_eq!(
+            effective["autoSyncState"]["staticInjected"],
+            json!({ "ACW": "372000", "MAX": "372000" })
+        );
+    }
+
+    #[test]
+    fn codex_oauth_context_defaults_override_legacy_common_config_values() {
         let db = Database::memory().expect("create memory db");
         db.set_config_snippet(
             AppType::Claude.as_str(),
@@ -2666,11 +2883,15 @@ mod tests {
                 .expect("build effective settings");
         assert_eq!(
             effective["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
-            json!("262144")
+            json!("372000")
         );
         assert_eq!(
             effective["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
-            json!("262144")
+            json!("372000")
+        );
+        assert_eq!(
+            effective["autoSyncState"]["staticInjected"],
+            json!({ "ACW": "372000", "MAX": "372000" })
         );
     }
 
@@ -2739,8 +2960,14 @@ mod tests {
         // 模拟写 live：注入了两个上下文默认值
         let live = build_effective_settings_with_common_config(&db, &AppType::Claude, &provider)
             .expect("build effective settings");
-        // 当前版本不再注入，live 本身不应包含这两个字段
-        assert!(live["env"].get("CLAUDE_CODE_MAX_CONTEXT_TOKENS").is_none());
+        assert_eq!(
+            live["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
+            json!("372000")
+        );
+        assert_eq!(
+            live["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
+            json!("372000")
+        );
 
         // 模拟切走回灌：注入产物被剥掉，其余字段原样保留
         let backfilled =
@@ -3877,7 +4104,7 @@ base_url = "https://a.example/v1"
     }
 
     #[test]
-    fn codex_oauth_context_defaults_skip_when_auto_sync_disabled() {
+    fn codex_oauth_context_defaults_inject_when_auto_sync_disabled() {
         let db = Database::memory().expect("create memory db");
         let mut provider = Provider::with_id(
             "codex-oauth".to_string(),
@@ -3896,17 +4123,23 @@ base_url = "https://a.example/v1"
         let effective =
             build_effective_settings_with_common_config(&db, &AppType::Claude, &provider)
                 .expect("build effective settings");
-        // 开关关闭：Codex OAuth 固定 372K 兜底也不注入
-        assert!(effective["env"]
-            .get("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
-            .is_none());
-        assert!(effective["env"]
-            .get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
-            .is_none());
+        // 静态兜底不依赖 watcher 开关
+        assert_eq!(
+            effective["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
+            json!("372000")
+        );
+        assert_eq!(
+            effective["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
+            json!("372000")
+        );
+        assert_eq!(
+            effective["autoSyncState"]["staticInjected"],
+            json!({ "ACW": "372000", "MAX": "372000" })
+        );
     }
 
     #[test]
-    fn kimi_for_coding_context_defaults_skip_when_auto_sync_disabled() {
+    fn kimi_for_coding_context_defaults_inject_when_auto_sync_disabled() {
         let db = Database::memory().expect("create memory db");
         let provider = Provider::with_id(
             "kimi-for-coding".to_string(),
@@ -3924,12 +4157,18 @@ base_url = "https://a.example/v1"
         let effective =
             build_effective_settings_with_common_config(&db, &AppType::Claude, &provider)
                 .expect("build effective settings");
-        // 开关关闭：Kimi 固定 256K 兜底也不注入
-        assert!(effective["env"]
-            .get("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
-            .is_none());
-        assert!(effective["env"]
-            .get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
-            .is_none());
+        // 静态兜底不依赖 watcher 开关
+        assert_eq!(
+            effective["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
+            json!("262144")
+        );
+        assert_eq!(
+            effective["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
+            json!("262144")
+        );
+        assert_eq!(
+            effective["autoSyncState"]["staticInjected"],
+            json!({ "ACW": "262144", "MAX": "262144" })
+        );
     }
 }
