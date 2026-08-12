@@ -78,26 +78,27 @@ pub fn parse_context_window_suffix(model: &str) -> (&str, Option<u64>) {
 }
 
 /// 将 env 中旧式模型名后缀迁移到独立的 contextWindows 字段，并清理模型名。
+/// Claude Code 各可配置角色对应的 env key。
+pub(crate) const CLAUDE_MODEL_ENV_KEYS: [&str; 6] = [
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+];
+
 #[allow(dead_code)]
 pub(crate) fn migrate_legacy_suffix_to_context_windows(
     settings_config: &mut serde_json::Value,
 ) -> bool {
-    const ROLE_KEYS: [&str; 6] = [
-        "ANTHROPIC_MODEL",
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-        "ANTHROPIC_DEFAULT_SONNET_MODEL",
-        "ANTHROPIC_DEFAULT_OPUS_MODEL",
-        "ANTHROPIC_DEFAULT_FABLE_MODEL",
-        "CLAUDE_CODE_SUBAGENT_MODEL",
-    ];
-
     // 先只读扫描，避免同时持有 env 和 contextWindows 的写借用。
     let pending = {
         let Some(env) = settings_config.get("env").and_then(Value::as_object) else {
             return false;
         };
         let mut pending: Vec<(&'static str, String, u64)> = Vec::new();
-        for key in ROLE_KEYS {
+        for key in CLAUDE_MODEL_ENV_KEYS {
             let Some(model) = env.get(key).and_then(Value::as_str) else {
                 continue;
             };

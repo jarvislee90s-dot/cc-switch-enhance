@@ -85,14 +85,7 @@ pub(crate) fn provider_compact_ratio(provider: &Provider) -> f64 {
 }
 
 /// Claude Code 中可配置模型角色对应的 env key，和 live 注入逻辑保持一致。
-const WATCHER_ROLE_ENV_KEYS: [&str; 6] = [
-    "ANTHROPIC_MODEL",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL",
-    "ANTHROPIC_DEFAULT_FABLE_MODEL",
-    "CLAUDE_CODE_SUBAGENT_MODEL",
-];
+const WATCHER_ROLE_ENV_KEYS: [&str; 6] = crate::claude_desktop_config::CLAUDE_MODEL_ENV_KEYS;
 
 /// 自动目标：普通角色窗口按压缩比例换算，静态兜底按原始 ACW/MAX 字符串匹配。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -580,7 +573,12 @@ fn is_auto_source_value(provider: &Provider, key: &str, value: &str) -> bool {
 
 /// live 值与 DB 账本、staticInjected，或任意已配置角色的自动目标一致时，视为自动来源。
 /// 用于 watcher 重建后 DB lastWritten 缺失/过期时，仍不会把自动写入误判为 userExplicit。
-fn is_auto_target_value(_settings: &Value, provider: &Provider, key: &str, value: &str) -> bool {
+pub(crate) fn is_auto_target_value(
+    _settings: &Value,
+    provider: &Provider,
+    key: &str,
+    value: &str,
+) -> bool {
     if is_auto_source_value(provider, key, value) {
         return true;
     }

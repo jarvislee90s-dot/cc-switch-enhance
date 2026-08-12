@@ -6,12 +6,10 @@ import {
   setClaudeOneMMarker,
   stripClaudeOneMMarker,
   setModelSuffix,
-  reapplySuffix,
   readContextWindows,
   writeContextWindow,
   stripModelSuffix,
   useModelState,
-  parseWindowToken,
 } from "@/components/providers/forms/hooks/useModelState";
 
 describe("useModelState", () => {
@@ -137,6 +135,8 @@ describe("useModelState", () => {
 
     env = JSON.parse(latestConfig).env;
     expect(env.CLAUDE_CODE_SUBAGENT_MODEL).toBeUndefined();
+    const cleared = JSON.parse(latestConfig);
+    expect(cleared.contextWindows.CLAUDE_CODE_SUBAGENT_MODEL).toBeUndefined();
   });
 
   it("normalizes Claude Code 1M markers for UI toggles", () => {
@@ -152,34 +152,87 @@ describe("useModelState", () => {
       "deepseek-v4-pro[1M]",
     );
   });
-});
 
-describe("parseWindowToken", () => {
-  it.each([
-    ["200K", 200000],
-    ["200k", 200000],
-    ["1M", 1000000],
-    ["1m", 1000000],
-    ["128000", 128000],
-  ])("接受 %s", (input, expected) => {
-    expect(parseWindowToken(input)).toBe(expected);
+  it("handleModelChange 将旧模型后缀迁移到 contextWindows", () => {
+    let latestConfig = JSON.stringify({
+      env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "glm-5.2[200k]" },
+    });
+    const onConfigChange = vi.fn((config: string) => {
+      latestConfig = config;
+    });
+
+    const { result } = renderHook(() =>
+      useModelState({
+        settingsConfig: latestConfig,
+        onConfigChange,
+      }),
+    );
+
+    act(() => {
+      result.current.handleModelChange(
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "glm-5.3",
+      );
+    });
+
+    const parsed = JSON.parse(latestConfig);
+    expect(parsed.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("glm-5.3");
+    expect(parsed.contextWindows.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe(200000);
   });
 
-  it.each([
-    "1e3",
-    "1foo2",
-    "12abc34",
-    "1.5M",
-    "1,000,000",
-    "1_000_000",
-    "1 000 000",
-    "0",
-    "1G",
-  ])("拒绝 %s", (input) => {
-    expect(parseWindowToken(input)).toBeUndefined();
+  it("handleModelChange 将新输入后缀迁移到 contextWindows", () => {
+    let latestConfig = JSON.stringify({
+      env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "glm-5.2" },
+    });
+    const onConfigChange = vi.fn((config: string) => {
+      latestConfig = config;
+    });
+
+    const { result } = renderHook(() =>
+      useModelState({
+        settingsConfig: latestConfig,
+        onConfigChange,
+      }),
+    );
+
+    act(() => {
+      result.current.handleModelChange(
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "glm-5.3[1M]",
+      );
+    });
+
+    const parsed = JSON.parse(latestConfig);
+    expect(parsed.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("glm-5.3");
+    expect(parsed.contextWindows.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe(1000000);
+  });
+
+  it("清空带后缀模型时同步删除 contextWindows", () => {
+    let latestConfig = JSON.stringify({
+      env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "glm-5.2[200k]" },
+    });
+    const onConfigChange = vi.fn((config: string) => {
+      latestConfig = config;
+    });
+
+    const { result } = renderHook(() =>
+      useModelState({
+        settingsConfig: latestConfig,
+        onConfigChange,
+      }),
+    );
+
+    act(() => {
+      result.current.handleModelChange("ANTHROPIC_DEFAULT_SONNET_MODEL", "");
+    });
+
+    const parsed = JSON.parse(latestConfig);
+    expect(parsed.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBeUndefined();
+    expect(
+      parsed.contextWindows?.ANTHROPIC_DEFAULT_SONNET_MODEL,
+    ).toBeUndefined();
   });
 });
-
 describe("parseModelSuffix", () => {
   it("parses [1m] suffix", () => {
     expect(parseModelSuffix("deepseek-v4-pro[1m]")).toEqual({
@@ -353,29 +406,6 @@ describe("stripModelSuffix", () => {
     expect(stripModelSuffix("model[200k]")).toBe("model");
   });
 });
-
-describe("reapplySuffix", () => {
-  it("preserves suffix when changing model name", () => {
-    expect(reapplySuffix("deepseek-v4-pro[200k]", "glm-5.2")).toBe(
-      "glm-5.2[200k]",
-    );
-  });
-
-  it("returns base unchanged when old model has no suffix", () => {
-    expect(reapplySuffix("deepseek-v4-pro", "glm-5.2")).toBe("glm-5.2");
-  });
-
-  it("returns empty string when new input is empty", () => {
-    expect(reapplySuffix("deepseek-v4-pro[200k]", "")).toBe("");
-  });
-
-  it("old suffix wins when new input also has a suffix", () => {
-    expect(reapplySuffix("deepseek-v4-pro[200k]", "glm-5.2[100k]")).toBe(
-      "glm-5.2[200k]",
-    );
-  });
-});
-
 describe("contextWindows", () => {
   it("reads contextWindows from settings config", () => {
     const config = JSON.stringify({

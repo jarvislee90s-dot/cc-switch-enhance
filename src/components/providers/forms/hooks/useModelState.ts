@@ -51,7 +51,7 @@ export interface ModelSuffixResult {
   window?: number;
 }
 
-export function parseWindowToken(token: string): number | undefined {
+function parseWindowToken(token: string): number | undefined {
   const trimmed = token.trim();
   if (!trimmed) return undefined;
   // 与 Rust 端一致：全串校验，不接受小数、分隔符或未知单位
@@ -97,22 +97,6 @@ export function setModelSuffix(model: string, windowStr: string): string {
   if (window === undefined) return base;
   // 旧输入兼容：合法 token 按小写写入后缀
   return `${base}[${trimmed.toLowerCase()}]`;
-}
-
-/**
- * 改模型名时保留原 model 的 context window 后缀。
- * 例如原 model 是 "deepseek[200k]"，用户改成 "glm-5.2"，
- * 返回 "glm-5.2[200k]"，避免改模型名丢窗口配置。
- * 若新输入本身带后缀，以原 model 的后缀为准（用户改的是名字不是窗口）。
- */
-export function reapplySuffix(oldModel: string, newInput: string): string {
-  const suffixResult = parseModelSuffix(oldModel);
-  const oldSuffix = suffixResult.window
-    ? oldModel.slice(oldModel.lastIndexOf("["))
-    : "";
-  const newBase = stripModelSuffix(newInput).trim();
-  if (!newBase) return "";
-  return oldSuffix ? `${newBase}${oldSuffix}` : newBase;
 }
 
 function isRecord(value: unknown): value is Record<string, any> {
@@ -345,10 +329,24 @@ export function useModelState({
       if (field === "CLAUDE_CODE_SUBAGENT_MODEL") setSubagentModel(nextValue);
 
       try {
-        const currentConfig = latestConfigRef.current
+        let currentConfig = latestConfigRef.current
           ? JSON.parse(latestConfigRef.current)
           : { env: {} };
         if (!currentConfig.env) currentConfig.env = {};
+        if (MODEL_ENV_FIELDS.includes(field) && nextValue) {
+          const oldModel =
+            typeof currentConfig.env[field] === "string"
+              ? currentConfig.env[field]
+              : "";
+          const window =
+            parseModelSuffix(oldModel).window ?? parseModelSuffix(value).window;
+          if (window !== undefined) {
+            currentConfig = JSON.parse(
+              writeContextWindow(JSON.stringify(currentConfig), field, window),
+            );
+            if (!currentConfig.env) currentConfig.env = {};
+          }
+        }
         const env = currentConfig.env as Record<string, unknown>;
 
         // 新键仅写入；旧键不再写入
@@ -357,6 +355,9 @@ export function useModelState({
           env[field] = trimmed;
         } else {
           delete env[field];
+          if (isRecord(currentConfig.contextWindows)) {
+            delete currentConfig.contextWindows[field];
+          }
         }
         // 删除旧键
         delete env["ANTHROPIC_SMALL_FAST_MODEL"];

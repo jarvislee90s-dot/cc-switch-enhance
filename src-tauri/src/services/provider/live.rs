@@ -11,6 +11,7 @@ use toml_edit::{DocumentMut, Item, TableLike};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
 use crate::app_config::AppType;
+use crate::claude_desktop_config::CLAUDE_MODEL_ENV_KEYS;
 use crate::codex_config::{get_codex_auth_path, get_codex_config_path};
 use crate::config::{delete_file, get_claude_settings_path, read_json_file, write_json_file};
 use crate::database::Database;
@@ -33,19 +34,6 @@ use super::normalize_claude_models_in_value;
 const CODEX_OAUTH_CLAUDE_MAX_CONTEXT_TOKENS: &str = "372000";
 const CODEX_OAUTH_CLAUDE_AUTO_COMPACT_WINDOW: &str = "372000";
 const KIMI_FOR_CODING_CONTEXT_TOKENS: &str = "262144";
-
-/// Model env keys Claude Code may route requests through. The defaults above
-/// are calibrated against gpt-5.6's Codex catalog, so every configured model
-/// must belong to that family before they are injected — gpt-5.5's upstream
-/// catalog oscillates between 272K and 372K and must not inherit them.
-const CLAUDE_MODEL_ENV_KEYS: [&str; 6] = [
-    "ANTHROPIC_MODEL",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL",
-    "ANTHROPIC_DEFAULT_FABLE_MODEL",
-    "CLAUDE_CODE_SUBAGENT_MODEL",
-];
 
 pub(crate) fn provider_env_targets_gpt56(
     provider_env: Option<&serde_json::Map<String, Value>>,
@@ -350,6 +338,21 @@ fn merge_auto_sync_state_into_provider(provider_settings: &mut Value, effective_
         state.insert("staticInjected".to_string(), static_injected.clone());
     } else {
         state.remove("staticInjected");
+    }
+    if let Some(user_explicit) = effective_state
+        .get("userExplicit")
+        .and_then(Value::as_object)
+    {
+        let target = state
+            .entry("userExplicit".to_string())
+            .or_insert_with(|| json!({}));
+        if !target.is_object() {
+            *target = json!({});
+        }
+        let target = target.as_object_mut().expect("userExplicit object");
+        for (key, value) in user_explicit {
+            target.insert(key.clone(), value.clone());
+        }
     }
 }
 
@@ -1014,6 +1017,7 @@ pub(crate) fn build_effective_settings_with_common_config(
     }
 
     if matches!(app_type, AppType::Claude) {
+        normalize_claude_models_in_value(&mut effective_settings);
         crate::claude_desktop_config::migrate_legacy_suffix_to_context_windows(
             &mut effective_settings,
         );
@@ -1025,6 +1029,132 @@ pub(crate) fn build_effective_settings_with_common_config(
     }
 
     Ok(effective_settings)
+}
+
+fn context_window_value_as_string(value: &Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        let trimmed = text.trim();
+        return (!trimmed.is_empty()).then(|| trimmed.to_string());
+    }
+    if let Some(number) = value.as_u64() {
+        return Some(number.to_string());
+    }
+    value
+        .as_f64()
+        .filter(|number| number.is_finite() && number.fract() == 0.0)
+        .map(|number| (number as u64).to_string())
+}
+
+fn stored_user_explicit_value(
+    provider: &Provider,
+    short_key: &str,
+    env_key: &str,
+) -> Option<String> {
+    let explicit = provider
+        .settings_config
+        .pointer("/autoSyncState/userExplicit")
+        .and_then(Value::as_object)?;
+    if let Some(value) = explicit.get(short_key) {
+        if value.is_null() || value.as_bool() == Some(false) {
+            return None;
+        }
+        return context_window_value_as_string(value);
+    }
+    if let Some(value) = explicit.get(env_key) {
+        if value.as_bool() == Some(true) {
+            return None;
+        }
+        return context_window_value_as_string(value);
+    }
+    None
+}
+
+fn apply_stored_user_explicit_values(provider: &Provider, settings: &mut Value) {
+    let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for (env_key, short_key) in CLAUDE_BACKFILL_CONTEXT_KEYS {
+        if let Some(value) = stored_user_explicit_value(provider, short_key, env_key) {
+            env.insert(env_key.to_string(), Value::String(value));
+        }
+    }
+}
+
+fn merge_manual_live_context_windows(live: &Value, provider: &Provider, settings: &mut Value) {
+    let mut manual_acw = None;
+    let mut manual_max = None;
+    for (env_key, short_key) in CLAUDE_BACKFILL_CONTEXT_KEYS {
+        let Some(live_value) = live
+            .get("env")
+            .and_then(Value::as_object)
+            .and_then(|env| env.get(env_key))
+            .and_then(context_window_value_as_string)
+        else {
+            continue;
+        };
+        if provider_env_has_explicit_value(provider, env_key) {
+            continue;
+        }
+        if stored_user_explicit_value(provider, short_key, env_key).as_deref()
+            == Some(live_value.as_str())
+        {
+            continue;
+        }
+        if crate::claude_settings_watcher::is_auto_target_value(
+            live,
+            provider,
+            short_key,
+            &live_value,
+        ) {
+            continue;
+        }
+        match short_key {
+            "ACW" => manual_acw = Some(live_value),
+            "MAX" => manual_max = Some(live_value),
+            _ => {}
+        }
+    }
+    if manual_acw.is_none() && manual_max.is_none() {
+        return;
+    }
+    let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) else {
+        return;
+    };
+    if let Some(value) = manual_acw.as_ref() {
+        env.insert(
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW".to_string(),
+            Value::String(value.clone()),
+        );
+    }
+    if let Some(value) = manual_max.as_ref() {
+        env.insert(
+            "CLAUDE_CODE_MAX_CONTEXT_TOKENS".to_string(),
+            Value::String(value.clone()),
+        );
+    }
+    let Some(obj) = settings.as_object_mut() else {
+        return;
+    };
+    let state = obj
+        .entry("autoSyncState".to_string())
+        .or_insert_with(|| json!({}));
+    if !state.is_object() {
+        *state = json!({});
+    }
+    let state = state.as_object_mut().expect("autoSyncState object");
+    let explicit = state
+        .entry("userExplicit".to_string())
+        .or_insert_with(|| json!({}));
+    if !explicit.is_object() {
+        *explicit = json!({});
+    }
+    let explicit = explicit.as_object_mut().expect("userExplicit object");
+    if let Some(value) = manual_acw {
+        explicit.insert("ACW".to_string(), Value::String(value));
+    }
+    if let Some(value) = manual_max {
+        explicit.insert("MAX".to_string(), Value::String(value));
+    }
 }
 
 pub(crate) fn write_live_with_common_config(
@@ -1047,6 +1177,25 @@ pub(crate) fn write_live_with_common_config(
     }
 
     if matches!(app_type, AppType::Claude) {
+        apply_stored_user_explicit_values(provider, &mut effective_provider.settings_config);
+        let live_path = get_claude_settings_path();
+        if live_path.exists() {
+            match read_json_file(&live_path) {
+                Ok(live) => {
+                    merge_manual_live_context_windows(
+                        &live,
+                        provider,
+                        &mut effective_provider.settings_config,
+                    );
+                }
+                Err(err) => {
+                    log::warn!(
+                        "[ClaudeLive] failed to read live settings before write for '{}': {err}",
+                        provider.id
+                    );
+                }
+            }
+        }
         strip_legacy_suffixes_from_claude_models(&mut effective_provider.settings_config);
     }
 
@@ -1054,6 +1203,8 @@ pub(crate) fn write_live_with_common_config(
 
     if matches!(app_type, AppType::Claude) {
         let mut updated_config = provider.settings_config.clone();
+        normalize_claude_models_in_value(&mut updated_config);
+        crate::claude_desktop_config::migrate_legacy_suffix_to_context_windows(&mut updated_config);
         merge_auto_sync_state_into_provider(
             &mut updated_config,
             &effective_provider.settings_config,
@@ -1062,7 +1213,7 @@ pub(crate) fn write_live_with_common_config(
     }
 
     if matches!(app_type, AppType::Claude) {
-        ensure_claude_settings_watcher(db, app_type, provider, &effective_settings);
+        ensure_claude_settings_watcher(db, app_type, provider, &effective_provider.settings_config);
     }
 
     Ok(())
@@ -1210,14 +1361,13 @@ const CLAUDE_BACKFILL_CONTEXT_KEYS: [(&str, &str); 2] = [
     ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "MAX"),
 ];
 
-fn provider_env_has_string_value(provider: &Provider, env_key: &str) -> bool {
+fn provider_env_has_explicit_value(provider: &Provider, env_key: &str) -> bool {
     provider
         .settings_config
         .get("env")
         .and_then(Value::as_object)
         .and_then(|env| env.get(env_key))
-        .and_then(Value::as_str)
-        .is_some()
+        .is_some_and(|value| value.is_string() || value.is_number())
 }
 
 fn auto_sync_ledger_value_relevant(value: &Value) -> bool {
@@ -1338,7 +1488,7 @@ fn strip_auto_synced_context_defaults(settings: &mut Value, provider: &Provider)
             let Some(live_value) = env.get(env_key).and_then(Value::as_str) else {
                 continue;
             };
-            if provider_env_has_string_value(provider, env_key) {
+            if provider_env_has_explicit_value(provider, env_key) {
                 continue;
             }
             if backfill_user_explicit_value(state, short_key, env_key, live_value) {
@@ -2721,6 +2871,104 @@ mod tests {
 
     #[test]
     #[serial]
+    fn write_live_with_common_config_preserves_manual_live_context_edit() {
+        let _home = TempHome::new();
+        let _test_watcher_unset = EnvVarGuard::remove("CC_SWITCH_TEST_WATCHER");
+        crate::claude_settings_watcher::clear_watcher_slot_for_tests();
+        let db = Database::memory().expect("create memory db");
+        let provider = Provider::with_id(
+            "manual-live".to_string(),
+            "Manual Live".to_string(),
+            json!({ "env": { "ANTHROPIC_MODEL": "fallback-model" } }),
+            None,
+        );
+        db.save_provider(AppType::Claude.as_str(), &provider)
+            .expect("save provider");
+        let live_path = get_claude_settings_path();
+        write_json_file(
+            &live_path,
+            &json!({
+                "env": {
+                    "ANTHROPIC_MODEL": "fallback-model",
+                    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "765432",
+                    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1234567"
+                }
+            }),
+        )
+        .expect("seed manually edited live");
+
+        write_live_with_common_config(&db, &AppType::Claude, &provider).expect("write live");
+
+        let live: Value = read_json_file(&live_path).expect("read live");
+        assert_eq!(
+            live["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
+            json!("765432")
+        );
+        assert_eq!(
+            live["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
+            json!("1234567")
+        );
+
+        let stored = db
+            .get_provider_by_id("manual-live", AppType::Claude.as_str())
+            .expect("get provider")
+            .expect("stored provider exists");
+        assert_eq!(
+            stored.settings_config["autoSyncState"]["userExplicit"]["ACW"],
+            json!("765432")
+        );
+        assert_eq!(
+            stored.settings_config["autoSyncState"]["userExplicit"]["MAX"],
+            json!("1234567")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn write_live_with_common_config_syncs_new_user_explicit_into_watcher_snapshot() {
+        let _home = TempHome::new();
+        let _test_watcher = EnvVarGuard::set("CC_SWITCH_TEST_WATCHER", "1");
+        let _slot_guard = WatcherSlotGuard;
+        let _disable_watcher_removed = EnvVarGuard::remove("CC_SWITCH_DISABLE_WATCHER");
+        crate::claude_settings_watcher::clear_watcher_slot_for_tests();
+        let db = Database::memory().expect("create memory db");
+        let provider = Provider::with_id(
+            "watcher-snapshot".to_string(),
+            "Watcher Snapshot".to_string(),
+            json!({ "env": { "ANTHROPIC_MODEL": "fallback-model" } }),
+            None,
+        );
+        db.save_provider(AppType::Claude.as_str(), &provider)
+            .expect("save provider");
+        let live_path = get_claude_settings_path();
+        write_json_file(
+            &live_path,
+            &json!({
+                "env": {
+                    "ANTHROPIC_MODEL": "fallback-model",
+                    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "765432",
+                    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1234567"
+                }
+            }),
+        )
+        .expect("seed manually edited live");
+
+        write_live_with_common_config(&db, &AppType::Claude, &provider).expect("write live");
+
+        let snapshot = crate::claude_settings_watcher::watcher_provider_settings_config_for_tests()
+            .expect("watcher provider snapshot exists");
+        assert_eq!(
+            snapshot["autoSyncState"]["userExplicit"]["ACW"],
+            json!("765432")
+        );
+        assert_eq!(
+            snapshot["autoSyncState"]["userExplicit"]["MAX"],
+            json!("1234567")
+        );
+    }
+
+    #[test]
+    #[serial]
     fn write_live_with_common_config_starts_watcher_with_test_opt_in() {
         let _home = TempHome::new();
         let _test_watcher = EnvVarGuard::set("CC_SWITCH_TEST_WATCHER", "1");
@@ -3036,7 +3284,7 @@ mod tests {
             .expect("stored provider exists");
         assert_eq!(
             stored.settings_config["env"]["ANTHROPIC_MODEL"],
-            "fallback-model[1M]"
+            "fallback-model"
         );
         assert_eq!(
             stored.settings_config["autoSyncState"]["lastWritten"],
@@ -3049,6 +3297,132 @@ mod tests {
         assert_eq!(
             stored.settings_config["autoSyncState"]["staticInjected"],
             json!({ "ACW": "1000000", "MAX": "1000000" })
+        );
+        assert_eq!(
+            stored.settings_config["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"],
+            "glm-5.2"
+        );
+        assert_eq!(
+            stored.settings_config["env"]["CLAUDE_CODE_SUBAGENT_MODEL"],
+            "subagent-model"
+        );
+        assert_eq!(
+            stored.settings_config["contextWindows"]["ANTHROPIC_MODEL"],
+            json!(1000000)
+        );
+        assert_eq!(
+            stored.settings_config["contextWindows"]["ANTHROPIC_DEFAULT_SONNET_MODEL"],
+            json!(200000)
+        );
+        assert_eq!(
+            stored.settings_config["contextWindows"]["CLAUDE_CODE_SUBAGENT_MODEL"],
+            json!(1000000)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn write_live_with_common_config_persists_legacy_suffix_migration_to_db() {
+        let _home = TempHome::new();
+        let _test_watcher_unset = EnvVarGuard::remove("CC_SWITCH_TEST_WATCHER");
+        crate::claude_settings_watcher::clear_watcher_slot_for_tests();
+        let db = Database::memory().expect("create memory db");
+        let provider = Provider::with_id(
+            "legacy-db".to_string(),
+            "Legacy DB".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_MODEL": "fallback-model[1M]",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2[200k]"
+                }
+            }),
+            None,
+        );
+        db.save_provider(AppType::Claude.as_str(), &provider)
+            .expect("save provider");
+
+        write_live_with_common_config(&db, &AppType::Claude, &provider).expect("write live");
+
+        let stored = db
+            .get_provider_by_id("legacy-db", AppType::Claude.as_str())
+            .expect("get provider")
+            .expect("stored provider exists");
+        assert_eq!(
+            stored.settings_config["env"]["ANTHROPIC_MODEL"],
+            "fallback-model"
+        );
+        assert_eq!(
+            stored.settings_config["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"],
+            "glm-5.2"
+        );
+        assert_eq!(
+            stored.settings_config["contextWindows"]["ANTHROPIC_MODEL"],
+            json!(1000000)
+        );
+        assert_eq!(
+            stored.settings_config["contextWindows"]["ANTHROPIC_DEFAULT_SONNET_MODEL"],
+            json!(200000)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn write_live_with_common_config_normalizes_small_fast_legacy_suffix() {
+        let _home = TempHome::new();
+        let _test_watcher_unset = EnvVarGuard::remove("CC_SWITCH_TEST_WATCHER");
+        crate::claude_settings_watcher::clear_watcher_slot_for_tests();
+        let db = Database::memory().expect("create memory db");
+        let provider = Provider::with_id(
+            "small-fast-legacy".to_string(),
+            "Small Fast Legacy".to_string(),
+            json!({
+                "env": { "ANTHROPIC_SMALL_FAST_MODEL": "fallback-model[1M]" }
+            }),
+            None,
+        );
+        db.save_provider(AppType::Claude.as_str(), &provider)
+            .expect("save provider");
+
+        write_live_with_common_config(&db, &AppType::Claude, &provider).expect("write live");
+
+        let live: Value = read_json_file(&get_claude_settings_path()).expect("read live");
+        assert!(live["env"].get("ANTHROPIC_SMALL_FAST_MODEL").is_none());
+        assert_eq!(
+            live["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"],
+            "fallback-model"
+        );
+        assert_eq!(
+            live["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"],
+            "fallback-model"
+        );
+        assert_eq!(
+            live["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"],
+            "fallback-model"
+        );
+        assert_eq!(live["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "1000000");
+
+        let stored = db
+            .get_provider_by_id("small-fast-legacy", AppType::Claude.as_str())
+            .expect("get provider")
+            .expect("stored provider exists");
+        assert!(stored.settings_config["env"]
+            .get("ANTHROPIC_SMALL_FAST_MODEL")
+            .is_none());
+        assert_eq!(
+            stored.settings_config["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"],
+            "fallback-model"
+        );
+        assert_eq!(
+            stored.settings_config["contextWindows"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"],
+            json!(1000000)
+        );
+        assert_eq!(
+            stored.settings_config["contextWindows"]["ANTHROPIC_DEFAULT_SONNET_MODEL"],
+            json!(1000000)
+        );
+        assert_eq!(
+            stored.settings_config["contextWindows"]["ANTHROPIC_DEFAULT_OPUS_MODEL"],
+            json!(1000000)
         );
     }
 
@@ -4947,6 +5321,29 @@ base_url = "https://a.example/v1"
             "P".to_string(),
             json!({
                 "env": { "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "250000" },
+                "autoSyncState": {
+                    "lastWritten": { "MAX": "250000" }
+                }
+            }),
+            None,
+        );
+        strip_auto_synced_context_defaults(&mut settings, &provider);
+        assert_eq!(
+            settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
+            json!("250000")
+        );
+    }
+
+    #[test]
+    fn backfill_keeps_numeric_provider_env_explicit_value_matching_last_written() {
+        let mut settings = json!({
+            "env": { "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "250000" }
+        });
+        let provider = Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "env": { "CLAUDE_CODE_MAX_CONTEXT_TOKENS": 250000 },
                 "autoSyncState": {
                     "lastWritten": { "MAX": "250000" }
                 }

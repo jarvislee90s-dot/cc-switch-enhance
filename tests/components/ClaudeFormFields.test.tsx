@@ -1,8 +1,9 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { ComponentProps, PropsWithChildren } from "react";
+import { useState, type ComponentProps, type PropsWithChildren } from "react";
 import { useForm } from "react-hook-form";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ClaudeFormFields } from "@/components/providers/forms/ClaudeFormFields";
+import { useModelState } from "@/components/providers/forms/hooks/useModelState";
 import { Form } from "@/components/ui/form";
 
 const copilotApiMock = vi.hoisted(() => ({
@@ -110,6 +111,94 @@ const renderCopilotForm = (overrides: Partial<ClaudeFormFieldsProps> = {}) => {
   );
 };
 
+const renderStatefulCopilotForm = (
+  initialConfig: string,
+  overrides: Partial<ClaudeFormFieldsProps> = {},
+) => {
+  const StatefulForm = () => {
+    const [settingsConfig, setSettingsConfig] = useState(initialConfig);
+    const modelState = useModelState({
+      settingsConfig,
+      onConfigChange: setSettingsConfig,
+    });
+    const props: ClaudeFormFieldsProps = {
+      shouldShowApiKey: false,
+      apiKey: "",
+      onApiKeyChange: vi.fn(),
+      category: "official",
+      shouldShowApiKeyLink: false,
+      websiteUrl: "",
+      isCopilotPreset: true,
+      usesOAuth: true,
+      isCopilotAuthenticated: true,
+      selectedGitHubAccountId: "gh-1",
+      onGitHubAccountSelect: vi.fn(),
+      isCodexOauthPreset: false,
+      isCodexOauthAuthenticated: false,
+      selectedCodexAccountId: null,
+      onCodexAccountSelect: vi.fn(),
+      codexFastMode: false,
+      onCodexFastModeChange: vi.fn(),
+      templateValueEntries: [],
+      templateValues: {},
+      templatePresetName: "",
+      onTemplateValueChange: vi.fn(),
+      shouldShowSpeedTest: false,
+      baseUrl: "",
+      onBaseUrlChange: vi.fn(),
+      isEndpointModalOpen: false,
+      onEndpointModalToggle: vi.fn(),
+      onCustomEndpointsChange: vi.fn(),
+      autoSelect: false,
+      onAutoSelectChange: vi.fn(),
+      showEndpointTools: true,
+      shouldShowModelSelector: true,
+      claudeModel: modelState.claudeModel,
+      defaultHaikuModel: modelState.defaultHaikuModel,
+      defaultHaikuModelName: modelState.defaultHaikuModelName,
+      defaultSonnetModel: modelState.defaultSonnetModel,
+      defaultSonnetModelName: modelState.defaultSonnetModelName,
+      defaultOpusModel: modelState.defaultOpusModel,
+      defaultOpusModelName: modelState.defaultOpusModelName,
+      defaultFableModel: modelState.defaultFableModel,
+      defaultFableModelName: modelState.defaultFableModelName,
+      subagentModel: modelState.subagentModel,
+      onModelChange: modelState.handleModelChange,
+      speedTestEndpoints: [],
+      apiFormat: "anthropic",
+      onApiFormatChange: vi.fn(),
+      apiKeyField: "ANTHROPIC_AUTH_TOKEN",
+      onApiKeyFieldChange: vi.fn(),
+      isFullUrl: false,
+      onFullUrlChange: vi.fn(),
+      customUserAgent: "",
+      onCustomUserAgentChange: vi.fn(),
+      localProxyHeadersOverride: "",
+      onLocalProxyHeadersOverrideChange: vi.fn(),
+      localProxyBodyOverride: "",
+      onLocalProxyBodyOverrideChange: vi.fn(),
+      settingsConfig,
+      onSettingsConfigChange: setSettingsConfig,
+      ...overrides,
+    };
+
+    return (
+      <FormShell>
+        <ClaudeFormFields {...props} />
+        <div data-testid="live-config" data-config={settingsConfig} />
+      </FormShell>
+    );
+  };
+
+  render(<StatefulForm />);
+  return {
+    getConfig: () =>
+      JSON.parse(
+        screen.getByTestId("live-config").dataset.config ?? "{}",
+      ) as Record<string, any>,
+  };
+};
+
 const renderCodexOauthForm = (overrides: Partial<ClaudeFormFieldsProps> = {}) =>
   renderCopilotForm({
     isCopilotPreset: false,
@@ -215,6 +304,38 @@ describe("ClaudeFormFields", () => {
       "ANTHROPIC_DEFAULT_SONNET_MODEL",
       "glm-5.2[200k]",
     );
+  });
+
+  it("legacy 后缀模型改名后 contextWindows 保留窗口", () => {
+    const { getConfig } = renderStatefulCopilotForm(
+      JSON.stringify({
+        env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "glm-5.2[200k]" },
+      }),
+    );
+
+    const modelInput = screen.getByDisplayValue("glm-5.2");
+    fireEvent.change(modelInput, { target: { value: "glm-5.3" } });
+
+    const config = getConfig();
+    expect(config.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("glm-5.3");
+    expect(config.contextWindows.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe(200000);
+  });
+
+  it("非法窗口输入不清空已有 contextWindows", () => {
+    const onSettingsConfigChange = vi.fn();
+    renderCopilotForm({
+      defaultSonnetModel: "glm-5.2",
+      settingsConfig: JSON.stringify({
+        env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "glm-5.2" },
+        contextWindows: { ANTHROPIC_DEFAULT_SONNET_MODEL: 200000 },
+      }),
+      onSettingsConfigChange,
+    });
+
+    const contextInputs = screen.getAllByLabelText("Context Window");
+    fireEvent.change(contextInputs[0], { target: { value: "1.5M" } });
+
+    expect(onSettingsConfigChange).not.toHaveBeenCalled();
   });
 
   it("角色窗口输入框优先显示 contextWindows 中的值", () => {

@@ -111,11 +111,9 @@ impl ProxyService {
             ClaudeTakeoverAuthPolicy::PreserveExistingOrAuthToken
         };
         // Copilot/Codex 接管时 live config 可能还是旧供应商；显示模型必须跟随目标 provider。
-        let takeover_model_fields = if provider.uses_managed_account_auth() {
-            Self::build_claude_takeover_model_fields(&provider.settings_config)
-        } else {
-            Self::build_claude_takeover_model_fields(config)
-        };
+        // live 配置可能已 sanitize / 残留旧供应商；模型字段一律从 effective provider 构建。
+        let takeover_model_fields =
+            Self::build_claude_takeover_model_fields(&provider.settings_config);
 
         Self::apply_claude_takeover_fields_with_policy_and_models(
             config,
@@ -3425,6 +3423,44 @@ mod tests {
             .expect("set local current provider");
     }
 
+    fn seed_non_managed_claude_1m_provider(db: &Arc<Database>) -> Provider {
+        let provider = Provider::with_id(
+            "p1".to_string(),
+            "P1".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_API_KEY": "provider-key",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "sonnet-model"
+                },
+                "contextWindows": { "ANTHROPIC_DEFAULT_SONNET_MODEL": 1000000 }
+            }),
+            None,
+        );
+        seed_claude_current_provider(db, &provider);
+        provider
+    }
+
+    async fn seed_non_managed_claude_live(service: &ProxyService) {
+        service
+            .write_claude_live(&json!({
+                "env": {
+                    "ANTHROPIC_API_KEY": "live-key",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "sonnet-model"
+                }
+            }))
+            .expect("seed Claude live");
+    }
+
+    async fn assert_takeover_live_sources_one_m_from_provider(service: &ProxyService) {
+        let live = service.read_claude_live().expect("read taken-over live");
+        assert_eq!(
+            live.pointer("/env/ANTHROPIC_DEFAULT_SONNET_MODEL")
+                .and_then(Value::as_str),
+            Some("claude-sonnet-4-6[1m]")
+        );
+        assert!(live.get("contextWindows").is_none());
+    }
+
     async fn use_ephemeral_proxy_port(db: &Arc<Database>) {
         let mut proxy_config = db.get_proxy_config().await.expect("get test proxy config");
         proxy_config.listen_port = 0;
@@ -6095,6 +6131,51 @@ model = "gpt-5.1-codex"
             !crate::claude_settings_watcher::watcher_slot_is_empty_for_tests(),
             "CC_SWITCH_TEST_WATCHER=1 must allow watcher replacement after proxy sync"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn takeover_live_configs_sources_one_m_window_from_effective_provider() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let _provider = seed_non_managed_claude_1m_provider(&db);
+        seed_non_managed_claude_live(&service).await;
+        service
+            .takeover_live_configs()
+            .await
+            .expect("takeover all live configs");
+        assert_takeover_live_sources_one_m_from_provider(&service).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn takeover_live_config_strict_sources_one_m_window_from_effective_provider() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let _provider = seed_non_managed_claude_1m_provider(&db);
+        seed_non_managed_claude_live(&service).await;
+        service
+            .takeover_live_config_strict(&AppType::Claude)
+            .await
+            .expect("strictly take over Claude live");
+        assert_takeover_live_sources_one_m_from_provider(&service).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn takeover_live_config_best_effort_sources_one_m_window_from_effective_provider() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let _provider = seed_non_managed_claude_1m_provider(&db);
+        seed_non_managed_claude_live(&service).await;
+        service
+            .takeover_live_config_best_effort(&AppType::Claude)
+            .await
+            .expect("best-effort take over Claude live");
+        assert_takeover_live_sources_one_m_from_provider(&service).await;
     }
 
     #[tokio::test]

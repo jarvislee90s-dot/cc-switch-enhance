@@ -2392,6 +2392,7 @@ pub fn remove_codex_toml_base_url_if(toml_str: &str, predicate: impl Fn(&str) ->
 mod tests {
     use super::*;
     use serde_json::json;
+    use serial_test::serial;
 
     #[test]
     fn catalog_tool_profile_from_api_format() {
@@ -2897,6 +2898,72 @@ model = "gpt-5.4"
             Some("vendor_alpha"),
             "profile provider references should be preserved"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn codex_live_config_output_excludes_internal_fields() {
+        struct TestHomeGuard {
+            previous: Option<std::ffi::OsString>,
+        }
+        impl Drop for TestHomeGuard {
+            fn drop(&mut self) {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var("CC_SWITCH_TEST_HOME", value),
+                    None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
+                }
+            }
+        }
+        let temp = tempfile::tempdir().expect("create temp home");
+        let _guard = TestHomeGuard {
+            previous: std::env::var_os("CC_SWITCH_TEST_HOME"),
+        };
+        std::env::set_var("CC_SWITCH_TEST_HOME", temp.path());
+
+        let settings = json!({
+            "auth": { "OPENAI_API_KEY": "sk-test" },
+            "config": "model = \"gpt-5.4\"\n",
+            "modelCatalog": {
+                "models": [
+                    { "model": "gpt-5.4", "contextWindow": "128000" }
+                ]
+            },
+            "contextWindows": { "ANTHROPIC_MODEL": 1000000 },
+            "autoSyncState": { "lastWritten": { "MAX": "1000000" } },
+            "autoSyncContextWindow": true,
+            "autoSyncCompactRatio": 0.8,
+        });
+        write_codex_provider_live_with_catalog(
+            &settings,
+            Some("custom"),
+            &settings["auth"],
+            settings["config"].as_str(),
+            CodexCatalogToolProfile::ProxyChat,
+        )
+        .expect("write Codex live config with catalog");
+
+        let output =
+            std::fs::read_to_string(get_codex_config_path()).expect("read Codex config.toml");
+        assert!(output.contains("model = \"gpt-5.4\""));
+        for key in [
+            "contextWindows",
+            "autoSyncState",
+            "autoSyncContextWindow",
+            "autoSyncCompactRatio",
+        ] {
+            assert!(!output.contains(key), "{key} leaked into Codex config.toml");
+        }
+        let catalog = std::fs::read_to_string(get_codex_model_catalog_path())
+            .expect("read generated Codex catalog");
+        assert!(catalog.contains("gpt-5.4"));
+        for key in [
+            "contextWindows",
+            "autoSyncState",
+            "autoSyncContextWindow",
+            "autoSyncCompactRatio",
+        ] {
+            assert!(!catalog.contains(key), "{key} leaked into Codex catalog");
+        }
     }
 
     #[test]

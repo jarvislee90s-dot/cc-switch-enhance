@@ -398,7 +398,15 @@ export function ClaudeFormFields({
   const handleContextWindowChange = useCallback(
     (roleEnvKey: string, input: string) => {
       if (!onSettingsConfigChange) return;
+      const trimmed = input.trim();
+      if (!trimmed) {
+        onSettingsConfigChange(
+          writeContextWindow(settingsConfig ?? "{}", roleEnvKey, null),
+        );
+        return;
+      }
       const window = parseContextWindowInput(input);
+      if (window === null) return;
       onSettingsConfigChange(
         writeContextWindow(settingsConfig ?? "{}", roleEnvKey, window),
       );
