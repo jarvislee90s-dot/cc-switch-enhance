@@ -934,6 +934,50 @@ fn claude_watcher_persist_callback(
     })
 }
 
+/// 写 live 成功后启动/替换 Claude settings watcher；失败只记录日志，不阻断写配置。
+pub(crate) fn ensure_claude_settings_watcher(
+    db: &Database,
+    app_type: &AppType,
+    provider: &Provider,
+    effective_settings: &Value,
+) {
+    if !matches!(app_type, AppType::Claude) {
+        return;
+    }
+    // 测试/调试隔离：设置该变量时不要创建目录或 spawn，避免触碰真实 ~/.claude。
+    if std::env::var("CC_SWITCH_DISABLE_WATCHER").as_deref() == Ok("1") {
+        return;
+    }
+
+    let settings_path = get_claude_settings_path();
+    // 确保父目录存在：fresh 安装时 ~/.claude 可能尚未创建。
+    if let Some(parent) = settings_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            log::warn!(
+                "[ClaudeSettingsWatcher] failed to create {}: {e}",
+                parent.display()
+            );
+        }
+    }
+    if !settings_path.parent().map(|p| p.exists()).unwrap_or(false) {
+        return;
+    }
+
+    let persist = claude_watcher_persist_callback(db, app_type, &provider.id);
+    let watcher_provider = watcher_provider_from_effective(provider, effective_settings);
+    let provider_arc = std::sync::Arc::new(std::sync::Mutex::new(watcher_provider));
+    match crate::claude_settings_watcher::spawn_claude_settings_watcher(
+        settings_path,
+        provider_arc,
+        persist,
+    ) {
+        // Ok(watcher) 必须交给 replace_watcher 存进进程单例，
+        // 否则返回值在 match 表达式结束时被 Drop，notify 监听线程退出。
+        Ok(watcher) => crate::claude_settings_watcher::replace_watcher(watcher),
+        Err(e) => log::warn!("[ClaudeSettingsWatcher] spawn failed: {e}"),
+    }
+}
+
 pub(crate) fn build_effective_settings_with_common_config(
     db: &Database,
     app_type: &AppType,
@@ -968,37 +1012,6 @@ pub(crate) fn build_effective_settings_with_common_config(
         apply_kimi_for_coding_context_defaults(&mut effective_settings, provider);
     }
 
-    // 启动 settings.json 监听器，在后台自动同步 ACW/MAX 当用户 /model 切换时
-    if matches!(app_type, AppType::Claude) {
-        let settings_path = get_claude_settings_path();
-        // 确保父目录存在：fresh 安装时 ~/.claude 可能尚未创建，
-        // 而 write_live_snapshot（atomic_write -> create_dir_all）在本函数
-        // 之后才执行。提前创建父目录，保证 watcher 能启动监听。
-        if let Some(parent) = settings_path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                log::warn!(
-                    "[ClaudeSettingsWatcher] failed to create {}: {e}",
-                    parent.display()
-                );
-            }
-        }
-        if settings_path.parent().map(|p| p.exists()).unwrap_or(false) {
-            let persist = claude_watcher_persist_callback(db, app_type, &provider.id);
-            let watcher_provider = watcher_provider_from_effective(provider, &effective_settings);
-            let provider_arc = std::sync::Arc::new(std::sync::Mutex::new(watcher_provider));
-            match crate::claude_settings_watcher::spawn_claude_settings_watcher(
-                settings_path,
-                provider_arc,
-                persist,
-            ) {
-                // Ok(watcher) 必须交给 replace_watcher 存进进程单例，
-                // 否则返回值在 match 表达式结束时被 Drop，notify 监听线程退出，
-                // /model 切换将无法同步 ACW/MAX（dev 测试暴露的根因）。
-                Ok(watcher) => crate::claude_settings_watcher::replace_watcher(watcher),
-                Err(e) => log::warn!("[ClaudeSettingsWatcher] spawn failed: {e}"),
-            }
-        }
-    }
     Ok(effective_settings)
 }
 
@@ -1007,9 +1020,9 @@ pub(crate) fn write_live_with_common_config(
     app_type: &AppType,
     provider: &Provider,
 ) -> Result<(), AppError> {
+    let effective_settings = build_effective_settings_with_common_config(db, app_type, provider)?;
     let mut effective_provider = provider.clone();
-    effective_provider.settings_config =
-        build_effective_settings_with_common_config(db, app_type, provider)?;
+    effective_provider.settings_config = effective_settings.clone();
 
     if matches!(app_type, AppType::ClaudeDesktop) {
         crate::claude_desktop_config::apply_provider(db, &effective_provider)?;
@@ -1034,6 +1047,10 @@ pub(crate) fn write_live_with_common_config(
             &effective_provider.settings_config,
         );
         db.update_provider_settings_config(app_type.as_str(), &provider.id, &updated_config)?;
+    }
+
+    if matches!(app_type, AppType::Claude) {
+        ensure_claude_settings_watcher(db, app_type, provider, &effective_settings);
     }
 
     Ok(())
@@ -2582,6 +2599,75 @@ mod tests {
                 None => env::remove_var("CC_SWITCH_TEST_HOME"),
             }
         }
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = env::var_os(key);
+            env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => env::set_var(self.key, value),
+                None => env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn build_effective_settings_does_not_spawn_watcher_in_tests() {
+        let _home = TempHome::new();
+        crate::claude_settings_watcher::clear_watcher_slot_for_tests();
+        let db = Database::memory().expect("create memory db");
+        let provider =
+            Provider::with_id("p".to_string(), "P".to_string(), json!({ "env": {} }), None);
+        let settings_path = get_claude_settings_path();
+        assert!(!settings_path.parent().unwrap().exists());
+        let settings =
+            build_effective_settings_with_common_config(&db, &AppType::Claude, &provider)
+                .expect("build effective settings");
+        assert!(settings.get("watcherSpawned").is_none());
+        assert!(
+            crate::claude_settings_watcher::watcher_slot_is_empty_for_tests(),
+            "settings builder must not spawn or replace the Claude watcher"
+        );
+        assert!(
+            !settings_path.parent().unwrap().exists(),
+            "settings builder must not create the watcher parent directory"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn write_live_with_common_config_respects_disable_watcher_env() {
+        let _home = TempHome::new();
+        let _disable_watcher = EnvVarGuard::set("CC_SWITCH_DISABLE_WATCHER", "1");
+        crate::claude_settings_watcher::clear_watcher_slot_for_tests();
+        let db = Database::memory().expect("create memory db");
+        let provider = Provider::with_id(
+            "disabled-watcher".to_string(),
+            "Disabled Watcher".to_string(),
+            json!({ "env": {} }),
+            None,
+        );
+        db.save_provider(AppType::Claude.as_str(), &provider)
+            .expect("save provider");
+        write_live_with_common_config(&db, &AppType::Claude, &provider).expect("write live");
+        assert!(get_claude_settings_path().exists());
+        assert!(
+            crate::claude_settings_watcher::watcher_slot_is_empty_for_tests(),
+            "CC_SWITCH_DISABLE_WATCHER=1 must prevent watcher spawn"
+        );
     }
 
     #[test]

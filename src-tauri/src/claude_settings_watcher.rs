@@ -306,6 +306,19 @@ pub fn replace_watcher(new: ClaudeSettingsWatcher) {
     *guard = Some(new);
 }
 
+#[cfg(test)]
+pub(crate) fn clear_watcher_slot_for_tests() {
+    *watcher_slot().lock().expect("watcher slot mutex poisoned") = None;
+}
+
+#[cfg(test)]
+pub(crate) fn watcher_slot_is_empty_for_tests() -> bool {
+    watcher_slot()
+        .lock()
+        .expect("watcher slot mutex poisoned")
+        .is_none()
+}
+
 /// 处理一次 settings.json 变化
 fn handle_settings_change(
     path: &std::path::Path,
