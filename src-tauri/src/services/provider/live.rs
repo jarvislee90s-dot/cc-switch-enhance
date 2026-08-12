@@ -223,7 +223,12 @@ fn context_window_target_from_settings(settings: &Value) -> Option<u64> {
     let windows = settings.get("contextWindows").and_then(Value::as_object)?;
     CLAUDE_MODEL_ENV_KEYS
         .iter()
-        .filter_map(|key| windows.get(*key).and_then(Value::as_u64))
+        .filter_map(|key| {
+            windows
+                .get(*key)
+                .and_then(Value::as_u64)
+                .filter(|window| *window > 0)
+        })
         .max()
 }
 
@@ -4183,6 +4188,45 @@ base_url = "https://a.example/v1"
         assert!(
             settings["autoSyncState"].get("staticInjected").is_none(),
             "empty contextWindows must clear stale staticInjected"
+        );
+    }
+
+    #[test]
+    fn apply_context_window_defaults_ignores_zero_context_windows() {
+        let provider = Provider::with_id(
+            "test-zero".to_string(),
+            "Test Zero".to_string(),
+            json!({
+                "env": { "ANTHROPIC_MODEL": "fallback-model" },
+                "contextWindows": { "ANTHROPIC_MODEL": 0 }
+            }),
+            None,
+        );
+
+        let mut settings = json!({
+            "env": { "ANTHROPIC_MODEL": "fallback-model" },
+            "contextWindows": { "ANTHROPIC_MODEL": 0 },
+            "autoSyncState": {
+                "lastWritten": { "model": "sonnet" },
+                "staticInjected": { "ACW": "1000000", "MAX": "1000000" }
+            }
+        });
+        apply_context_window_defaults(&mut settings, &provider);
+        assert!(
+            settings["env"]
+                .get("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+                .is_none(),
+            "zero contextWindows must not inject MAX"
+        );
+        assert!(
+            settings["env"]
+                .get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+                .is_none(),
+            "zero contextWindows must not inject ACW"
+        );
+        assert!(
+            settings["autoSyncState"].get("staticInjected").is_none(),
+            "zero contextWindows must clear stale staticInjected"
         );
     }
 

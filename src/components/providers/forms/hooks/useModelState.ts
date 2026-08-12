@@ -77,7 +77,9 @@ export function parseModelSuffix(model: string): ModelSuffixResult {
   if (open <= 0) return { slug: model, window: undefined };
   const slug = trimmed.slice(0, open).trim();
   if (!slug) return { slug: model, window: undefined };
-  const window = parseWindowToken(trimmed.slice(open + 1, close));
+  const inner = trimmed.slice(open + 1, close);
+  if (/\s/.test(inner)) return { slug: model, window: undefined };
+  const window = parseWindowToken(inner);
   if (window === undefined) return { slug: model, window: undefined };
   return { slug, window };
 }

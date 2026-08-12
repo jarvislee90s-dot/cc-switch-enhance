@@ -223,6 +223,17 @@ describe("parseModelSuffix", () => {
     });
   });
 
+  it("rejects whitespace inside brackets", () => {
+    expect(parseModelSuffix("model[ 200k ]")).toEqual({
+      slug: "model[ 200k ]",
+      window: undefined,
+    });
+    expect(parseModelSuffix("model[200 k]")).toEqual({
+      slug: "model[200 k]",
+      window: undefined,
+    });
+  });
+
   it("parses lowercase [1m]", () => {
     expect(parseModelSuffix("model[1m]")).toEqual({
       slug: "model",

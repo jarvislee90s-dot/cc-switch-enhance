@@ -303,12 +303,10 @@ impl ProxyService {
 
         let mut client_model = takeover_model.to_string();
         let has_one_m_window =
-            Self::claude_takeover_window_keys(model_key)
-                .iter()
-                .any(|window_key| {
-                    crate::claude_desktop_config::resolve_context_window(config, window_key)
-                        .is_some_and(|window| window >= 1_000_000)
-                });
+            Self::claude_takeover_source_key(env, model_key).is_some_and(|window_key| {
+                crate::claude_desktop_config::resolve_context_window(config, window_key)
+                    .is_some_and(|window| window >= 1_000_000)
+            });
         if has_one_m_window {
             client_model.push_str(CLAUDE_ONE_M_MARKER_FOR_CLIENT);
         }
@@ -321,26 +319,33 @@ impl ProxyService {
         }
     }
 
-    fn claude_takeover_window_keys(model_key: &str) -> &'static [&'static str] {
-        match model_key {
+    fn claude_takeover_source_key(
+        env: &Map<String, Value>,
+        model_key: &str,
+    ) -> Option<&'static str> {
+        let candidates = match model_key {
             "ANTHROPIC_DEFAULT_HAIKU_MODEL" => &[
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL",
                 "ANTHROPIC_SMALL_FAST_MODEL",
                 "ANTHROPIC_MODEL",
-            ],
+            ][..],
             "ANTHROPIC_DEFAULT_SONNET_MODEL" => &[
                 "ANTHROPIC_DEFAULT_SONNET_MODEL",
                 "ANTHROPIC_MODEL",
                 "ANTHROPIC_SMALL_FAST_MODEL",
-            ],
+            ][..],
             "ANTHROPIC_DEFAULT_OPUS_MODEL" => &[
                 "ANTHROPIC_DEFAULT_OPUS_MODEL",
                 "ANTHROPIC_MODEL",
                 "ANTHROPIC_SMALL_FAST_MODEL",
-            ],
-            "ANTHROPIC_DEFAULT_FABLE_MODEL" => &["ANTHROPIC_DEFAULT_FABLE_MODEL"],
-            _ => &[],
-        }
+            ][..],
+            "ANTHROPIC_DEFAULT_FABLE_MODEL" => &["ANTHROPIC_DEFAULT_FABLE_MODEL"][..],
+            _ => return None,
+        };
+        candidates
+            .iter()
+            .find(|key| Self::claude_env_string(env, key).is_some())
+            .copied()
     }
 
     fn claude_env_string<'a>(env: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
@@ -3472,6 +3477,31 @@ mod tests {
         assert!(
             !sonnet.contains("[1m]"),
             "200K must not be declared as 1M: {sonnet}"
+        );
+    }
+
+    #[test]
+    fn takeover_uses_actual_sonnet_source_window_not_fallback_union() {
+        let config = json!({
+            "env": {
+                "ANTHROPIC_MODEL": "fallback[1M]",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2"
+            },
+            "contextWindows": {
+                "ANTHROPIC_MODEL": 1000000,
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": 200000
+            }
+        });
+        let fields = ProxyService::build_claude_takeover_model_fields(&config);
+        let sonnet = fields
+            .iter()
+            .find(|(k, _)| *k == "ANTHROPIC_DEFAULT_SONNET_MODEL")
+            .unwrap()
+            .1
+            .clone();
+        assert!(
+            !sonnet.contains("[1m]"),
+            "sonnet 200K must win over fallback 1M when sonnet role is explicit: {sonnet}"
         );
     }
 
