@@ -45,6 +45,11 @@ export function EditProviderDialog({
   // live 读取失败时禁止保存，避免用 DB 快照覆盖实时配置
   const [liveLoadFailed, setLiveLoadFailed] = useState(false);
 
+  // 记录已完成 live 加载的 scope，切换 provider/app 后首个 commit 不会把旧结果当作当前结果
+  const [loadedScope, setLoadedScope] = useState<string | null>(null);
+
+  const currentScope = `${appId}:${provider?.id ?? "new"}`;
+
   useEffect(() => {
     let cancelled = false;
 
@@ -52,7 +57,9 @@ export function EditProviderDialog({
     setLiveSettings(null);
     setHasLoadedLive(false);
     setLiveLoadFailed(false);
+    setLoadedScope(null);
 
+    const scope = currentScope;
     const load = async () => {
       if (!open || !provider) {
         return;
@@ -63,6 +70,7 @@ export function EditProviderDialog({
       if (isProxyTakeover) {
         if (!cancelled) {
           setHasLoadedLive(true);
+          setLoadedScope(scope);
         }
         return;
       }
@@ -73,6 +81,7 @@ export function EditProviderDialog({
       if (appId === "opencode") {
         if (!cancelled) {
           setHasLoadedLive(true);
+          setLoadedScope(scope);
         }
         return;
       }
@@ -85,11 +94,13 @@ export function EditProviderDialog({
               setLiveSettings(live);
             }
             setHasLoadedLive(true);
+            setLoadedScope(scope);
           }
         } catch {
           if (!cancelled) {
             setLiveLoadFailed(true);
             setHasLoadedLive(true);
+            setLoadedScope(scope);
           }
         }
         return;
@@ -107,21 +118,25 @@ export function EditProviderDialog({
                 setLiveSettings(live);
               }
               setHasLoadedLive(true);
+              setLoadedScope(scope);
             }
           } catch {
             if (!cancelled) {
               setLiveLoadFailed(true);
               setHasLoadedLive(true);
+              setLoadedScope(scope);
             }
           }
         } else if (!cancelled) {
           setHasLoadedLive(true);
+          setLoadedScope(scope);
         }
       } catch {
         // 无法确认当前供应商时也按 live 读取失败处理，避免用 DB 快照覆盖 live
         if (!cancelled) {
           setLiveLoadFailed(true);
           setHasLoadedLive(true);
+          setLoadedScope(scope);
         }
       }
     };
@@ -236,11 +251,14 @@ export function EditProviderDialog({
     [appId, onSubmit, onOpenChange, provider],
   );
 
+  const isLiveReady = loadedScope === currentScope && hasLoadedLive;
+  const isCurrentFailure = liveLoadFailed && loadedScope === currentScope;
+
   if (!provider || !initialData) {
     return null;
   }
 
-  if (!hasLoadedLive || liveLoadFailed) {
+  if (!isLiveReady || isCurrentFailure) {
     return (
       <FullScreenPanel
         isOpen={open}
@@ -260,11 +278,11 @@ export function EditProviderDialog({
       >
         <div
           className={`p-8 text-sm ${
-            liveLoadFailed ? "text-destructive" : "text-muted-foreground"
+            isCurrentFailure ? "text-destructive" : "text-muted-foreground"
           }`}
-          data-testid={liveLoadFailed ? "live-load-error" : undefined}
+          data-testid={isCurrentFailure ? "live-load-error" : undefined}
         >
-          {liveLoadFailed
+          {isCurrentFailure
             ? t("providerForm.liveLoadFailed", {
                 defaultValue: "读取实时配置失败，为避免覆盖实时配置已禁用保存",
               })

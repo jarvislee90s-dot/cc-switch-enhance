@@ -1,3 +1,4 @@
+import ReactDOM from "react-dom";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Provider } from "@/types";
@@ -382,6 +383,73 @@ describe("EditProviderDialog", () => {
     expect(screen.getByRole("button", { name: "common.save" })).toBeDisabled();
     expect(screen.queryByTestId("provider-form")).not.toBeInTheDocument();
     expect(apiMocks.getLiveProviderSettings).not.toHaveBeenCalled();
+  });
+
+  it("切换 provider 后的首个 commit 不渲染旧 live 表单", async () => {
+    const providerA: Provider = {
+      id: "deepseek",
+      name: "DeepSeek",
+      category: "aggregator",
+      settingsConfig: {
+        auth: { OPENAI_API_KEY: "db-key-a" },
+      },
+    };
+    const providerB: Provider = {
+      id: "kimi",
+      name: "Kimi",
+      category: "aggregator",
+      settingsConfig: {
+        auth: { OPENAI_API_KEY: "db-key-b" },
+      },
+    };
+    const liveA = { auth: { OPENAI_API_KEY: "live-key-a" } };
+    const liveB = { auth: { OPENAI_API_KEY: "live-key-b" } };
+    let resolveA: (value: Record<string, unknown>) => void = () => {};
+    const livePromiseA = new Promise<Record<string, unknown>>((resolve) => {
+      resolveA = resolve;
+    });
+
+    apiMocks.getCurrent
+      .mockResolvedValueOnce(providerA.id)
+      .mockResolvedValueOnce(providerB.id);
+    apiMocks.getLiveProviderSettings
+      .mockReturnValueOnce(livePromiseA)
+      .mockReturnValueOnce(liveB);
+
+    const view = render(
+      <EditProviderDialog
+        open
+        provider={providerA}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+        appId="codex"
+      />,
+      { legacyRoot: true },
+    );
+
+    resolveA(liveA);
+    await waitFor(() => {
+      expect(
+        JSON.parse(screen.getByTestId("settings-config").textContent ?? "{}"),
+      ).toEqual(liveA);
+    });
+
+    // 直接 ReactDOM.render 绕开 RTL 的 act，让断言落在切换后的首个 commit 上
+    ReactDOM.render(
+      <EditProviderDialog
+        open
+        provider={providerB}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+        appId="codex"
+      />,
+      view.container,
+    );
+
+    expect(apiMocks.getCurrent).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("加载中...")).toBeInTheDocument();
+    expect(screen.queryByTestId("provider-form")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "common.save" })).toBeDisabled();
   });
 
   it("同一会话切换 provider 时重新进入加载 gate，避免短暂用旧 live 配置渲染", async () => {
