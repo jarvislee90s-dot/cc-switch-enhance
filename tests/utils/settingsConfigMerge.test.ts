@@ -171,4 +171,81 @@ describe("mergeSettingsConfigPreservingAutoSync", () => {
       autoSyncContextWindow: true,
     });
   });
+
+  it("关闭时按 lastWritten/staticInjected 短键删除 ACW/MAX 并保留账本", () => {
+    const updated = applyAutoSyncContextWindowSetting(
+      JSON.stringify({
+        env: {
+          CLAUDE_CODE_AUTO_COMPACT_WINDOW: "160000",
+          CLAUDE_CODE_MAX_CONTEXT_TOKENS: "262144",
+        },
+        autoSyncContextWindow: true,
+        autoSyncState: {
+          lastWritten: { ACW: "160000" },
+          staticInjected: { MAX: "262144" },
+          userExplicit: {},
+        },
+      }),
+      false,
+    );
+
+    const parsed = JSON.parse(updated);
+    expect(parsed.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBeUndefined();
+    expect(parsed.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBeUndefined();
+    expect(parsed.autoSyncState.lastWritten).toEqual({ ACW: "160000" });
+    expect(parsed.autoSyncState.staticInjected).toEqual({ MAX: "262144" });
+  });
+
+  it("关闭瞬间 live 中的非自动值保留并写入短键 userExplicit", () => {
+    const updated = applyAutoSyncContextWindowSetting(
+      JSON.stringify({
+        env: {
+          CLAUDE_CODE_AUTO_COMPACT_WINDOW: "250000",
+          CLAUDE_CODE_MAX_CONTEXT_TOKENS: "250000",
+        },
+        autoSyncContextWindow: true,
+        autoSyncState: {
+          lastWritten: { ACW: "160000", MAX: "200000" },
+          staticInjected: {},
+          userExplicit: {},
+        },
+      }),
+      false,
+    );
+
+    const parsed = JSON.parse(updated);
+    expect(parsed.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe("250000");
+    expect(parsed.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe("250000");
+    expect(parsed.autoSyncState.userExplicit).toEqual({
+      ACW: "250000",
+      MAX: "250000",
+    });
+    expect(parsed.autoSyncState.lastWritten).toEqual({
+      ACW: "160000",
+      MAX: "200000",
+    });
+  });
+
+  it("兼容旧账本完整 env key 识别自动来源", () => {
+    const updated = applyAutoSyncContextWindowSetting(
+      JSON.stringify({
+        env: { CLAUDE_CODE_MAX_CONTEXT_TOKENS: "200000" },
+        autoSyncContextWindow: true,
+        autoSyncState: {
+          lastWritten: {
+            CLAUDE_CODE_MAX_CONTEXT_TOKENS: "200000",
+          },
+          staticInjected: {},
+          userExplicit: {},
+        },
+      }),
+      false,
+    );
+
+    const parsed = JSON.parse(updated);
+    expect(parsed.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBeUndefined();
+    expect(parsed.autoSyncState.lastWritten).toEqual({
+      CLAUDE_CODE_MAX_CONTEXT_TOKENS: "200000",
+    });
+  });
 });

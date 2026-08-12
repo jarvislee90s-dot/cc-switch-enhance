@@ -3,6 +3,11 @@ const CLAUDE_CONTEXT_WINDOW_ENV_KEYS = [
   "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
 ] as const;
 
+const CLAUDE_CONTEXT_WINDOW_STATE_KEYS = {
+  CLAUDE_CODE_AUTO_COMPACT_WINDOW: "ACW",
+  CLAUDE_CODE_MAX_CONTEXT_TOKENS: "MAX",
+} as const;
+
 const AUTO_SYNC_COMPACT_RATIO_MIN = 0.2;
 const AUTO_SYNC_COMPACT_RATIO_MAX = 1;
 
@@ -16,11 +21,49 @@ function removeClaudeContextWindowEnvFields(config: Record<string, unknown>) {
   }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function matchesAutoSyncSource(
+  state: Record<string, unknown>,
+  shortKey: string,
+  envKey: string,
+  liveValue: unknown,
+): boolean {
+  return ["lastWritten", "staticInjected"].some((sourceName) => {
+    const source = state[sourceName];
+    if (!isRecord(source)) return false;
+    return [shortKey, envKey].some((key) => {
+      const sourceValue = source[key];
+      return (
+        sourceValue !== undefined &&
+        sourceValue !== null &&
+        sourceValue !== false &&
+        String(sourceValue) === String(liveValue)
+      );
+    });
+  });
+}
+
+function writeUserExplicitState(
+  state: Record<string, unknown>,
+  shortKey: string,
+  liveValue: unknown,
+) {
+  if (!isRecord(state.userExplicit)) {
+    state.userExplicit = {};
+  }
+  const userExplicit = state.userExplicit as Record<string, unknown>;
+  userExplicit[shortKey] = liveValue;
+}
+
 /**
  * 写入自动同步开关状态。
  *
- * 关闭时顺手清理 Claude Code 的 ACW/MAX env 字段；开启时只写开关状态，
- * 不自动补回字段，等 watcher 在终端切换模型时再写。
+ * 关闭时按 autoSyncState 清理自动写入的 ACW/MAX；live 中非自动来源的值
+ * 视为关闭瞬间用户写入，保留并记入 userExplicit。无账本时沿用旧行为删除。
+ * 开启时只写开关状态，不自动补回字段，等 watcher 在终端切换模型时再写。
  */
 export function applyAutoSyncContextWindowSetting(
   config: string,
@@ -29,8 +72,28 @@ export function applyAutoSyncContextWindowSetting(
   try {
     const parsed = JSON.parse(config || "{}") as Record<string, unknown>;
     parsed.autoSyncContextWindow = enabled;
-    if (!enabled) {
+    if (enabled) {
+      return JSON.stringify(parsed, null, 2);
+    }
+
+    const state = parsed.autoSyncState;
+    if (!isRecord(state)) {
       removeClaudeContextWindowEnvFields(parsed);
+      return JSON.stringify(parsed, null, 2);
+    }
+
+    const env = parsed.env;
+    if (isRecord(env)) {
+      for (const envKey of CLAUDE_CONTEXT_WINDOW_ENV_KEYS) {
+        const liveValue = env[envKey];
+        if (liveValue === undefined) continue;
+        const shortKey = CLAUDE_CONTEXT_WINDOW_STATE_KEYS[envKey];
+        if (matchesAutoSyncSource(state, shortKey, envKey, liveValue)) {
+          delete env[envKey];
+        } else {
+          writeUserExplicitState(state, shortKey, liveValue);
+        }
+      }
     }
     return JSON.stringify(parsed, null, 2);
   } catch {
