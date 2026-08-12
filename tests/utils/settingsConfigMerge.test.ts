@@ -132,23 +132,6 @@ describe("mergeSettingsConfigPreservingAutoSync", () => {
     });
   });
 
-  it("重新开启自动同步时兼容旧完整 env key userExplicit", () => {
-    const updated = applyAutoSyncContextWindowSetting(
-      JSON.stringify({
-        env: {},
-        autoSyncState: {
-          userExplicit: {
-            CLAUDE_CODE_MAX_CONTEXT_TOKENS: "250000",
-          },
-        },
-      }),
-      true,
-    );
-
-    expect(JSON.parse(updated).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe(
-      "250000",
-    );
-  });
 
   it("当前开关为 false 时，其他参数更新保留手动 ACW/MAX", () => {
     const current = JSON.stringify({ env: {}, autoSyncContextWindow: false });
@@ -365,26 +348,4 @@ describe("mergeSettingsConfigPreservingAutoSync", () => {
     expect(parsed.autoSyncState.userExplicit).toEqual({ MAX: "200000" });
   });
 
-  it("兼容旧账本完整 env key 识别自动来源", () => {
-    const updated = applyAutoSyncContextWindowSetting(
-      JSON.stringify({
-        env: { CLAUDE_CODE_MAX_CONTEXT_TOKENS: "200000" },
-        autoSyncContextWindow: true,
-        autoSyncState: {
-          lastWritten: {
-            CLAUDE_CODE_MAX_CONTEXT_TOKENS: "200000",
-          },
-          staticInjected: {},
-          userExplicit: {},
-        },
-      }),
-      false,
-    );
-
-    const parsed = JSON.parse(updated);
-    expect(parsed.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBeUndefined();
-    expect(parsed.autoSyncState.lastWritten).toEqual({
-      CLAUDE_CODE_MAX_CONTEXT_TOKENS: "200000",
-    });
-  });
 });

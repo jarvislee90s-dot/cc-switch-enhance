@@ -28,39 +28,30 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function matchesAutoSyncSource(
   state: Record<string, unknown>,
   shortKey: string,
-  envKey: string,
   liveValue: unknown,
 ): boolean {
   return ["lastWritten", "staticInjected"].some((sourceName) => {
     const source = state[sourceName];
     if (!isRecord(source)) return false;
-    return [shortKey, envKey].some((key) => {
-      const sourceValue = source[key];
-      return (
-        sourceValue !== undefined &&
-        sourceValue !== null &&
-        sourceValue !== false &&
-        String(sourceValue) === String(liveValue)
-      );
-    });
+    const sourceValue = source[shortKey];
+    return (
+      sourceValue !== undefined &&
+      sourceValue !== null &&
+      sourceValue !== false &&
+      String(sourceValue) === String(liveValue)
+    );
   });
 }
 
 function hasUserExplicitValue(
   state: Record<string, unknown>,
   shortKey: string,
-  envKey: string,
 ): boolean {
   const userExplicit = state.userExplicit;
   if (!isRecord(userExplicit)) return false;
 
   const shortValue = userExplicit[shortKey];
-  if (shortValue !== undefined && shortValue !== null) return true;
-
-  const legacyValue = userExplicit[envKey];
-  return (
-    legacyValue !== undefined && legacyValue !== null && legacyValue !== false
-  );
+  return shortValue !== undefined && shortValue !== null;
 }
 
 function restorableLedgerValue(value: unknown): string | undefined {
@@ -74,22 +65,17 @@ function restorableLedgerValue(value: unknown): string | undefined {
 function restoreAutoSyncContextWindowValue(
   state: Record<string, unknown>,
   shortKey: string,
-  envKey: string,
 ): string | undefined {
   const userExplicit = state.userExplicit;
   if (isRecord(userExplicit)) {
     const shortValue = restorableLedgerValue(userExplicit[shortKey]);
     if (shortValue !== undefined) return shortValue;
-    const legacyValue = restorableLedgerValue(userExplicit[envKey]);
-    if (legacyValue !== undefined) return legacyValue;
   }
   for (const sourceName of ["lastWritten", "staticInjected"] as const) {
     const source = state[sourceName];
     if (!isRecord(source)) continue;
     const value = restorableLedgerValue(source[shortKey]);
     if (value !== undefined) return value;
-    const legacyValue = restorableLedgerValue(source[envKey]);
-    if (legacyValue !== undefined) return legacyValue;
   }
   return undefined;
 }
@@ -127,11 +113,7 @@ export function applyAutoSyncContextWindowSetting(
         const writes: Array<[string, string]> = [];
         for (const envKey of CLAUDE_CONTEXT_WINDOW_ENV_KEYS) {
           const shortKey = CLAUDE_CONTEXT_WINDOW_STATE_KEYS[envKey];
-          const value = restoreAutoSyncContextWindowValue(
-            state,
-            shortKey,
-            envKey,
-          );
+          const value = restoreAutoSyncContextWindowValue(state, shortKey);
           if (value !== undefined) writes.push([envKey, value]);
         }
         if (writes.length > 0) {
@@ -155,8 +137,8 @@ export function applyAutoSyncContextWindowSetting(
         const liveValue = env[envKey];
         if (liveValue === undefined) continue;
         const shortKey = CLAUDE_CONTEXT_WINDOW_STATE_KEYS[envKey];
-        if (!hasUserExplicitValue(state, shortKey, envKey)) {
-          if (matchesAutoSyncSource(state, shortKey, envKey, liveValue)) {
+        if (!hasUserExplicitValue(state, shortKey)) {
+          if (matchesAutoSyncSource(state, shortKey, liveValue)) {
             delete env[envKey];
             continue;
           }

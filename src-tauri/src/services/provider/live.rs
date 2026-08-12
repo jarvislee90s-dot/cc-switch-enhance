@@ -1045,23 +1045,13 @@ fn context_window_value_as_string(value: &Value) -> Option<String> {
         .map(|number| (number as u64).to_string())
 }
 
-fn stored_user_explicit_value(
-    provider: &Provider,
-    short_key: &str,
-    env_key: &str,
-) -> Option<String> {
+fn stored_user_explicit_value(provider: &Provider, short_key: &str) -> Option<String> {
     let explicit = provider
         .settings_config
         .pointer("/autoSyncState/userExplicit")
         .and_then(Value::as_object)?;
     if let Some(value) = explicit.get(short_key) {
         if value.is_null() || value.as_bool() == Some(false) {
-            return None;
-        }
-        return context_window_value_as_string(value);
-    }
-    if let Some(value) = explicit.get(env_key) {
-        if value.as_bool() == Some(true) {
             return None;
         }
         return context_window_value_as_string(value);
@@ -1074,7 +1064,7 @@ fn apply_stored_user_explicit_values(provider: &Provider, settings: &mut Value) 
         return;
     };
     for (env_key, short_key) in CLAUDE_BACKFILL_CONTEXT_KEYS {
-        if let Some(value) = stored_user_explicit_value(provider, short_key, env_key) {
+        if let Some(value) = stored_user_explicit_value(provider, short_key) {
             env.insert(env_key.to_string(), Value::String(value));
         }
     }
@@ -1095,9 +1085,7 @@ fn merge_manual_live_context_windows(live: &Value, provider: &Provider, settings
         if provider_env_has_explicit_value(provider, env_key) {
             continue;
         }
-        if stored_user_explicit_value(provider, short_key, env_key).as_deref()
-            == Some(live_value.as_str())
-        {
+        if stored_user_explicit_value(provider, short_key).as_deref() == Some(live_value.as_str()) {
             continue;
         }
         if crate::claude_settings_watcher::is_auto_target_value(
@@ -1377,7 +1365,6 @@ fn auto_sync_ledger_value_relevant(value: &Value) -> bool {
 fn auto_sync_key_has_auto_source_record(
     state: &serde_json::Map<String, Value>,
     short_key: &str,
-    env_key: &str,
 ) -> bool {
     ["lastWritten", "staticInjected"].iter().any(|source| {
         state
@@ -1387,9 +1374,6 @@ fn auto_sync_key_has_auto_source_record(
                 source_obj
                     .get(short_key)
                     .is_some_and(auto_sync_ledger_value_relevant)
-                    || source_obj
-                        .get(env_key)
-                        .is_some_and(auto_sync_ledger_value_relevant)
             })
     })
 }
@@ -1397,7 +1381,6 @@ fn auto_sync_key_has_auto_source_record(
 fn backfill_user_explicit_value(
     state: &serde_json::Map<String, Value>,
     short_key: &str,
-    env_key: &str,
     live_value: &str,
 ) -> bool {
     let Some(explicit) = state.get("userExplicit").and_then(Value::as_object) else {
@@ -1407,19 +1390,12 @@ fn backfill_user_explicit_value(
         // 短键新账本只保存实际字符串；null / 非字符串视为无显式值。
         return value.as_str() == Some(live_value);
     }
-    if let Some(value) = explicit.get(env_key) {
-        if value.is_null() || value.as_bool() == Some(false) {
-            return false;
-        }
-        return value.as_bool() == Some(true) || value.as_str() == Some(live_value);
-    }
     false
 }
 
 fn backfill_auto_source_value(
     state: &serde_json::Map<String, Value>,
     short_key: &str,
-    env_key: &str,
     live_value: &str,
 ) -> bool {
     ["lastWritten", "staticInjected"].iter().any(|source| {
@@ -1428,7 +1404,6 @@ fn backfill_auto_source_value(
             .and_then(Value::as_object)
             .is_some_and(|source_obj| {
                 source_obj.get(short_key).and_then(Value::as_str) == Some(live_value)
-                    || source_obj.get(env_key).and_then(Value::as_str) == Some(live_value)
             })
     })
 }
@@ -1491,12 +1466,12 @@ fn strip_auto_synced_context_defaults(settings: &mut Value, provider: &Provider)
             if provider_env_has_explicit_value(provider, env_key) {
                 continue;
             }
-            if backfill_user_explicit_value(state, short_key, env_key, live_value) {
+            if backfill_user_explicit_value(state, short_key, live_value) {
                 continue;
             }
-            if backfill_auto_source_value(state, short_key, env_key, live_value) {
+            if backfill_auto_source_value(state, short_key, live_value) {
                 remove_keys.push(env_key);
-            } else if !auto_sync_key_has_auto_source_record(state, short_key, env_key) {
+            } else if !auto_sync_key_has_auto_source_record(state, short_key) {
                 legacy_keys.push(env_key);
             }
         }
@@ -5168,30 +5143,6 @@ base_url = "https://a.example/v1"
             .get("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
             .is_none());
     }
-
-    #[test]
-    fn backfill_honors_legacy_full_env_key_user_explicit_marker() {
-        let mut settings = json!({
-            "env": { "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "200000" }
-        });
-        let provider = Provider::with_id(
-            "p".to_string(),
-            "P".to_string(),
-            json!({
-                "autoSyncState": {
-                    "lastWritten": { "MAX": "200000" },
-                    "userExplicit": { "CLAUDE_CODE_MAX_CONTEXT_TOKENS": true }
-                }
-            }),
-            None,
-        );
-        strip_auto_synced_context_defaults(&mut settings, &provider);
-        assert_eq!(
-            settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
-            json!("200000")
-        );
-    }
-
     #[test]
     fn codex_oauth_context_defaults_inject_when_auto_sync_disabled() {
         let db = Database::memory().expect("create memory db");

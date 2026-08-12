@@ -545,16 +545,10 @@ fn is_user_explicit(provider: &Provider, key: &str) -> bool {
     if explicit.get(key).is_some_and(|value| !value.is_null()) {
         return true;
     }
-    // 兼容旧账本：完整 env key 出现且不为 false/null 即视为用户显式。
-    legacy_env_key(key).is_some_and(|env_key| {
-        explicit
-            .get(env_key)
-            .is_some_and(|value| !value.is_null() && value.as_bool() != Some(false))
-    })
+    false
 }
 
 fn is_auto_source_value(provider: &Provider, key: &str, value: &str) -> bool {
-    let legacy_key = legacy_env_key(key);
     ["lastWritten", "staticInjected"].iter().any(|source| {
         let Some(source_obj) = provider
             .settings_config
@@ -566,8 +560,7 @@ fn is_auto_source_value(provider: &Provider, key: &str, value: &str) -> bool {
         if source_obj.get(key).and_then(Value::as_str) == Some(value) {
             return true;
         }
-        legacy_key
-            .is_some_and(|env_key| source_obj.get(env_key).and_then(Value::as_str) == Some(value))
+        false
     })
 }
 
@@ -2666,43 +2659,6 @@ mod tests {
             .get("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
             .is_none());
     }
-
-    #[test]
-    fn watcher_recognizes_legacy_auto_sync_shapes() {
-        let provider = Provider::with_id(
-            "p".to_string(),
-            "P".to_string(),
-            json!({
-                "autoSyncState": {
-                    "lastWritten": {
-                        "model": "sonnet",
-                        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "160000",
-                        "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "200000"
-                    },
-                    "staticInjected": {
-                        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "372000",
-                        "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "372000"
-                    },
-                    "userExplicit": {
-                        "legacy": true,
-                        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": true,
-                        "CLAUDE_CODE_MAX_CONTEXT_TOKENS": true
-                    }
-                }
-            }),
-            None,
-        );
-
-        assert!(is_auto_source_value(&provider, "ACW", "160000"));
-        assert!(is_auto_source_value(&provider, "MAX", "200000"));
-        assert!(is_auto_source_value(&provider, "ACW", "372000"));
-        assert!(is_auto_source_value(&provider, "MAX", "372000"));
-        assert!(!is_auto_source_value(&provider, "ACW", "sonnet"));
-        assert!(!is_auto_source_value(&provider, "MAX", "legacy"));
-        assert!(is_user_explicit(&provider, "ACW"));
-        assert!(is_user_explicit(&provider, "MAX"));
-    }
-
     #[test]
     fn verify_file_unchanged_detects_concurrent_modification() {
         let dir = tempfile::tempdir().unwrap();

@@ -88,7 +88,6 @@ pub(crate) const CLAUDE_MODEL_ENV_KEYS: [&str; 6] = [
     "CLAUDE_CODE_SUBAGENT_MODEL",
 ];
 
-#[allow(dead_code)]
 pub(crate) fn migrate_legacy_suffix_to_context_windows(
     settings_config: &mut serde_json::Value,
 ) -> bool {
@@ -152,7 +151,6 @@ pub(crate) fn migrate_legacy_suffix_to_context_windows(
 }
 
 /// 优先读取 contextWindows 中的显式值，缺失时回退到模型名后缀。
-#[allow(dead_code)]
 pub(crate) fn resolve_context_window(
     settings_config: &serde_json::Value,
     role_env_key: &str,
