@@ -404,7 +404,7 @@ fn handle_settings_change(
         !is_user_explicit(&provider, "MAX") && !is_auto_target_value(&v, &provider, "MAX", value)
     });
     if explicit_acw.is_some() || explicit_max.is_some() {
-        record_user_explicit(&mut *provider, explicit_acw, explicit_max);
+        record_user_explicit(&mut provider, explicit_acw, explicit_max);
         if !persist_settings(persist, &provider) {
             provider.settings_config = previous_settings;
             *state.lock().expect("settings watcher mutex poisoned") = previous_snapshot;
@@ -462,7 +462,7 @@ fn handle_settings_change(
     if let Err(e) = crate::config::atomic_write(path, new_content.as_bytes()) {
         log::warn!("[ClaudeSettingsWatcher] write failed: {e}");
     } else {
-        record_last_written(&mut *provider, &writes[0].1, &writes[1].1);
+        record_last_written(&mut provider, &writes[0].1, &writes[1].1);
         record_processed_state(
             state,
             Some(active.model.as_str()),
