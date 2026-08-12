@@ -1147,7 +1147,11 @@ fn strip_injected_kimi_for_coding_context_defaults(settings: &mut Value, provide
 /// 与 `apply_context_window_defaults` 对称：模型后缀自动注入的 ACW/MAX 只应活在
 /// live，切走回填时必须剥掉；用户显式存储或手改过的 live 值保留。
 fn strip_injected_model_suffix_context_defaults(settings: &mut Value, provider: &Provider) {
-    let Some(target_window) = claude_context_window_target(provider) else {
+    let Some(target_window) =
+        crate::claude_settings_watcher::resolve_active_model_window(settings, provider)
+            .map(|active| active.window)
+            .or_else(|| claude_context_window_target(provider))
+    else {
         return;
     };
     let provider_env = provider
@@ -4747,6 +4751,48 @@ base_url = "https://a.example/v1"
         assert_eq!(
             settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
             json!("250000")
+        );
+    }
+
+    #[test]
+    fn backfill_without_ledger_uses_active_model_window_when_roles_differ() {
+        let provider = Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "haiku-model[30k]",
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL": "opus-model[1M]"
+                },
+                "autoSyncCompactRatio": 0.8
+            }),
+            None,
+        );
+        let live = json!({
+            "model": "haiku",
+            "env": {
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "haiku-model",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "opus-model",
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "24000",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "30000"
+            }
+        });
+
+        let backfilled =
+            restore_live_settings_for_provider_backfill(&AppType::Claude, &provider, live);
+        assert!(backfilled["env"]
+            .get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+            .is_none());
+        assert!(backfilled["env"]
+            .get("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+            .is_none());
+        assert_eq!(
+            backfilled["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"],
+            "haiku-model"
+        );
+        assert_eq!(
+            backfilled["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"],
+            "opus-model"
         );
     }
 }
