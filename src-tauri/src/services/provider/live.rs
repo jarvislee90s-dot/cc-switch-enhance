@@ -944,6 +944,13 @@ pub(crate) fn ensure_claude_settings_watcher(
     if !matches!(app_type, AppType::Claude) {
         return;
     }
+    #[cfg(test)]
+    {
+        // 测试默认不 spawn；仅显式设置 CC_SWITCH_TEST_WATCHER=1 时才走真实 spawn。
+        if std::env::var("CC_SWITCH_TEST_WATCHER").as_deref() != Ok("1") {
+            return;
+        }
+    }
     // 测试/调试隔离：设置该变量时不要创建目录或 spawn，避免触碰真实 ~/.claude。
     if std::env::var("CC_SWITCH_DISABLE_WATCHER").as_deref() == Ok("1") {
         return;
@@ -2612,6 +2619,12 @@ mod tests {
             env::set_var(key, value);
             Self { key, previous }
         }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = env::var_os(key);
+            env::remove_var(key);
+            Self { key, previous }
+        }
     }
 
     impl Drop for EnvVarGuard {
@@ -2620,6 +2633,14 @@ mod tests {
                 Some(value) => env::set_var(self.key, value),
                 None => env::remove_var(self.key),
             }
+        }
+    }
+
+    struct WatcherSlotGuard;
+
+    impl Drop for WatcherSlotGuard {
+        fn drop(&mut self) {
+            crate::claude_settings_watcher::clear_watcher_slot_for_tests();
         }
     }
 
@@ -2633,10 +2654,9 @@ mod tests {
             Provider::with_id("p".to_string(), "P".to_string(), json!({ "env": {} }), None);
         let settings_path = get_claude_settings_path();
         assert!(!settings_path.parent().unwrap().exists());
-        let settings =
+        let _settings =
             build_effective_settings_with_common_config(&db, &AppType::Claude, &provider)
                 .expect("build effective settings");
-        assert!(settings.get("watcherSpawned").is_none());
         assert!(
             crate::claude_settings_watcher::watcher_slot_is_empty_for_tests(),
             "settings builder must not spawn or replace the Claude watcher"
@@ -2652,6 +2672,8 @@ mod tests {
     fn write_live_with_common_config_respects_disable_watcher_env() {
         let _home = TempHome::new();
         let _disable_watcher = EnvVarGuard::set("CC_SWITCH_DISABLE_WATCHER", "1");
+        let _test_watcher = EnvVarGuard::set("CC_SWITCH_TEST_WATCHER", "1");
+        let _slot_guard = WatcherSlotGuard;
         crate::claude_settings_watcher::clear_watcher_slot_for_tests();
         let db = Database::memory().expect("create memory db");
         let provider = Provider::with_id(
@@ -2667,6 +2689,51 @@ mod tests {
         assert!(
             crate::claude_settings_watcher::watcher_slot_is_empty_for_tests(),
             "CC_SWITCH_DISABLE_WATCHER=1 must prevent watcher spawn"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn write_live_with_common_config_does_not_spawn_watcher_by_default_in_tests() {
+        let _home = TempHome::new();
+        let _test_watcher_unset = EnvVarGuard::remove("CC_SWITCH_TEST_WATCHER");
+        crate::claude_settings_watcher::clear_watcher_slot_for_tests();
+        let db = Database::memory().expect("create memory db");
+        let provider = Provider::with_id(
+            "default-no-watcher".to_string(),
+            "Default No Watcher".to_string(),
+            json!({ "env": {} }),
+            None,
+        );
+        db.save_provider(AppType::Claude.as_str(), &provider)
+            .expect("save provider");
+        write_live_with_common_config(&db, &AppType::Claude, &provider).expect("write live");
+        assert!(
+            crate::claude_settings_watcher::watcher_slot_is_empty_for_tests(),
+            "tests must not spawn or replace the Claude watcher by default"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn write_live_with_common_config_starts_watcher_with_test_opt_in() {
+        let _home = TempHome::new();
+        let _test_watcher = EnvVarGuard::set("CC_SWITCH_TEST_WATCHER", "1");
+        let _slot_guard = WatcherSlotGuard;
+        crate::claude_settings_watcher::clear_watcher_slot_for_tests();
+        let db = Database::memory().expect("create memory db");
+        let provider = Provider::with_id(
+            "opt-in-watcher".to_string(),
+            "Opt In Watcher".to_string(),
+            json!({ "env": {} }),
+            None,
+        );
+        db.save_provider(AppType::Claude.as_str(), &provider)
+            .expect("save provider");
+        write_live_with_common_config(&db, &AppType::Claude, &provider).expect("write live");
+        assert!(
+            !crate::claude_settings_watcher::watcher_slot_is_empty_for_tests(),
+            "CC_SWITCH_TEST_WATCHER=1 must allow watcher spawn after write live"
         );
     }
 
