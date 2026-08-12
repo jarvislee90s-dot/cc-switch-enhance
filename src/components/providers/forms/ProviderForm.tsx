@@ -299,7 +299,7 @@ function ProviderFormFull({
     initialData ? null : "custom",
   );
   const presetInitScopeRef = useRef<string | null>(null);
-  const formResetScopeRef = useRef<string | null>(null);
+  const initializedRef = useRef(false);
   const [activePreset, setActivePreset] = useState<{
     id: string;
     category?: ProviderCategory;
@@ -698,11 +698,11 @@ function ProviderFormFull({
   }, [appId, initialData, selectedPresetId, resetCodexConfig]);
 
   useEffect(() => {
-    const scope = `${appId}:${providerId ?? "new"}`;
-    if (formResetScopeRef.current === scope) return;
-    formResetScopeRef.current = scope;
+    // 只在首次渲染时用 defaultValues 初始化一次，之后不再因 scope 重复 reset
+    if (initializedRef.current) return;
+    initializedRef.current = true;
     form.reset(defaultValues);
-  }, [appId, providerId, defaultValues, form]);
+  }, [defaultValues, form]);
 
   const presetCategoryLabels: Record<string, string> = useMemo(
     () => ({

@@ -66,6 +66,7 @@ vi.mock("@/components/providers/forms/ProviderForm", () => ({
   }) => (
     <form
       id="provider-form"
+      data-testid="provider-form"
       onSubmit={(event) => {
         event.preventDefault();
         onSubmit({
@@ -249,5 +250,127 @@ describe("EditProviderDialog", () => {
         autoSyncCompactRatio: 0.8,
       });
     });
+  });
+
+  it("live 配置加载完成前不渲染表单，加载完成后出现", async () => {
+    const provider: Provider = {
+      id: "deepseek",
+      name: "DeepSeek",
+      category: "aggregator",
+      settingsConfig: {
+        auth: { OPENAI_API_KEY: "db-key" },
+      },
+    };
+    let resolveLive: (value: Record<string, unknown>) => void = () => {};
+    const livePromise = new Promise<Record<string, unknown>>((resolve) => {
+      resolveLive = resolve;
+    });
+
+    apiMocks.getCurrent.mockResolvedValue(provider.id);
+    apiMocks.getLiveProviderSettings.mockReturnValue(livePromise);
+
+    render(
+      <EditProviderDialog
+        open
+        provider={provider}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+        appId="codex"
+      />,
+    );
+
+    expect(screen.queryByTestId("provider-form")).not.toBeInTheDocument();
+
+    resolveLive({});
+    await waitFor(() =>
+      expect(screen.getByTestId("provider-form")).toBeInTheDocument(),
+    );
+  });
+
+  it("live 配置加载失败时禁用保存且不渲染表单", async () => {
+    const provider: Provider = {
+      id: "deepseek",
+      name: "DeepSeek",
+      category: "aggregator",
+      settingsConfig: {
+        auth: { OPENAI_API_KEY: "db-key" },
+      },
+    };
+
+    apiMocks.getCurrent.mockResolvedValue(provider.id);
+    apiMocks.getLiveProviderSettings.mockRejectedValue(new Error("boom"));
+
+    render(
+      <EditProviderDialog
+        open
+        provider={provider}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+        appId="codex"
+      />,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "common.save" })).toBeDisabled(),
+    );
+    expect(screen.queryByTestId("provider-form")).not.toBeInTheDocument();
+  });
+
+  it("OpenClaw live 配置加载失败时禁用保存且不渲染表单", async () => {
+    const provider: Provider = {
+      id: "openclaw-provider",
+      name: "OpenClaw Provider",
+      category: "custom",
+      settingsConfig: { base_url: "https://db.example.com" },
+    };
+
+    apiMocks.getOpenClawLiveProvider.mockRejectedValue(new Error("boom"));
+
+    render(
+      <EditProviderDialog
+        open
+        provider={provider}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+        appId="openclaw"
+      />,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "common.save" })).toBeDisabled(),
+    );
+    expect(screen.queryByTestId("provider-form")).not.toBeInTheDocument();
+  });
+
+  it("live 配置不存在时仍使用数据库快照渲染并允许保存", async () => {
+    const provider: Provider = {
+      id: "deepseek",
+      name: "DeepSeek",
+      category: "aggregator",
+      settingsConfig: {
+        auth: { OPENAI_API_KEY: "db-key" },
+      },
+    };
+
+    apiMocks.getCurrent.mockResolvedValue(provider.id);
+    apiMocks.getLiveProviderSettings.mockResolvedValue(null);
+
+    render(
+      <EditProviderDialog
+        open
+        provider={provider}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+        appId="codex"
+      />,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("provider-form")).toBeInTheDocument(),
+    );
+    expect(screen.getByRole("button", { name: "common.save" })).toBeEnabled();
+    expect(
+      JSON.parse(screen.getByTestId("settings-config").textContent ?? "{}"),
+    ).toEqual(provider.settingsConfig);
   });
 });

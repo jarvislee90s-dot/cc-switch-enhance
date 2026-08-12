@@ -39,20 +39,21 @@ export function EditProviderDialog({
     unknown
   > | null>(null);
 
-  // 使用 ref 标记是否已经加载过，防止重复读取覆盖用户编辑
+  // 标记是否已经完成 live 读取（成功、不存在、或跳过读取都视为完成）
   const [hasLoadedLive, setHasLoadedLive] = useState(false);
+
+  // live 读取失败时禁止保存，避免用 DB 快照覆盖实时配置
+  const [liveLoadFailed, setLiveLoadFailed] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
-      if (!open || !provider) {
-        setLiveSettings(null);
-        setHasLoadedLive(false);
-        return;
-      }
+      // 打开、切换 provider 或切换 app 时重新初始化加载状态
+      setLiveSettings(null);
+      setHasLoadedLive(false);
+      setLiveLoadFailed(false);
 
-      // 关键修复：只在首次打开时加载一次
-      if (hasLoadedLive) {
+      if (!open || !provider) {
         return;
       }
 
@@ -60,7 +61,6 @@ export function EditProviderDialog({
       // 因此直接回退到 SSOT（数据库）配置，避免用户困惑与误保存
       if (isProxyTakeover) {
         if (!cancelled) {
-          setLiveSettings(null);
           setHasLoadedLive(true);
         }
         return;
@@ -71,7 +71,6 @@ export function EditProviderDialog({
       // instead of just the provider fragment, causing incorrect nested structure on save
       if (appId === "opencode") {
         if (!cancelled) {
-          setLiveSettings(null);
           setHasLoadedLive(true);
         }
         return;
@@ -80,17 +79,15 @@ export function EditProviderDialog({
       if (appId === "openclaw") {
         try {
           const live = await openclawApi.getLiveProvider(provider.id);
-          if (!cancelled && live && typeof live === "object") {
-            setLiveSettings(live);
-          } else if (!cancelled) {
-            setLiveSettings(null);
+          if (!cancelled) {
+            if (live && typeof live === "object") {
+              setLiveSettings(live);
+            }
+            setHasLoadedLive(true);
           }
         } catch {
           if (!cancelled) {
-            setLiveSettings(null);
-          }
-        } finally {
-          if (!cancelled) {
+            setLiveLoadFailed(true);
             setHasLoadedLive(true);
           }
         }
@@ -104,32 +101,34 @@ export function EditProviderDialog({
             const live = (await vscodeApi.getLiveProviderSettings(
               appId,
             )) as Record<string, unknown>;
-            if (!cancelled && live && typeof live === "object") {
-              setLiveSettings(live);
+            if (!cancelled) {
+              if (live && typeof live === "object") {
+                setLiveSettings(live);
+              }
               setHasLoadedLive(true);
             }
           } catch {
-            // 读取实时配置失败则回退到 SSOT（不打断编辑流程）
             if (!cancelled) {
-              setLiveSettings(null);
+              setLiveLoadFailed(true);
               setHasLoadedLive(true);
             }
           }
-        } else {
-          if (!cancelled) {
-            setLiveSettings(null);
-            setHasLoadedLive(true);
-          }
+        } else if (!cancelled) {
+          setHasLoadedLive(true);
         }
-      } finally {
-        // no-op
+      } catch {
+        // 无法确认当前供应商时也按 live 读取失败处理，避免用 DB 快照覆盖 live
+        if (!cancelled) {
+          setLiveLoadFailed(true);
+          setHasLoadedLive(true);
+        }
       }
     };
     void load();
     return () => {
       cancelled = true;
     };
-  }, [open, provider?.id, appId, hasLoadedLive, isProxyTakeover]); // 只依赖 provider.id，不依赖整个 provider 对象
+  }, [open, provider?.id, appId, isProxyTakeover]); // 只依赖 provider.id，不依赖整个 provider 对象
 
   const initialSettingsConfig = useMemo(() => {
     const base = (liveSettings ?? provider?.settingsConfig ?? {}) as Record<
@@ -238,6 +237,39 @@ export function EditProviderDialog({
 
   if (!provider || !initialData) {
     return null;
+  }
+
+  if (!hasLoadedLive || liveLoadFailed) {
+    return (
+      <FullScreenPanel
+        isOpen={open}
+        title={t("provider.editProvider")}
+        onClose={() => onOpenChange(false)}
+        footer={
+          <Button
+            type="submit"
+            form="provider-form"
+            disabled
+            className="bg-primary text-primary-foreground hover:bg-primary/90"
+          >
+            <Save className="h-4 w-4 mr-2" />
+            {t("common.save")}
+          </Button>
+        }
+      >
+        <div
+          className={`p-8 text-sm ${
+            liveLoadFailed ? "text-destructive" : "text-muted-foreground"
+          }`}
+        >
+          {liveLoadFailed
+            ? t("providerForm.liveLoadFailed", {
+                defaultValue: "读取实时配置失败，为避免覆盖实时配置已禁用保存",
+              })
+            : t("common.loading", { defaultValue: "加载中..." })}
+        </div>
+      </FullScreenPanel>
+    );
   }
 
   return (
