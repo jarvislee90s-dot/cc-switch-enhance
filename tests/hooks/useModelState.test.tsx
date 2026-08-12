@@ -102,7 +102,7 @@ describe("useModelState", () => {
     expect(result.current.defaultSonnetModelName).toBe("deepseek-v4-pro");
   });
 
-  it("writes and clears the Claude Code subagent model env field", () => {
+  it("writes clean Claude Code subagent model env and strips legacy suffix", () => {
     let latestConfig = JSON.stringify({
       env: {
         ANTHROPIC_MODEL: "fallback-model",
@@ -128,7 +128,7 @@ describe("useModelState", () => {
 
     let env = JSON.parse(latestConfig).env;
     expect(env.ANTHROPIC_MODEL).toBe("fallback-model");
-    expect(env.CLAUDE_CODE_SUBAGENT_MODEL).toBe("subagent-model[1M]");
+    expect(env.CLAUDE_CODE_SUBAGENT_MODEL).toBe("subagent-model");
 
     act(() => {
       result.current.handleModelChange("CLAUDE_CODE_SUBAGENT_MODEL", "");
@@ -347,6 +347,15 @@ describe("contextWindows", () => {
     expect(readContextWindows(JSON.stringify({ env: {} }))).toEqual({});
   });
 
+  it("returns empty object for non-object contextWindows", () => {
+    expect(readContextWindows(JSON.stringify({ contextWindows: [] }))).toEqual(
+      {},
+    );
+    expect(
+      readContextWindows(JSON.stringify({ contextWindows: "bad" })),
+    ).toEqual({});
+  });
+
   it("窗口写入 contextWindows 且模型名不带后缀", () => {
     const config = JSON.stringify({
       env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "glm-5.2" },
@@ -361,9 +370,24 @@ describe("contextWindows", () => {
     expect(parsed.contextWindows.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe(200000);
   });
 
+  it("写入窗口时剥离 env 中的旧后缀", () => {
+    const config = JSON.stringify({
+      env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "model[1M]" },
+    });
+    const next = writeContextWindow(
+      config,
+      "ANTHROPIC_DEFAULT_SONNET_MODEL",
+      200000,
+    );
+    const parsed = JSON.parse(next);
+    expect(parsed.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("model");
+    expect(parsed.contextWindows.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe(200000);
+  });
+
   it("清空窗口时不写 contextWindows 也不写后缀", () => {
     const config = JSON.stringify({
-      env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "glm-5.2" },
+      env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "glm-5.2[1M]" },
+      contextWindows: { ANTHROPIC_DEFAULT_SONNET_MODEL: 1000000 },
     });
     const next = writeContextWindow(
       config,
@@ -375,5 +399,26 @@ describe("contextWindows", () => {
       parsed.contextWindows.ANTHROPIC_DEFAULT_SONNET_MODEL,
     ).toBeUndefined();
     expect(parsed.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("glm-5.2");
+  });
+
+  it("writeContextWindow 对无效 JSON 不抛错并返回原 config", () => {
+    const invalid = "{invalid";
+    expect(() =>
+      writeContextWindow(invalid, "ANTHROPIC_DEFAULT_SONNET_MODEL", 200000),
+    ).not.toThrow();
+    expect(
+      writeContextWindow(invalid, "ANTHROPIC_DEFAULT_SONNET_MODEL", 200000),
+    ).toBe(invalid);
+  });
+
+  it("writeContextWindow 会替换非对象 contextWindows", () => {
+    const next = writeContextWindow(
+      JSON.stringify({ contextWindows: [] }),
+      "ANTHROPIC_DEFAULT_SONNET_MODEL",
+      200000,
+    );
+    const parsed = JSON.parse(next);
+    expect(Array.isArray(parsed.contextWindows)).toBe(false);
+    expect(parsed.contextWindows.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe(200000);
   });
 });

@@ -17,6 +17,15 @@ export type ClaudeModelEnvField =
   | "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"
   | "CLAUDE_CODE_SUBAGENT_MODEL";
 
+const MODEL_ENV_FIELDS: ClaudeModelEnvField[] = [
+  "ANTHROPIC_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "ANTHROPIC_DEFAULT_FABLE_MODEL",
+  "CLAUDE_CODE_SUBAGENT_MODEL",
+];
+
 export const CLAUDE_ONE_M_MARKER = "[1M]";
 
 export function hasClaudeOneMMarker(model: string): boolean {
@@ -125,12 +134,19 @@ export function reapplySuffix(oldModel: string, newInput: string): string {
   return oldSuffix ? `${newBase}${oldSuffix}` : newBase;
 }
 
+function isRecord(value: unknown): value is Record<string, any> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 export function readContextWindows(
   settingsConfig: string,
 ): Record<string, number> {
   try {
-    const cfg = JSON.parse(settingsConfig || "{}") as Record<string, any>;
-    return (cfg.contextWindows ?? {}) as Record<string, number>;
+    const cfg = JSON.parse(settingsConfig || "{}") as unknown;
+    if (!isRecord(cfg)) return {};
+    const contextWindows = cfg.contextWindows;
+    if (!isRecord(contextWindows)) return {};
+    return contextWindows as Record<string, number>;
   } catch {
     return {};
   }
@@ -141,12 +157,35 @@ export function writeContextWindow(
   roleEnvKey: string,
   value: number | null,
 ): string {
-  const parsed = JSON.parse(config || "{}") as Record<string, any>;
-  parsed.contextWindows ??= {};
+  let parsed: Record<string, any>;
+  try {
+    const candidate = JSON.parse(config || "{}") as unknown;
+    if (!isRecord(candidate)) return config;
+    parsed = candidate;
+  } catch {
+    return config;
+  }
+
+  const env = isRecord(parsed.env) ? parsed.env : undefined;
+  if (env) {
+    const current = env[roleEnvKey];
+    if (typeof current === "string") {
+      env[roleEnvKey] = stripModelSuffix(current);
+    } else {
+      delete env[roleEnvKey];
+    }
+  } else if (parsed.env !== undefined) {
+    parsed.env = {};
+  }
+
+  const contextWindows = isRecord(parsed.contextWindows)
+    ? parsed.contextWindows
+    : {};
+  parsed.contextWindows = contextWindows;
   if (value === null || value <= 0) {
-    delete parsed.contextWindows[roleEnvKey];
+    delete contextWindows[roleEnvKey];
   } else {
-    parsed.contextWindows[roleEnvKey] = value;
+    contextWindows[roleEnvKey] = value;
   }
   return JSON.stringify(parsed, null, 2);
 }
@@ -295,23 +334,28 @@ export function useModelState({
     (field: ClaudeModelEnvField, value: string) => {
       isUserEditingRef.current = true;
 
-      if (field === "ANTHROPIC_MODEL") setClaudeModel(value);
+      const nextValue = MODEL_ENV_FIELDS.includes(field)
+        ? stripModelSuffix(value).trim()
+        : value.trim();
+
+      if (field === "ANTHROPIC_MODEL") setClaudeModel(nextValue);
       if (field === "ANTHROPIC_DEFAULT_HAIKU_MODEL")
-        setDefaultHaikuModel(value);
+        setDefaultHaikuModel(nextValue);
       if (field === "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME")
-        setDefaultHaikuModelName(value);
+        setDefaultHaikuModelName(nextValue);
       if (field === "ANTHROPIC_DEFAULT_SONNET_MODEL")
-        setDefaultSonnetModel(value);
+        setDefaultSonnetModel(nextValue);
       if (field === "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME")
-        setDefaultSonnetModelName(value);
-      if (field === "ANTHROPIC_DEFAULT_OPUS_MODEL") setDefaultOpusModel(value);
+        setDefaultSonnetModelName(nextValue);
+      if (field === "ANTHROPIC_DEFAULT_OPUS_MODEL")
+        setDefaultOpusModel(nextValue);
       if (field === "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME")
-        setDefaultOpusModelName(value);
+        setDefaultOpusModelName(nextValue);
       if (field === "ANTHROPIC_DEFAULT_FABLE_MODEL")
-        setDefaultFableModel(value);
+        setDefaultFableModel(nextValue);
       if (field === "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME")
-        setDefaultFableModelName(value);
-      if (field === "CLAUDE_CODE_SUBAGENT_MODEL") setSubagentModel(value);
+        setDefaultFableModelName(nextValue);
+      if (field === "CLAUDE_CODE_SUBAGENT_MODEL") setSubagentModel(nextValue);
 
       try {
         const currentConfig = latestConfigRef.current
@@ -321,7 +365,7 @@ export function useModelState({
         const env = currentConfig.env as Record<string, unknown>;
 
         // 新键仅写入；旧键不再写入
-        const trimmed = value.trim();
+        const trimmed = nextValue;
         if (trimmed) {
           env[field] = trimmed;
         } else {

@@ -57,7 +57,6 @@ import type {
 import {
   parseModelSuffix,
   setModelSuffix,
-  reapplySuffix,
   readContextWindows,
   writeContextWindow,
   stripModelSuffix,
@@ -789,14 +788,13 @@ export function ClaudeFormFields({
 
   const handleRoleModelChange = (row: ModelRoleRow, value: string) => {
     const oldModelBase = stripModelSuffix(row.model).trim();
-    // 改模型名时保留原 context window 后缀，避免丢窗口配置
-    const nextModel = reapplySuffix(row.model, value);
-    const nextModelBase = stripModelSuffix(nextModel).trim();
+    // 窗口后缀由 contextWindows 承载，模型名保存时只保留干净名称。
+    const nextModel = stripModelSuffix(value).trim();
     const displayName = row.displayName?.trim() ?? "";
     const shouldSyncDisplayName = !displayName || displayName === oldModelBase;
     onModelChange(row.modelField, nextModel);
     if (row.displayNameField && shouldSyncDisplayName) {
-      onModelChange(row.displayNameField, nextModelBase);
+      onModelChange(row.displayNameField, nextModel);
     }
   };
 
@@ -1046,7 +1044,7 @@ export function ClaudeFormFields({
                         subagentModel;
                       if (value) {
                         for (const row of modelRoleRows) {
-                          const roleValue = value;
+                          const roleValue = stripModelSuffix(value);
                           onModelChange(row.modelField, roleValue);
                           if (row.displayNameField) {
                             onModelChange(
@@ -1278,7 +1276,7 @@ export function ClaudeFormFields({
                   (value) =>
                     onModelChange(
                       "ANTHROPIC_MODEL",
-                      reapplySuffix(claudeModel, value),
+                      stripModelSuffix(value).trim(),
                     ),
                 )}
                 <Input
