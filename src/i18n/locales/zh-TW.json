@@ -1186,6 +1186,7 @@
     "modelContextWindowHint": "聲明模型上下文視窗大小，留空使用預設 200K",
     "autoSyncContextWindow": "自動同步模型上下文長度",
     "autoSyncContextWindowTooltip": "上下文長度和壓縮閾值按切換的模型更新設定 json。切換後需重啟 Claude Code（退出後用 claude --resume 恢復會話）才生效。多CC終端使用不同模型，以最後切換模型時的上下文長度作為全域變數。",
+    "autoSyncContextWindowTooltipOn": "上下文長度和壓縮閾值按切換的模型更新設定 json。切換後需重啟 Claude Code（退出後用 claude --resume 恢復會話）才生效。多CC終端使用不同模型，以最後切換模型時的上下文長度作為全域變數。",
     "autoSyncContextWindowTooltipOff": "對於[1M]後綴的模型 Claude Code 原生支援 1M 上下文，其他輸入形式或不輸入預設為 200k，切換模型後終端內生效。",
     "autoSyncCompactRatio": "壓縮比例",
     "autoSyncCompactRatioHint": "此參數是模型自動壓縮上下文視窗的比例，範圍 0.2~1，留空按 1 處理。",
