@@ -311,9 +311,14 @@ describe("EditProviderDialog", () => {
     );
 
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: "common.save" })).toBeDisabled(),
+      expect(
+        screen.getByRole("button", { name: "common.save" }),
+      ).toBeDisabled(),
     );
     expect(screen.queryByTestId("provider-form")).not.toBeInTheDocument();
+    expect(screen.getByTestId("live-load-error")).toHaveTextContent(
+      /读取实时配置失败/,
+    );
   });
 
   it("OpenClaw live 配置加载失败时禁用保存且不渲染表单", async () => {
@@ -337,9 +342,117 @@ describe("EditProviderDialog", () => {
     );
 
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: "common.save" })).toBeDisabled(),
+      expect(
+        screen.getByRole("button", { name: "common.save" }),
+      ).toBeDisabled(),
     );
     expect(screen.queryByTestId("provider-form")).not.toBeInTheDocument();
+    expect(screen.getByTestId("live-load-error")).toHaveTextContent(
+      /读取实时配置失败/,
+    );
+  });
+
+  it("providersApi.getCurrent 失败时禁用保存并显示 live 读取失败", async () => {
+    const provider: Provider = {
+      id: "deepseek",
+      name: "DeepSeek",
+      category: "aggregator",
+      settingsConfig: {
+        auth: { OPENAI_API_KEY: "db-key" },
+      },
+    };
+
+    apiMocks.getCurrent.mockRejectedValue(new Error("boom"));
+
+    render(
+      <EditProviderDialog
+        open
+        provider={provider}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+        appId="codex"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("live-load-error")).toHaveTextContent(
+        /读取实时配置失败/,
+      );
+    });
+    expect(screen.getByRole("button", { name: "common.save" })).toBeDisabled();
+    expect(screen.queryByTestId("provider-form")).not.toBeInTheDocument();
+    expect(apiMocks.getLiveProviderSettings).not.toHaveBeenCalled();
+  });
+
+  it("同一会话切换 provider 时重新进入加载 gate，避免短暂用旧 live 配置渲染", async () => {
+    const providerA: Provider = {
+      id: "deepseek",
+      name: "DeepSeek",
+      category: "aggregator",
+      settingsConfig: {
+        auth: { OPENAI_API_KEY: "db-key-a" },
+      },
+    };
+    const providerB: Provider = {
+      id: "kimi",
+      name: "Kimi",
+      category: "aggregator",
+      settingsConfig: {
+        auth: { OPENAI_API_KEY: "db-key-b" },
+      },
+    };
+    let resolveA: (value: Record<string, unknown>) => void = () => {};
+    let resolveB: (value: Record<string, unknown>) => void = () => {};
+    const liveA = new Promise<Record<string, unknown>>((resolve) => {
+      resolveA = resolve;
+    });
+    const liveB = new Promise<Record<string, unknown>>((resolve) => {
+      resolveB = resolve;
+    });
+
+    apiMocks.getCurrent
+      .mockResolvedValueOnce(providerA.id)
+      .mockResolvedValueOnce(providerB.id);
+    apiMocks.getLiveProviderSettings
+      .mockReturnValueOnce(liveA)
+      .mockReturnValueOnce(liveB);
+
+    const view = render(
+      <EditProviderDialog
+        open
+        provider={providerA}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+        appId="codex"
+      />,
+    );
+
+    resolveA({ auth: { OPENAI_API_KEY: "live-key-a" } });
+    await waitFor(() => {
+      expect(
+        JSON.parse(screen.getByTestId("settings-config").textContent ?? "{}"),
+      ).toEqual({ auth: { OPENAI_API_KEY: "live-key-a" } });
+    });
+
+    view.rerender(
+      <EditProviderDialog
+        open
+        provider={providerB}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+        appId="codex"
+      />,
+    );
+    expect(screen.getByText("加载中...")).toBeInTheDocument();
+    expect(screen.queryByTestId("provider-form")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "common.save" })).toBeDisabled();
+
+    resolveB({ auth: { OPENAI_API_KEY: "live-key-b" } });
+    await waitFor(() => {
+      expect(
+        JSON.parse(screen.getByTestId("settings-config").textContent ?? "{}"),
+      ).toEqual({ auth: { OPENAI_API_KEY: "live-key-b" } });
+    });
   });
 
   it("live 配置不存在时仍使用数据库快照渲染并允许保存", async () => {

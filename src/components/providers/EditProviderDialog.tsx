@@ -47,12 +47,13 @@ export function EditProviderDialog({
 
   useEffect(() => {
     let cancelled = false;
-    const load = async () => {
-      // 打开、切换 provider 或切换 app 时重新初始化加载状态
-      setLiveSettings(null);
-      setHasLoadedLive(false);
-      setLiveLoadFailed(false);
 
+    // 打开、切换 provider 或切换 app 时，在 effect 同步阶段先重置加载状态
+    setLiveSettings(null);
+    setHasLoadedLive(false);
+    setLiveLoadFailed(false);
+
+    const load = async () => {
       if (!open || !provider) {
         return;
       }
@@ -261,6 +262,7 @@ export function EditProviderDialog({
           className={`p-8 text-sm ${
             liveLoadFailed ? "text-destructive" : "text-muted-foreground"
           }`}
+          data-testid={liveLoadFailed ? "live-load-error" : undefined}
         >
           {liveLoadFailed
             ? t("providerForm.liveLoadFailed", {
