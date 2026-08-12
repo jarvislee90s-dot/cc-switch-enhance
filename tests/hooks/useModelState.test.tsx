@@ -11,6 +11,7 @@ import {
   writeContextWindow,
   stripModelSuffix,
   useModelState,
+  parseWindowToken,
 } from "@/components/providers/forms/hooks/useModelState";
 
 describe("useModelState", () => {
@@ -153,6 +154,32 @@ describe("useModelState", () => {
   });
 });
 
+describe("parseWindowToken", () => {
+  it.each([
+    ["200K", 200000],
+    ["200k", 200000],
+    ["1M", 1000000],
+    ["1m", 1000000],
+    ["128000", 128000],
+  ])("接受 %s", (input, expected) => {
+    expect(parseWindowToken(input)).toBe(expected);
+  });
+
+  it.each([
+    "1e3",
+    "1foo2",
+    "12abc34",
+    "1.5M",
+    "1,000,000",
+    "1_000_000",
+    "1 000 000",
+    "0",
+    "1G",
+  ])("拒绝 %s", (input) => {
+    expect(parseWindowToken(input)).toBeUndefined();
+  });
+});
+
 describe("parseModelSuffix", () => {
   it("parses [1m] suffix", () => {
     expect(parseModelSuffix("deepseek-v4-pro[1m]")).toEqual({
@@ -217,10 +244,27 @@ describe("parseModelSuffix", () => {
     });
   });
 
-  it("parses [1.5m] decimal as 1500000", () => {
+  it("rejects [1.5m] decimal", () => {
     expect(parseModelSuffix("model[1.5m]")).toEqual({
-      slug: "model",
-      window: 1500000,
+      slug: "model[1.5m]",
+      window: undefined,
+    });
+  });
+
+  it.each([
+    "1e3",
+    "1foo2",
+    "12abc34",
+    "1.5M",
+    "1,000,000",
+    "1_000_000",
+    "1 000 000",
+    "0",
+    "1G",
+  ])("rejects [%s] as invalid suffix", (input) => {
+    expect(parseModelSuffix(`model[${input}]`)).toEqual({
+      slug: `model[${input}]`,
+      window: undefined,
     });
   });
 });
@@ -261,43 +305,35 @@ describe("setModelSuffix", () => {
   it("returns base unchanged for unsupported unit 1G", () => {
     expect(setModelSuffix("model", "1G")).toBe("model");
   });
+
+  it.each([
+    "1e3",
+    "1foo2",
+    "12abc34",
+    "1.5M",
+    "1,000,000",
+    "1_000_000",
+    "1 000 000",
+    "0",
+    "1G",
+  ])("returns base unchanged for invalid input %s", (input) => {
+    expect(setModelSuffix("model", input)).toBe("model");
+  });
 });
 
 describe("setModelSuffix - 多元化输入", () => {
-  it("accepts input with brackets [30k]", () => {
-    expect(setModelSuffix("model", "[30k]")).toBe("model[30k]");
-  });
-
-  it("accepts input with trailing bracket [30", () => {
-    expect(setModelSuffix("model", "[30")).toBe("model[30]");
-  });
-
-  it("accepts input with leading bracket 30k]", () => {
-    expect(setModelSuffix("model", "30k]")).toBe("model[30k]");
-  });
-
-  it("accepts comma-separated number 1,000,000", () => {
-    expect(setModelSuffix("model", "1,000,000")).toBe("model[1000000]");
-  });
-
-  it("accepts underscore-separated number 1_000_000", () => {
-    expect(setModelSuffix("model", "1_000_000")).toBe("model[1000000]");
-  });
-
-  it('accepts space-separated "1 000 000"', () => {
-    expect(setModelSuffix("model", "1 000 000")).toBe("model[1000000]");
-  });
-
-  it("accepts decimal 1.5M as 1500000", () => {
-    expect(setModelSuffix("model", "1.5M")).toBe("model[1500000]");
-  });
-
-  it("accepts decimal 0.5M as 500000", () => {
-    expect(setModelSuffix("model", "0.5M")).toBe("model[500000]");
-  });
-
-  it("accepts mixed input [1,000k]", () => {
-    expect(setModelSuffix("model", "[1,000k]")).toBe("model[1000k]");
+  it.each([
+    "[30k]",
+    "[30",
+    "30k]",
+    "1,000,000",
+    "1_000_000",
+    "1 000 000",
+    "1.5M",
+    "0.5M",
+    "[1,000k]",
+  ])("rejects %s without suffix", (input) => {
+    expect(setModelSuffix("model", input)).toBe("model");
   });
 });
 

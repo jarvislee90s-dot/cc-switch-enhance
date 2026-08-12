@@ -51,38 +51,20 @@ export interface ModelSuffixResult {
   window?: number;
 }
 
-function parseWindowToken(token: string): number | undefined {
+export function parseWindowToken(token: string): number | undefined {
   const trimmed = token.trim();
   if (!trimmed) return undefined;
-  // 清洗括号、逗号、下划线、空格等装饰字符
-  const cleaned = trimmed.replace(/[[\]()_,\s]/g, "");
-  if (!cleaned) return undefined;
-
-  // 提取末尾单位（K/k/M/m），去掉后得到数字部分
-  const last = cleaned[cleaned.length - 1];
-  let numPart: string;
-  let multiplier: number;
-  if (last === "K" || last === "k") {
-    numPart = cleaned.slice(0, -1);
-    multiplier = 1000;
-  } else if (last === "M" || last === "m") {
-    numPart = cleaned.slice(0, -1);
-    multiplier = 1000000;
-  } else if (last >= "0" && last <= "9") {
-    // 纯数字
-    numPart = cleaned;
-    multiplier = 1;
-  } else {
-    // 未知单位（如 G）→ 不合法
-    return undefined;
-  }
-
-  // 支持小数（如 1.5M → 1.5 × 1000000 = 1500000）
-  const num = numPart.includes(".")
-    ? Number.parseFloat(numPart)
-    : Number.parseInt(numPart, 10);
+  // 与 Rust 端一致：全串校验，不接受小数、分隔符或未知单位
+  const match = /^(\d+)([KkMm])?$/.exec(trimmed);
+  if (!match) return undefined;
+  const num = Number(match[1]);
   if (!Number.isFinite(num) || num <= 0) return undefined;
-  return Math.round(num * multiplier);
+  const multiplier = match[2]
+    ? match[2].toLowerCase() === "k"
+      ? 1000
+      : 1000000
+    : 1;
+  return num * multiplier;
 }
 
 export function parseModelSuffix(model: string): ModelSuffixResult {
@@ -109,13 +91,10 @@ export function setModelSuffix(model: string, windowStr: string): string {
   if (!base) return "";
   const trimmed = windowStr.trim();
   if (!trimmed) return base;
-  const cleaned = trimmed.replace(/[[\]()_,\s]/g, "");
-  if (!cleaned) return base;
-  const window = parseWindowToken(cleaned);
+  const window = parseWindowToken(trimmed);
   if (window === undefined) return base;
-  // 小数输入时输出计算结果（如 1.5M → [1500000]），否则保留清洗后的原始格式
-  const suffix = cleaned.includes(".") ? String(window) : cleaned.toLowerCase();
-  return `${base}[${suffix}]`;
+  // 旧输入兼容：合法 token 按小写写入后缀
+  return `${base}[${trimmed.toLowerCase()}]`;
 }
 
 /**
