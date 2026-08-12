@@ -426,6 +426,16 @@ describe("ClaudeFormFields", () => {
     expect(screen.getByLabelText("压缩比例")).toHaveValue(0.8);
   });
 
+  it("压缩比例输入 max=0.95 step=0.05", () => {
+    renderCopilotForm({
+      settingsConfig: JSON.stringify({ env: {}, autoSyncContextWindow: true }),
+    });
+
+    const input = screen.getByLabelText("压缩比例");
+    expect(input).toHaveAttribute("max", "0.95");
+    expect(input).toHaveAttribute("step", "0.05");
+  });
+
   it("修改压缩比例时走独立回调", () => {
     const onAutoSyncCompactRatioChange = vi.fn();
     renderCopilotForm({
@@ -438,6 +448,20 @@ describe("ClaudeFormFields", () => {
     });
 
     expect(onAutoSyncCompactRatioChange).toHaveBeenCalledWith(0.5);
+  });
+
+  it("压缩比例 0.95 在范围内时写入", () => {
+    const onAutoSyncCompactRatioChange = vi.fn();
+    renderCopilotForm({
+      settingsConfig: JSON.stringify({ env: {}, autoSyncContextWindow: true }),
+      onAutoSyncCompactRatioChange,
+    });
+
+    fireEvent.change(screen.getByLabelText("压缩比例"), {
+      target: { value: "0.95" },
+    });
+
+    expect(onAutoSyncCompactRatioChange).toHaveBeenCalledWith(0.95);
   });
 
   it("清空压缩比例时删除字段", () => {
@@ -466,12 +490,12 @@ describe("ClaudeFormFields", () => {
     });
 
     fireEvent.change(screen.getByLabelText("压缩比例"), {
-      target: { value: "1.5" },
+      target: { value: "0.96" },
     });
 
     expect(onAutoSyncCompactRatioChange).not.toHaveBeenCalled();
     expect(
-      screen.getByText("压缩比例必须是 0.2~1 之间的数字"),
+      screen.getByText("压缩比例必须是 0.2~0.95 之间的数字"),
     ).toBeInTheDocument();
   });
 

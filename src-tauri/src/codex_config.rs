@@ -597,7 +597,7 @@ fn codex_catalog_model_entry(
     entry_obj.insert("description".to_string(), json!(display_name));
     entry_obj.insert("context_window".to_string(), json!(context_window));
     entry_obj.insert("max_context_window".to_string(), json!(context_window));
-    entry_obj.insert("effective_context_window_percent".to_string(), json!(100));
+    entry_obj.insert("effective_context_window_percent".to_string(), json!(95));
     entry_obj.insert("auto_compact_token_limit".to_string(), Value::Null);
 
     entry_obj.insert("priority".to_string(), json!(1000 + priority));
@@ -4527,8 +4527,21 @@ model_catalog_json = "cc-switch-model-catalog.json"
                 .expect("catalog generation")
                 .expect("non-empty catalog");
         let entry = &catalog["models"][0];
-        assert_eq!(entry["effective_context_window_percent"], json!(100));
+        assert_eq!(entry["effective_context_window_percent"], json!(95));
         assert_eq!(entry["auto_compact_token_limit"], json!(null));
+    }
+
+    #[test]
+    fn catalog_entry_uses_95_effective_percent() {
+        let settings = json!({ "modelCatalog": { "models": [ { "model": "m", "contextWindow": "1000000" } ] } });
+        let catalog =
+            codex_model_catalog_from_settings(&settings, "", CodexCatalogToolProfile::ProxyChat)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            catalog["models"][0]["effective_context_window_percent"],
+            json!(95)
+        );
     }
 
     fn test_spec(model: &str, context_window: Option<u64>) -> CodexCatalogModelSpec {

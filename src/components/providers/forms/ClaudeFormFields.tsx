@@ -83,7 +83,7 @@ function parseAutoSyncCompactRatio(config?: string): number | null {
       typeof ratio === "number" &&
       Number.isFinite(ratio) &&
       ratio >= 0.2 &&
-      ratio <= 1
+      ratio <= 0.95
     ) {
       return ratio;
     }
@@ -351,7 +351,7 @@ export function ClaudeFormFields({
         return;
       }
       const parsed = Number(value);
-      if (Number.isFinite(parsed) && parsed >= 0.2 && parsed <= 1) {
+      if (Number.isFinite(parsed) && parsed >= 0.2 && parsed <= 0.95) {
         setAutoSyncCompactRatioError("");
         if (onAutoSyncCompactRatioChange) {
           onAutoSyncCompactRatioChange(parsed);
@@ -363,7 +363,7 @@ export function ClaudeFormFields({
       } else {
         setAutoSyncCompactRatioError(
           t("providerForm.autoSyncCompactRatioInvalid", {
-            defaultValue: "压缩比例必须是 0.2~1 之间的数字",
+            defaultValue: "压缩比例必须是 0.2~0.95 之间的数字",
           }),
         );
       }
@@ -1223,8 +1223,8 @@ export function ClaudeFormFields({
                 id="auto-sync-compact-ratio"
                 type="number"
                 min={0.2}
-                max={1}
-                step={0.1}
+                max={0.95}
+                step={0.05}
                 className="h-7 w-20 text-center"
                 value={autoSyncCompactRatioInput}
                 onChange={(event) =>
@@ -1257,7 +1257,7 @@ export function ClaudeFormFields({
             <p className="mt-1.5 ml-1 text-xs leading-relaxed text-muted-foreground">
               {t("providerForm.autoSyncCompactRatioHint", {
                 defaultValue:
-                  "该参数是模型自动压缩上下文窗口的比例，范围 0.2~1，留空按 1 处理。",
+                  "该参数是模型自动压缩上下文窗口的比例，范围 0.2~0.95，留空按 1 处理。",
               })}
             </p>
 
