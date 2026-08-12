@@ -70,7 +70,7 @@ describe("mergeSettingsConfigPreservingAutoSync", () => {
     });
   });
 
-  it("重新开启自动同步时不自动写回 ACW/MAX", () => {
+  it("重新开启自动同步时无账本不写回 ACW/MAX", () => {
     const updated = applyAutoSyncContextWindowSetting(
       JSON.stringify({ env: { ANTHROPIC_MODEL: "model[1M]" } }),
       true,
@@ -80,6 +80,74 @@ describe("mergeSettingsConfigPreservingAutoSync", () => {
       env: { ANTHROPIC_MODEL: "model[1M]" },
       autoSyncContextWindow: true,
     });
+  });
+
+  it("重新开启自动同步时从 userExplicit 恢复 ACW/MAX", () => {
+    const updated = applyAutoSyncContextWindowSetting(
+      JSON.stringify({
+        env: { ANTHROPIC_MODEL: "model[1M]" },
+        autoSyncState: {
+          userExplicit: { ACW: "160000", MAX: "200000" }
+        },
+      }),
+      true,
+    );
+
+    expect(JSON.parse(updated)).toEqual({
+      env: {
+        ANTHROPIC_MODEL: "model[1M]",
+        CLAUDE_CODE_AUTO_COMPACT_WINDOW: "160000",
+        CLAUDE_CODE_MAX_CONTEXT_TOKENS: "200000",
+      },
+      autoSyncContextWindow: true,
+      autoSyncState: {
+        userExplicit: { ACW: "160000", MAX: "200000" },
+      },
+    });
+  });
+
+  it("重新开启自动同步时无显式值从 lastWritten/staticInjected 恢复", () => {
+    const updated = applyAutoSyncContextWindowSetting(
+      JSON.stringify({
+        env: { ANTHROPIC_MODEL: "model[1M]" },
+        autoSyncState: {
+          lastWritten: { ACW: "160000" },
+          staticInjected: { MAX: "262144" },
+        },
+      }),
+      true,
+    );
+
+    expect(JSON.parse(updated)).toEqual({
+      env: {
+        ANTHROPIC_MODEL: "model[1M]",
+        CLAUDE_CODE_AUTO_COMPACT_WINDOW: "160000",
+        CLAUDE_CODE_MAX_CONTEXT_TOKENS: "262144",
+      },
+      autoSyncContextWindow: true,
+      autoSyncState: {
+        lastWritten: { ACW: "160000" },
+        staticInjected: { MAX: "262144" },
+      },
+    });
+  });
+
+  it("重新开启自动同步时兼容旧完整 env key userExplicit", () => {
+    const updated = applyAutoSyncContextWindowSetting(
+      JSON.stringify({
+        env: {},
+        autoSyncState: {
+          userExplicit: {
+            CLAUDE_CODE_MAX_CONTEXT_TOKENS: "250000",
+          },
+        },
+      }),
+      true,
+    );
+
+    expect(JSON.parse(updated).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe(
+      "250000",
+    );
   });
 
   it("当前开关为 false 时，其他参数更新保留手动 ACW/MAX", () => {

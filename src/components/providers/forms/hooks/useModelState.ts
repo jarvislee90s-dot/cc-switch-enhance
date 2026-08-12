@@ -125,7 +125,13 @@ export function readContextWindows(
     if (!isRecord(cfg)) return {};
     const contextWindows = cfg.contextWindows;
     if (!isRecord(contextWindows)) return {};
-    return contextWindows as Record<string, number>;
+    const result: Record<string, number> = {};
+    for (const [key, value] of Object.entries(contextWindows)) {
+      if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+        result[key] = value;
+      }
+    }
+    return result;
   } catch {
     return {};
   }

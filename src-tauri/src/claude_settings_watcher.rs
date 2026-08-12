@@ -394,15 +394,11 @@ fn handle_settings_change(
         return;
     }
 
-    // 5. 写前检测用户手填：先看 userExplicit，再比较 lastWritten/staticInjected。
-    // 以及所有已配置角色的自动目标值。该检测必须在静态注入/无 active window
-    // 早退之前，保证用户手改会被记账；键结构按 spec 固定为 ACW / MAX 短键。
-    let explicit_acw = new_acw.filter(|value| {
-        !is_user_explicit(&provider, "ACW") && !is_auto_target_value(&v, &provider, "ACW", value)
-    });
-    let explicit_max = new_max.filter(|value| {
-        !is_user_explicit(&provider, "MAX") && !is_auto_target_value(&v, &provider, "MAX", value)
-    });
+    // 5. 写前检测用户手填：live 值不是自动目标时，覆盖或新增 userExplicit。
+    // 检测必须在静态注入/无 active window 早退之前，保证用户手改会被记账；
+    // 键结构按 spec 固定为 ACW / MAX 短键。
+    let explicit_acw = new_acw.filter(|value| !is_auto_target_value(&v, &provider, "ACW", value));
+    let explicit_max = new_max.filter(|value| !is_auto_target_value(&v, &provider, "MAX", value));
     if explicit_acw.is_some() || explicit_max.is_some() {
         record_user_explicit(&mut provider, explicit_acw, explicit_max);
         if !persist_settings(persist, &provider) {
@@ -2517,6 +2513,54 @@ mod tests {
             captured_guard.as_ref().unwrap()["autoSyncState"]["userExplicit"]
                 .get("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn handle_settings_change_updates_existing_user_explicit_value() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let initial = json!({
+            "model": "sonnet",
+            "env": {
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "250000"
+            }
+        });
+        fs::write(&path, initial.to_string()).unwrap();
+
+        let provider = Mutex::new(Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "env": { "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2" },
+                "contextWindows": { "ANTHROPIC_DEFAULT_SONNET_MODEL": 200000 },
+                "autoSyncContextWindow": true,
+                "autoSyncState": {
+                    "lastWritten": { "MAX": "200000" },
+                    "userExplicit": { "MAX": "200000" }
+                }
+            }),
+            None,
+        ));
+        let state = Mutex::new(None);
+
+        handle_settings_change(&path, &provider, &state, &noop_persist());
+
+        let content = fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "250000");
+
+        let provider_guard = provider.lock().unwrap();
+        assert_eq!(
+            provider_guard.settings_config["autoSyncState"]["userExplicit"]["MAX"],
+            json!("250000")
+        );
+        assert_eq!(
+            provider_guard.settings_config["autoSyncState"]["lastWritten"],
+            json!({ "MAX": "200000" })
         );
     }
 

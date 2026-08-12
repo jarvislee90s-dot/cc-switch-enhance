@@ -302,17 +302,44 @@ impl ProxyService {
         };
 
         let mut client_model = takeover_model.to_string();
-        let window = crate::claude_desktop_config::resolve_context_window(config, model_key);
-        if window.is_some_and(|w| w >= 1_000_000) {
+        let has_one_m_window =
+            Self::claude_takeover_window_keys(model_key)
+                .iter()
+                .any(|window_key| {
+                    crate::claude_desktop_config::resolve_context_window(config, window_key)
+                        .is_some_and(|window| window >= 1_000_000)
+                });
+        if has_one_m_window {
             client_model.push_str(CLAUDE_ONE_M_MARKER_FOR_CLIENT);
         }
         fields.push((model_key, client_model));
-
         let display_name = Self::claude_env_string(env, name_key)
             .map(str::to_string)
             .unwrap_or_else(|| Self::strip_claude_one_m_marker(upstream_model));
         if !display_name.is_empty() {
             fields.push((name_key, display_name));
+        }
+    }
+
+    fn claude_takeover_window_keys(model_key: &str) -> &'static [&'static str] {
+        match model_key {
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL" => &[
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                "ANTHROPIC_SMALL_FAST_MODEL",
+                "ANTHROPIC_MODEL",
+            ],
+            "ANTHROPIC_DEFAULT_SONNET_MODEL" => &[
+                "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                "ANTHROPIC_MODEL",
+                "ANTHROPIC_SMALL_FAST_MODEL",
+            ],
+            "ANTHROPIC_DEFAULT_OPUS_MODEL" => &[
+                "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                "ANTHROPIC_MODEL",
+                "ANTHROPIC_SMALL_FAST_MODEL",
+            ],
+            "ANTHROPIC_DEFAULT_FABLE_MODEL" => &["ANTHROPIC_DEFAULT_FABLE_MODEL"],
+            _ => &[],
         }
     }
 
@@ -3485,6 +3512,24 @@ mod tests {
             .1
             .clone();
         assert!(sonnet.contains("[1m]"));
+    }
+
+    #[test]
+    fn takeover_appends_one_m_for_fallback_model_window() {
+        let config = json!({
+            "env": { "ANTHROPIC_MODEL": "fallback[1M]" }
+        });
+        let fields = ProxyService::build_claude_takeover_model_fields(&config);
+        let sonnet = fields
+            .iter()
+            .find(|(k, _)| *k == "ANTHROPIC_DEFAULT_SONNET_MODEL")
+            .unwrap()
+            .1
+            .clone();
+        assert!(
+            sonnet.contains("[1m]"),
+            "fallback ANTHROPIC_MODEL window must be declared as 1M: {sonnet}"
+        );
     }
 
     #[test]

@@ -392,6 +392,22 @@ describe("contextWindows", () => {
     ).toEqual({});
   });
 
+  it("filters non-finite and non-positive contextWindows values", () => {
+    const config = JSON.stringify({
+      contextWindows: {
+        ANTHROPIC_MODEL: 200000,
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: 0,
+        ANTHROPIC_DEFAULT_SONNET_MODEL: -1,
+        ANTHROPIC_DEFAULT_OPUS_MODEL: Number.POSITIVE_INFINITY,
+        ANTHROPIC_DEFAULT_FABLE_MODEL: Number.NaN,
+        CLAUDE_CODE_SUBAGENT_MODEL: "1000000",
+        ANTHROPIC_DEFAULT_FABLE_MODEL_NAME: null,
+      },
+    });
+
+    expect(readContextWindows(config)).toEqual({ ANTHROPIC_MODEL: 200000 });
+  });
+
   it("窗口写入 contextWindows 且模型名不带后缀", () => {
     const config = JSON.stringify({
       env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "glm-5.2" },

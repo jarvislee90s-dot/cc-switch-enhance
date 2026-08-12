@@ -61,7 +61,10 @@ pub fn parse_context_window_suffix(model: &str) -> (&str, Option<u64>) {
             if let Some(open) = trimmed[..close].rfind('[') {
                 if open > 0 {
                     let slug = trimmed[..open].trim();
-                    let inner = trimmed[open + 1..close].trim();
+                    let inner = &trimmed[open + 1..close];
+                    if inner.chars().any(char::is_whitespace) {
+                        return (model, None);
+                    }
                     if !slug.is_empty() {
                         if let Some(window) = parse_window_token(inner) {
                             return (slug, Some(window));
@@ -158,7 +161,7 @@ pub(crate) fn resolve_context_window(
         .and_then(|o| o.get(role_env_key))
         .and_then(Value::as_u64)
     {
-        return Some(w);
+        return (w > 0).then_some(w);
     }
     settings_config
         .get("env")
@@ -2398,6 +2401,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_context_window_suffix_rejects_whitespace_between_number_and_unit() {
+        let (slug, window) = parse_context_window_suffix("model[1 k]");
+        assert_eq!(slug, "model[1 k]");
+        assert_eq!(window, None);
+    }
+
+    #[test]
     fn parse_window_token_handles_empty_and_zero() {
         assert_eq!(parse_window_token(""), None);
         assert_eq!(parse_window_token("0"), None);
@@ -2447,5 +2457,17 @@ mod tests {
         );
         let empty = json!({ "env": {} });
         assert_eq!(resolve_context_window(&empty, "ANTHROPIC_MODEL"), None);
+    }
+
+    #[test]
+    fn resolve_context_window_rejects_zero_explicit_window() {
+        let config = json!({
+            "env": { "ANTHROPIC_DEFAULT_SONNET_MODEL": "sonnet[1m]" },
+            "contextWindows": { "ANTHROPIC_DEFAULT_SONNET_MODEL": 0 }
+        });
+        assert_eq!(
+            resolve_context_window(&config, "ANTHROPIC_DEFAULT_SONNET_MODEL"),
+            None
+        );
     }
 }

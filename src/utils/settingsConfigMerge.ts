@@ -63,6 +63,37 @@ function hasUserExplicitValue(
   );
 }
 
+function restorableLedgerValue(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return String(value);
+  }
+  return undefined;
+}
+
+function restoreAutoSyncContextWindowValue(
+  state: Record<string, unknown>,
+  shortKey: string,
+  envKey: string,
+): string | undefined {
+  const userExplicit = state.userExplicit;
+  if (isRecord(userExplicit)) {
+    const shortValue = restorableLedgerValue(userExplicit[shortKey]);
+    if (shortValue !== undefined) return shortValue;
+    const legacyValue = restorableLedgerValue(userExplicit[envKey]);
+    if (legacyValue !== undefined) return legacyValue;
+  }
+  for (const sourceName of ["lastWritten", "staticInjected"] as const) {
+    const source = state[sourceName];
+    if (!isRecord(source)) continue;
+    const value = restorableLedgerValue(source[shortKey]);
+    if (value !== undefined) return value;
+    const legacyValue = restorableLedgerValue(source[envKey]);
+    if (legacyValue !== undefined) return legacyValue;
+  }
+  return undefined;
+}
+
 function writeUserExplicitState(
   state: Record<string, unknown>,
   shortKey: string,
@@ -80,7 +111,8 @@ function writeUserExplicitState(
  *
  * 关闭时按 autoSyncState 清理自动写入的 ACW/MAX；live 中非自动来源的值
  * 视为关闭瞬间用户写入，保留并记入 userExplicit。无账本时沿用旧行为删除。
- * 开启时只写开关状态，不自动补回字段，等 watcher 在终端切换模型时再写。
+ * 开启时优先从 userExplicit 恢复 ACW/MAX；没有显式值时从
+ * lastWritten/staticInjected 恢复；都没有则不写回。
  */
 export function applyAutoSyncContextWindowSetting(
   config: string,
@@ -90,6 +122,24 @@ export function applyAutoSyncContextWindowSetting(
     const parsed = JSON.parse(config || "{}") as Record<string, unknown>;
     parsed.autoSyncContextWindow = enabled;
     if (enabled) {
+      const state = parsed.autoSyncState;
+      if (isRecord(state)) {
+        const writes: Array<[string, string]> = [];
+        for (const envKey of CLAUDE_CONTEXT_WINDOW_ENV_KEYS) {
+          const shortKey = CLAUDE_CONTEXT_WINDOW_STATE_KEYS[envKey];
+          const value = restoreAutoSyncContextWindowValue(
+            state,
+            shortKey,
+            envKey,
+          );
+          if (value !== undefined) writes.push([envKey, value]);
+        }
+        if (writes.length > 0) {
+          if (!isRecord(parsed.env)) parsed.env = {};
+          const env = parsed.env as Record<string, unknown>;
+          for (const [envKey, value] of writes) env[envKey] = value;
+        }
+      }
       return JSON.stringify(parsed, null, 2);
     }
 
