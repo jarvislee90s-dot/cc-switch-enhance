@@ -59,4 +59,59 @@ describe("ProviderForm initializedRef", () => {
 
     expect(getNameInput()).toHaveValue("Edited Provider");
   });
+
+  it("首次渲染 reset 一次，provider scope 变化不再 reset 用户编辑", () => {
+    const queryClient = createTestQueryClient();
+    const onSubmit = vi.fn();
+    const { container, rerender } = render(
+      <QueryClientProvider client={queryClient}>
+        <ProviderForm
+          appId="claude"
+          providerId="provider-a"
+          submitLabel="保存"
+          onSubmit={onSubmit}
+          onCancel={vi.fn()}
+          initialData={{
+            name: "DB Provider A",
+            settingsConfig: {
+              env: {
+                ANTHROPIC_AUTH_TOKEN: "db-token-a",
+              },
+            },
+          }}
+          showButtons={false}
+        />
+      </QueryClientProvider>,
+    );
+
+    const getNameInput = () =>
+      container.querySelector<HTMLInputElement>('input[name="name"]');
+
+    expect(getNameInput()).toHaveValue("DB Provider A");
+    fireEvent.change(getNameInput()!, { target: { value: "Edited Provider" } });
+    expect(getNameInput()).toHaveValue("Edited Provider");
+
+    rerender(
+      <QueryClientProvider client={queryClient}>
+        <ProviderForm
+          appId="claude"
+          providerId="provider-b"
+          submitLabel="保存"
+          onSubmit={onSubmit}
+          onCancel={vi.fn()}
+          initialData={{
+            name: "Live Provider B",
+            settingsConfig: {
+              env: {
+                ANTHROPIC_AUTH_TOKEN: "live-token-b",
+              },
+            },
+          }}
+          showButtons={false}
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(getNameInput()).toHaveValue("Edited Provider");
+  });
 });
