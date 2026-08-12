@@ -132,6 +132,58 @@ describe("mergeSettingsConfigPreservingAutoSync", () => {
     });
   });
 
+  it("当前压缩比例超过 0.95 时不保留", () => {
+    const current = JSON.stringify({
+      env: { ANTHROPIC_MODEL: "model-a" },
+      autoSyncContextWindow: true,
+      autoSyncCompactRatio: 0.96,
+    });
+    const staleNext = JSON.stringify({
+      env: { ANTHROPIC_MODEL: "model-b" },
+      autoSyncCompactRatio: 0.8,
+    });
+
+    const merged = mergeSettingsConfigPreservingAutoSync(current, staleNext);
+    expect(JSON.parse(merged)).toEqual({
+      env: { ANTHROPIC_MODEL: "model-b" },
+      autoSyncContextWindow: true,
+    });
+  });
+
+  it("当前压缩比例 0.2 时保留", () => {
+    const current = JSON.stringify({
+      env: {},
+      autoSyncContextWindow: true,
+      autoSyncCompactRatio: 0.2,
+    });
+    const staleNext = JSON.stringify({ env: { ANTHROPIC_MODEL: "model" } });
+
+    const merged = mergeSettingsConfigPreservingAutoSync(current, staleNext);
+    expect(JSON.parse(merged)).toEqual({
+      env: { ANTHROPIC_MODEL: "model" },
+      autoSyncContextWindow: true,
+      autoSyncCompactRatio: 0.2,
+    });
+  });
+
+  it("当前压缩比例低于 0.2 时不保留", () => {
+    const current = JSON.stringify({
+      env: {},
+      autoSyncContextWindow: true,
+      autoSyncCompactRatio: 0.19,
+    });
+    const staleNext = JSON.stringify({
+      env: { ANTHROPIC_MODEL: "model" },
+      autoSyncCompactRatio: 0.8,
+    });
+
+    const merged = mergeSettingsConfigPreservingAutoSync(current, staleNext);
+    expect(JSON.parse(merged)).toEqual({
+      env: { ANTHROPIC_MODEL: "model" },
+      autoSyncContextWindow: true,
+    });
+  });
+
   it("当前没有显式比例时不额外写入字段", () => {
     const current = JSON.stringify({ env: {}, autoSyncContextWindow: true });
     const next = JSON.stringify({

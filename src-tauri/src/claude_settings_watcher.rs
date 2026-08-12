@@ -80,7 +80,7 @@ pub(crate) fn provider_compact_ratio(provider: &Provider) -> f64 {
         .settings_config
         .get("autoSyncCompactRatio")
         .and_then(Value::as_f64)
-        .filter(|ratio| ratio.is_finite() && (0.2..=1.0).contains(ratio))
+        .filter(|ratio| ratio.is_finite() && (0.2..=0.95).contains(ratio))
         .unwrap_or(1.0)
 }
 
@@ -140,7 +140,7 @@ fn configured_role_auto_targets(provider: &Provider) -> Vec<AutoTarget> {
 /// 根据窗口值和压缩比例生成要写入 settings.json.env 的两个 env 项。
 /// ACW = 窗口 × ratio（向下取整），MAX = 窗口本身。
 pub(crate) fn build_env_writes(window: u64, ratio: f64) -> Vec<(&'static str, String)> {
-    let ratio = if ratio.is_finite() && (0.2..=1.0).contains(&ratio) {
+    let ratio = if ratio.is_finite() && (0.2..=0.95).contains(&ratio) {
         ratio
     } else {
         1.0
@@ -844,6 +844,36 @@ mod tests {
     }
 
     #[test]
+    fn compact_ratio_rejects_values_above_095() {
+        let explicit_one = Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({ "autoSyncCompactRatio": 1.0 }),
+            None,
+        );
+        assert_eq!(provider_compact_ratio(&explicit_one), 1.0);
+
+        let too_high = Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({ "autoSyncCompactRatio": 0.96 }),
+            None,
+        );
+        assert_eq!(provider_compact_ratio(&too_high), 1.0);
+    }
+
+    #[test]
+    fn compact_ratio_accepts_upper_bound() {
+        let provider = Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({ "autoSyncCompactRatio": 0.95 }),
+            None,
+        );
+        assert_eq!(provider_compact_ratio(&provider), 0.95);
+    }
+
+    #[test]
     fn compact_ratio_accepts_valid_range() {
         let provider = Provider::with_id(
             "p".to_string(),
@@ -864,6 +894,32 @@ mod tests {
                 ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "30000".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn build_writes_use_custom_ratio_upper_bound() {
+        let writes = build_env_writes(30000, 0.95);
+        assert_eq!(
+            writes,
+            vec![
+                ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "28500".to_string()),
+                ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "30000".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_writes_fallback_to_one_for_ratio_above_095() {
+        for ratio in [0.96, 1.0] {
+            let writes = build_env_writes(30000, ratio);
+            assert_eq!(
+                writes,
+                vec![
+                    ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "30000".to_string()),
+                    ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "30000".to_string()),
+                ]
+            );
+        }
     }
 
     #[test]

@@ -1188,8 +1188,8 @@
     "autoSyncContextWindowTooltipOn": "切替モデルに基づいて settings.json のコンテキスト長と圧縮閾値が更新されます。反映には Claude Code の再起動（終了後 claude --resume でセッションを復元）が必要です。複数のCCターミナルで異なるモデルを使う場合、最後に切り替えたモデルのコンテキスト長がグローバル値として使用されます。",
     "autoSyncContextWindowTooltipOff": "[1M] サフィックスのモデルは Claude Code ネイティブの 1M コンテキストを使用し、他の形式や未入力は 200k を既定値として、モデル切替後にターミナル内で反映されます。",
     "autoSyncCompactRatio": "圧縮比率",
-    "autoSyncCompactRatioHint": "モデル自動圧縮に使用するコンテキストウィンドウの比率です。0.2〜1 で指定し、空欄は 1 として扱います。",
-    "autoSyncCompactRatioInvalid": "圧縮比率は 0.2〜1 の数値で指定してください",
+    "autoSyncCompactRatioHint": "モデル自動圧縮に使用するコンテキストウィンドウの比率です。0.2〜0.95 で指定し、空欄は 1 として扱います。",
+    "autoSyncCompactRatioInvalid": "圧縮比率は 0.2〜0.95 の数値で指定してください",
     "requiredFields": "プロバイダー名、API エンドポイント、API Key、モデルを入力してください"
   },
   "copilot": {

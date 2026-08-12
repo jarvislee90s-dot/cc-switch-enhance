@@ -9,7 +9,7 @@ const CLAUDE_CONTEXT_WINDOW_STATE_KEYS = {
 } as const;
 
 const AUTO_SYNC_COMPACT_RATIO_MIN = 0.2;
-const AUTO_SYNC_COMPACT_RATIO_MAX = 1;
+const AUTO_SYNC_COMPACT_RATIO_MAX = 0.95;
 
 function removeClaudeContextWindowEnvFields(config: Record<string, unknown>) {
   const env = config.env;
@@ -124,7 +124,7 @@ export function applyAutoSyncContextWindowSetting(
  * 写入或清空自动压缩比例。
  *
  * null 表示用户留空，不持久化字段，watcher 按 1 处理；
- * 数字必须在 0.2 ~ 1 之间，调用方应已校验。
+ * 数字必须在 0.2 ~ 0.95 之间，调用方应已校验。
  */
 export function applyAutoSyncCompactRatioSetting(
   config: string,
