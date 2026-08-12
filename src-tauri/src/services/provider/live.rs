@@ -2720,6 +2720,7 @@ mod tests {
         let _home = TempHome::new();
         let _test_watcher = EnvVarGuard::set("CC_SWITCH_TEST_WATCHER", "1");
         let _slot_guard = WatcherSlotGuard;
+        let _disable_watcher_removed = EnvVarGuard::remove("CC_SWITCH_DISABLE_WATCHER");
         crate::claude_settings_watcher::clear_watcher_slot_for_tests();
         let db = Database::memory().expect("create memory db");
         let provider = Provider::with_id(

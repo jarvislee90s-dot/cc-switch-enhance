@@ -1703,12 +1703,17 @@ impl ProxyService {
                         .get_current_provider_for_app(&AppType::Claude)
                         .ok()
                         .flatten();
-                    if let Some(provider) = claude_provider.as_ref() {
-                        let provider = self.claude_provider_with_effective_settings(provider)?;
+                    let effective_claude_provider = match claude_provider.as_ref() {
+                        Some(provider) => {
+                            Some(self.claude_provider_with_effective_settings(provider)?)
+                        }
+                        None => None,
+                    };
+                    if let Some(provider) = effective_claude_provider.as_ref() {
                         Self::apply_claude_takeover_fields_for_provider(
                             &mut live_config,
                             &proxy_url,
-                            &provider,
+                            provider,
                         );
                     } else {
                         Self::apply_claude_takeover_fields_with_policy(
@@ -1717,7 +1722,18 @@ impl ProxyService {
                             ClaudeTakeoverAuthPolicy::PreserveExistingOrAuthToken,
                         );
                     }
-                    let _ = self.write_claude_live(&live_config);
+                    if self.write_claude_live(&live_config).is_ok() {
+                        if let Some(provider) = effective_claude_provider.as_ref() {
+                            ensure_claude_settings_watcher(
+                                self.db.as_ref(),
+                                &AppType::Claude,
+                                provider,
+                                &live_config,
+                            );
+                        } else {
+                            // 无当前 provider 时无法绑定 watcher，跳过替换。
+                        }
+                    }
                 }
             }
             AppType::Codex => {
@@ -1778,6 +1794,7 @@ impl ProxyService {
                         &mut config,
                     );
                     self.write_claude_live(&config)?;
+                    self.ensure_claude_watcher_from_current_provider(&config);
                     log::info!("Claude Live 配置已恢复");
                 }
             }
@@ -1909,12 +1926,48 @@ impl ProxyService {
 
     fn write_live_config_for_app(&self, app_type: &AppType, config: &Value) -> Result<(), String> {
         match app_type {
-            AppType::Claude => self.write_claude_live(config),
+            AppType::Claude => {
+                self.write_claude_live(config)?;
+                self.ensure_claude_watcher_from_current_provider(config);
+                Ok(())
+            }
             AppType::Codex => self.write_codex_live(config),
             AppType::Gemini => self.write_gemini_live(config),
             AppType::GrokBuild => self.write_grok_live(config),
             _ => Err("该应用不支持代理功能".to_string()),
         }
+    }
+
+    /// Claude live 写成功后，从 DB 当前 provider 替换 watcher；无 provider 时跳过。
+    fn ensure_claude_watcher_from_current_provider(&self, live_config: &Value) {
+        let current_id = match self.db.get_current_provider(AppType::Claude.as_str()) {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                // 无当前 provider 时 watcher 没有可绑定的供应商，跳过替换。
+                return;
+            }
+            Err(e) => {
+                log::warn!("读取 Claude 当前 provider 失败，跳过 watcher 替换: {e}");
+                return;
+            }
+        };
+
+        let provider = match self
+            .db
+            .get_provider_by_id(&current_id, AppType::Claude.as_str())
+        {
+            Ok(Some(provider)) => provider,
+            Ok(None) => {
+                log::debug!("Claude 当前 provider {current_id} 不存在，跳过 watcher 替换");
+                return;
+            }
+            Err(e) => {
+                log::warn!("读取 Claude 当前 provider 失败，跳过 watcher 替换: {e}");
+                return;
+            }
+        };
+
+        ensure_claude_settings_watcher(self.db.as_ref(), &AppType::Claude, &provider, live_config);
     }
 
     pub fn detect_takeover_in_live_config_for_app(&self, app_type: &AppType) -> bool {
@@ -2125,6 +2178,7 @@ impl ProxyService {
         crate::services::provider::strip_legacy_suffixes_from_claude_models(&mut config);
 
         self.write_claude_live(&config)?;
+        self.ensure_claude_watcher_from_current_provider(&config);
         Ok(())
     }
 
@@ -5952,6 +6006,7 @@ model = "gpt-5.1-codex"
         let _home = TempHome::new();
         let _test_watcher = EnvVarGuard::set("CC_SWITCH_TEST_WATCHER", "1");
         let _slot_guard = WatcherSlotGuard;
+        let _disable_watcher_removed = EnvVarGuard::remove("CC_SWITCH_DISABLE_WATCHER");
         crate::settings::reload_settings().expect("reload settings");
         crate::claude_settings_watcher::clear_watcher_slot_for_tests();
 
@@ -5980,6 +6035,7 @@ model = "gpt-5.1-codex"
         let _home = TempHome::new();
         let _test_watcher = EnvVarGuard::set("CC_SWITCH_TEST_WATCHER", "1");
         let _slot_guard = WatcherSlotGuard;
+        let _disable_watcher_removed = EnvVarGuard::remove("CC_SWITCH_DISABLE_WATCHER");
         crate::settings::reload_settings().expect("reload settings");
         crate::claude_settings_watcher::clear_watcher_slot_for_tests();
 
@@ -6011,6 +6067,7 @@ model = "gpt-5.1-codex"
         let _home = TempHome::new();
         let _test_watcher = EnvVarGuard::set("CC_SWITCH_TEST_WATCHER", "1");
         let _slot_guard = WatcherSlotGuard;
+        let _disable_watcher_removed = EnvVarGuard::remove("CC_SWITCH_DISABLE_WATCHER");
         crate::settings::reload_settings().expect("reload settings");
         crate::claude_settings_watcher::clear_watcher_slot_for_tests();
 
@@ -6033,6 +6090,38 @@ model = "gpt-5.1-codex"
         assert!(
             !crate::claude_settings_watcher::watcher_slot_is_empty_for_tests(),
             "CC_SWITCH_TEST_WATCHER=1 must allow watcher replacement after strict takeover"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn takeover_live_config_best_effort_starts_watcher_with_test_opt_in() {
+        let _home = TempHome::new();
+        let _disable_watcher_removed = EnvVarGuard::remove("CC_SWITCH_DISABLE_WATCHER");
+        let _test_watcher = EnvVarGuard::set("CC_SWITCH_TEST_WATCHER", "1");
+        let _slot_guard = WatcherSlotGuard;
+        crate::settings::reload_settings().expect("reload settings");
+        crate::claude_settings_watcher::clear_watcher_slot_for_tests();
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let provider = Provider::with_id(
+            "p1".to_string(),
+            "P1".to_string(),
+            json!({ "env": { "ANTHROPIC_API_KEY": "provider-key" } }),
+            None,
+        );
+        seed_claude_current_provider(&db, &provider);
+        service
+            .write_claude_live(&json!({ "env": { "ANTHROPIC_API_KEY": "live-key" } }))
+            .expect("seed Claude live");
+        service
+            .takeover_live_config_best_effort(&AppType::Claude)
+            .await
+            .expect("best effort take over Claude live");
+        assert!(
+            !crate::claude_settings_watcher::watcher_slot_is_empty_for_tests(),
+            "CC_SWITCH_TEST_WATCHER=1 must allow watcher replacement after best effort takeover"
         );
     }
 
@@ -7313,6 +7402,112 @@ requires_openai_auth = true
             env.get("CLAUDE_CODE_SUBAGENT_MODEL")
                 .and_then(Value::as_str),
             Some("subagent-model")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn restore_live_config_for_app_inner_starts_watcher_with_test_opt_in() {
+        let _home = TempHome::new();
+        let _disable_watcher_removed = EnvVarGuard::remove("CC_SWITCH_DISABLE_WATCHER");
+        let _test_watcher = EnvVarGuard::set("CC_SWITCH_TEST_WATCHER", "1");
+        let _slot_guard = WatcherSlotGuard;
+        crate::settings::reload_settings().expect("reload settings");
+        crate::claude_settings_watcher::clear_watcher_slot_for_tests();
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let provider = Provider::with_id(
+            "p1".to_string(),
+            "P1".to_string(),
+            json!({ "env": { "ANTHROPIC_API_KEY": "provider-key" } }),
+            None,
+        );
+        seed_claude_current_provider(&db, &provider);
+        let backup = json!({ "env": { "ANTHROPIC_API_KEY": "restored-key" } });
+        db.save_live_backup(
+            "claude",
+            &serde_json::to_string(&backup).expect("serialize backup"),
+        )
+        .await
+        .expect("seed live backup");
+
+        service
+            .restore_live_config_for_app_inner(&AppType::Claude)
+            .await
+            .expect("restore Claude live");
+        assert!(
+            !crate::claude_settings_watcher::watcher_slot_is_empty_for_tests(),
+            "CC_SWITCH_TEST_WATCHER=1 must allow watcher replacement after restore"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn write_live_config_for_app_starts_watcher_with_test_opt_in() {
+        let _home = TempHome::new();
+        let _disable_watcher_removed = EnvVarGuard::remove("CC_SWITCH_DISABLE_WATCHER");
+        let _test_watcher = EnvVarGuard::set("CC_SWITCH_TEST_WATCHER", "1");
+        let _slot_guard = WatcherSlotGuard;
+        crate::settings::reload_settings().expect("reload settings");
+        crate::claude_settings_watcher::clear_watcher_slot_for_tests();
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let provider = Provider::with_id(
+            "p1".to_string(),
+            "P1".to_string(),
+            json!({ "env": { "ANTHROPIC_API_KEY": "provider-key" } }),
+            None,
+        );
+        seed_claude_current_provider(&db, &provider);
+
+        service
+            .write_live_config_for_app(
+                &AppType::Claude,
+                &json!({ "env": { "ANTHROPIC_API_KEY": "backup-key" } }),
+            )
+            .expect("write Claude live through generic helper");
+        assert!(
+            !crate::claude_settings_watcher::watcher_slot_is_empty_for_tests(),
+            "CC_SWITCH_TEST_WATCHER=1 must allow watcher replacement after generic live write"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn cleanup_claude_takeover_placeholders_starts_watcher_with_test_opt_in() {
+        let _home = TempHome::new();
+        let _disable_watcher_removed = EnvVarGuard::remove("CC_SWITCH_DISABLE_WATCHER");
+        let _test_watcher = EnvVarGuard::set("CC_SWITCH_TEST_WATCHER", "1");
+        let _slot_guard = WatcherSlotGuard;
+        crate::settings::reload_settings().expect("reload settings");
+        crate::claude_settings_watcher::clear_watcher_slot_for_tests();
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let provider = Provider::with_id(
+            "p1".to_string(),
+            "P1".to_string(),
+            json!({ "env": { "ANTHROPIC_API_KEY": "provider-key" } }),
+            None,
+        );
+        seed_claude_current_provider(&db, &provider);
+        service
+            .write_claude_live(&json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:15721",
+                    "ANTHROPIC_API_KEY": PROXY_TOKEN_PLACEHOLDER
+                }
+            }))
+            .expect("seed taken-over Claude live");
+
+        service
+            .cleanup_claude_takeover_placeholders_in_live()
+            .expect("cleanup Claude takeover placeholders");
+        assert!(
+            !crate::claude_settings_watcher::watcher_slot_is_empty_for_tests(),
+            "CC_SWITCH_TEST_WATCHER=1 must allow watcher replacement after cleanup"
         );
     }
 
