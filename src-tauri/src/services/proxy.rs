@@ -1566,12 +1566,7 @@ impl ProxyService {
                 &claude_provider,
             );
             self.write_claude_live(&live_config)?;
-            ensure_claude_settings_watcher(
-                self.db.as_ref(),
-                &AppType::Claude,
-                &claude_provider,
-                &live_config,
-            );
+            self.ensure_claude_watcher_from_current_provider();
             log::info!("Claude Live 配置已接管，代理地址: {proxy_url}");
         }
 
@@ -1635,12 +1630,7 @@ impl ProxyService {
                     &claude_provider,
                 );
                 self.write_claude_live(&live_config)?;
-                ensure_claude_settings_watcher(
-                    self.db.as_ref(),
-                    &AppType::Claude,
-                    &claude_provider,
-                    &live_config,
-                );
+                self.ensure_claude_watcher_from_current_provider();
                 log::info!("Claude Live 配置已接管，代理地址: {proxy_url}");
             }
             AppType::Codex => {
@@ -1723,16 +1713,7 @@ impl ProxyService {
                         );
                     }
                     if self.write_claude_live(&live_config).is_ok() {
-                        if let Some(provider) = effective_claude_provider.as_ref() {
-                            ensure_claude_settings_watcher(
-                                self.db.as_ref(),
-                                &AppType::Claude,
-                                provider,
-                                &live_config,
-                            );
-                        } else {
-                            // 无当前 provider 时无法绑定 watcher，跳过替换。
-                        }
+                        self.ensure_claude_watcher_from_current_provider();
                     }
                 }
             }
@@ -1794,7 +1775,7 @@ impl ProxyService {
                         &mut config,
                     );
                     self.write_claude_live(&config)?;
-                    self.ensure_claude_watcher_from_current_provider(&config);
+                    self.ensure_claude_watcher_from_current_provider();
                     log::info!("Claude Live 配置已恢复");
                 }
             }
@@ -1928,7 +1909,7 @@ impl ProxyService {
         match app_type {
             AppType::Claude => {
                 self.write_claude_live(config)?;
-                self.ensure_claude_watcher_from_current_provider(config);
+                self.ensure_claude_watcher_from_current_provider();
                 Ok(())
             }
             AppType::Codex => self.write_codex_live(config),
@@ -1939,7 +1920,7 @@ impl ProxyService {
     }
 
     /// Claude live 写成功后，从 DB 当前 provider 替换 watcher；无 provider 时跳过。
-    fn ensure_claude_watcher_from_current_provider(&self, live_config: &Value) {
+    fn ensure_claude_watcher_from_current_provider(&self) {
         let current_id = match self.db.get_current_provider(AppType::Claude.as_str()) {
             Ok(Some(id)) => id,
             Ok(None) => {
@@ -1967,7 +1948,19 @@ impl ProxyService {
             }
         };
 
-        ensure_claude_settings_watcher(self.db.as_ref(), &AppType::Claude, &provider, live_config);
+        let effective_provider = match self.claude_provider_with_effective_settings(&provider) {
+            Ok(provider) => provider,
+            Err(e) => {
+                log::warn!("构建 Claude watcher effective 配置失败，跳过 watcher 替换: {e}");
+                return;
+            }
+        };
+        ensure_claude_settings_watcher(
+            self.db.as_ref(),
+            &AppType::Claude,
+            &effective_provider,
+            &effective_provider.settings_config,
+        );
     }
 
     pub fn detect_takeover_in_live_config_for_app(&self, app_type: &AppType) -> bool {
@@ -2178,7 +2171,7 @@ impl ProxyService {
         crate::services::provider::strip_legacy_suffixes_from_claude_models(&mut config);
 
         self.write_claude_live(&config)?;
-        self.ensure_claude_watcher_from_current_provider(&config);
+        self.ensure_claude_watcher_from_current_provider();
         Ok(())
     }
 
@@ -6122,6 +6115,70 @@ model = "gpt-5.1-codex"
         assert!(
             !crate::claude_settings_watcher::watcher_slot_is_empty_for_tests(),
             "CC_SWITCH_TEST_WATCHER=1 must allow watcher replacement after best effort takeover"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn takeover_live_config_best_effort_watcher_keeps_internal_sync_fields() {
+        let _home = TempHome::new();
+        let _disable_watcher_removed = EnvVarGuard::remove("CC_SWITCH_DISABLE_WATCHER");
+        let _test_watcher = EnvVarGuard::set("CC_SWITCH_TEST_WATCHER", "1");
+        let _slot_guard = WatcherSlotGuard;
+        crate::settings::reload_settings().expect("reload settings");
+        crate::claude_settings_watcher::clear_watcher_slot_for_tests();
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let provider = Provider::with_id(
+            "p1".to_string(),
+            "P1".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_API_KEY": "provider-key",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "sonnet-model"
+                },
+                "autoSyncContextWindow": true,
+                "autoSyncCompactRatio": 0.8,
+                "contextWindows": { "ANTHROPIC_DEFAULT_SONNET_MODEL": 200000 },
+                "autoSyncState": { "lastWritten": {} }
+            }),
+            None,
+        );
+        seed_claude_current_provider(&db, &provider);
+        service
+            .write_claude_live(&json!({ "env": { "ANTHROPIC_API_KEY": "live-key" } }))
+            .expect("seed Claude live");
+        service
+            .takeover_live_config_best_effort(&AppType::Claude)
+            .await
+            .expect("best effort take over Claude live");
+        let snapshot = crate::claude_settings_watcher::watcher_provider_settings_config_for_tests()
+            .expect("watcher slot must hold a provider snapshot");
+        assert_eq!(
+            snapshot
+                .get("autoSyncContextWindow")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            snapshot.get("autoSyncCompactRatio").and_then(Value::as_f64),
+            Some(0.8)
+        );
+        assert_eq!(
+            snapshot
+                .get("contextWindows")
+                .and_then(Value::as_object)
+                .and_then(|windows| windows.get("ANTHROPIC_DEFAULT_SONNET_MODEL"))
+                .and_then(Value::as_u64),
+            Some(200000)
+        );
+        assert!(
+            snapshot
+                .get("autoSyncState")
+                .and_then(Value::as_object)
+                .is_some(),
+            "watcher snapshot must keep autoSyncState"
         );
     }
 

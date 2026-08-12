@@ -193,6 +193,9 @@ pub struct ClaudeSettingsWatcher {
     shutdown: Arc<AtomicBool>,
     /// notify debouncer handle（Drop 时自动停止监听）
     _debouncer: Option<Debouncer<notify::RecommendedWatcher>>,
+    /// 测试专用：保留传入的 provider 快照，便于断言内部同步字段。
+    #[cfg(test)]
+    provider: Arc<Mutex<Provider>>,
 }
 
 impl Drop for ClaudeSettingsWatcher {
@@ -280,6 +283,8 @@ pub(crate) fn spawn_claude_settings_watcher(
         state,
         shutdown,
         _debouncer: Some(debouncer),
+        #[cfg(test)]
+        provider,
     })
 }
 
@@ -317,6 +322,19 @@ pub(crate) fn watcher_slot_is_empty_for_tests() -> bool {
         .lock()
         .expect("watcher slot mutex poisoned")
         .is_none()
+}
+
+#[cfg(test)]
+pub(crate) fn watcher_provider_settings_config_for_tests() -> Option<Value> {
+    let slot = watcher_slot().lock().expect("watcher slot mutex poisoned");
+    let watcher = slot.as_ref()?;
+    let settings_config = watcher
+        .provider
+        .lock()
+        .expect("watcher provider mutex poisoned")
+        .settings_config
+        .clone();
+    Some(settings_config)
 }
 
 /// 处理一次 settings.json 变化
