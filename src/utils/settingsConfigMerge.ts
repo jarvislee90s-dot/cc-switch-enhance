@@ -46,6 +46,23 @@ function matchesAutoSyncSource(
   });
 }
 
+function hasUserExplicitValue(
+  state: Record<string, unknown>,
+  shortKey: string,
+  envKey: string,
+): boolean {
+  const userExplicit = state.userExplicit;
+  if (!isRecord(userExplicit)) return false;
+
+  const shortValue = userExplicit[shortKey];
+  if (shortValue !== undefined && shortValue !== null) return true;
+
+  const legacyValue = userExplicit[envKey];
+  return (
+    legacyValue !== undefined && legacyValue !== null && legacyValue !== false
+  );
+}
+
 function writeUserExplicitState(
   state: Record<string, unknown>,
   shortKey: string,
@@ -88,11 +105,13 @@ export function applyAutoSyncContextWindowSetting(
         const liveValue = env[envKey];
         if (liveValue === undefined) continue;
         const shortKey = CLAUDE_CONTEXT_WINDOW_STATE_KEYS[envKey];
-        if (matchesAutoSyncSource(state, shortKey, envKey, liveValue)) {
-          delete env[envKey];
-        } else {
-          writeUserExplicitState(state, shortKey, liveValue);
+        if (!hasUserExplicitValue(state, shortKey, envKey)) {
+          if (matchesAutoSyncSource(state, shortKey, envKey, liveValue)) {
+            delete env[envKey];
+            continue;
+          }
         }
+        writeUserExplicitState(state, shortKey, liveValue);
       }
     }
     return JSON.stringify(parsed, null, 2);

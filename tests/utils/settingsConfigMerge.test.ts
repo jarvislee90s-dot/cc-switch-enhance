@@ -226,6 +226,25 @@ describe("mergeSettingsConfigPreservingAutoSync", () => {
     });
   });
 
+  it("关闭时优先 userExplicit，即使同一 live 值同时匹配 lastWritten", () => {
+    const updated = applyAutoSyncContextWindowSetting(
+      JSON.stringify({
+        env: { CLAUDE_CODE_MAX_CONTEXT_TOKENS: "200000" },
+        autoSyncContextWindow: true,
+        autoSyncState: {
+          lastWritten: { MAX: "200000" },
+          staticInjected: {},
+          userExplicit: { MAX: "200000" },
+        },
+      }),
+      false,
+    );
+
+    const parsed = JSON.parse(updated);
+    expect(parsed.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe("200000");
+    expect(parsed.autoSyncState.userExplicit).toEqual({ MAX: "200000" });
+  });
+
   it("兼容旧账本完整 env key 识别自动来源", () => {
     const updated = applyAutoSyncContextWindowSetting(
       JSON.stringify({
