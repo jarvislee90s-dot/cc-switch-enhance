@@ -37,6 +37,8 @@ pub(crate) use live::{
     write_live_with_common_config,
 };
 
+pub(crate) use live::ensure_claude_settings_watcher;
+
 pub(crate) use live::{is_kimi_for_coding_provider, provider_env_targets_gpt56};
 
 // Internal re-exports

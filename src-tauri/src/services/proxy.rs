@@ -10,7 +10,8 @@ use crate::proxy::server::ProxyServer;
 use crate::proxy::switch_lock::SwitchLockManager;
 use crate::proxy::types::*;
 use crate::services::provider::{
-    build_effective_settings_with_common_config, write_live_with_common_config,
+    build_effective_settings_with_common_config, ensure_claude_settings_watcher,
+    write_live_with_common_config,
 };
 use serde_json::{json, Map, Value};
 use std::str::FromStr;
@@ -356,6 +357,12 @@ impl ProxyService {
             &effective_provider,
         );
         self.write_claude_live(&effective_settings)?;
+        ensure_claude_settings_watcher(
+            self.db.as_ref(),
+            &AppType::Claude,
+            provider,
+            &effective_settings,
+        );
         Ok(())
     }
 
@@ -1559,6 +1566,12 @@ impl ProxyService {
                 &claude_provider,
             );
             self.write_claude_live(&live_config)?;
+            ensure_claude_settings_watcher(
+                self.db.as_ref(),
+                &AppType::Claude,
+                &claude_provider,
+                &live_config,
+            );
             log::info!("Claude Live 配置已接管，代理地址: {proxy_url}");
         }
 
@@ -1622,6 +1635,12 @@ impl ProxyService {
                     &claude_provider,
                 );
                 self.write_claude_live(&live_config)?;
+                ensure_claude_settings_watcher(
+                    self.db.as_ref(),
+                    &AppType::Claude,
+                    &claude_provider,
+                    &live_config,
+                );
                 log::info!("Claude Live 配置已接管，代理地址: {proxy_url}");
             }
             AppType::Codex => {
@@ -3281,6 +3300,50 @@ mod tests {
 
     fn assert_env_str(env: &Map<String, Value>, key: &str, expected: Option<&str>) {
         assert_eq!(env.get(key).and_then(|value| value.as_str()), expected);
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = env::var_os(key);
+            env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = env::var_os(key);
+            env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => env::set_var(self.key, value),
+                None => env::remove_var(self.key),
+            }
+        }
+    }
+
+    struct WatcherSlotGuard;
+
+    impl Drop for WatcherSlotGuard {
+        fn drop(&mut self) {
+            crate::claude_settings_watcher::clear_watcher_slot_for_tests();
+        }
+    }
+
+    fn seed_claude_current_provider(db: &Database, provider: &Provider) {
+        db.save_provider("claude", provider).expect("save provider");
+        db.set_current_provider("claude", &provider.id)
+            .expect("set current provider");
+        crate::settings::set_current_provider(&AppType::Claude, Some(&provider.id))
+            .expect("set local current provider");
     }
 
     async fn use_ephemeral_proxy_port(db: &Arc<Database>) {
@@ -5853,6 +5916,124 @@ model = "gpt-5.1-codex"
             .expect("backup exists");
         let expected = serde_json::to_string(&provider_c.settings_config).expect("serialize");
         assert_eq!(backup.original_config, expected);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn proxy_sync_claude_live_does_not_spawn_watcher_by_default_in_tests() {
+        let _home = TempHome::new();
+        let _test_watcher_unset = EnvVarGuard::remove("CC_SWITCH_TEST_WATCHER");
+        let _slot_guard = WatcherSlotGuard;
+        crate::settings::reload_settings().expect("reload settings");
+        crate::claude_settings_watcher::clear_watcher_slot_for_tests();
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let provider = Provider::with_id(
+            "p1".to_string(),
+            "P1".to_string(),
+            json!({ "env": { "ANTHROPIC_API_KEY": "provider-key" } }),
+            None,
+        );
+        seed_claude_current_provider(&db, &provider);
+        service
+            .sync_claude_live_from_provider_while_proxy_active(&provider)
+            .await
+            .expect("sync Claude live");
+        assert!(
+            crate::claude_settings_watcher::watcher_slot_is_empty_for_tests(),
+            "proxy sync must not spawn or replace the Claude watcher by default in tests"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn proxy_sync_claude_live_starts_watcher_with_test_opt_in() {
+        let _home = TempHome::new();
+        let _test_watcher = EnvVarGuard::set("CC_SWITCH_TEST_WATCHER", "1");
+        let _slot_guard = WatcherSlotGuard;
+        crate::settings::reload_settings().expect("reload settings");
+        crate::claude_settings_watcher::clear_watcher_slot_for_tests();
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let provider = Provider::with_id(
+            "p1".to_string(),
+            "P1".to_string(),
+            json!({ "env": { "ANTHROPIC_API_KEY": "provider-key" } }),
+            None,
+        );
+        seed_claude_current_provider(&db, &provider);
+        service
+            .sync_claude_live_from_provider_while_proxy_active(&provider)
+            .await
+            .expect("sync Claude live");
+        assert!(
+            !crate::claude_settings_watcher::watcher_slot_is_empty_for_tests(),
+            "CC_SWITCH_TEST_WATCHER=1 must allow watcher replacement after proxy sync"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn takeover_live_configs_starts_watcher_with_test_opt_in() {
+        let _home = TempHome::new();
+        let _test_watcher = EnvVarGuard::set("CC_SWITCH_TEST_WATCHER", "1");
+        let _slot_guard = WatcherSlotGuard;
+        crate::settings::reload_settings().expect("reload settings");
+        crate::claude_settings_watcher::clear_watcher_slot_for_tests();
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let provider = Provider::with_id(
+            "p1".to_string(),
+            "P1".to_string(),
+            json!({ "env": { "ANTHROPIC_API_KEY": "provider-key" } }),
+            None,
+        );
+        seed_claude_current_provider(&db, &provider);
+        service
+            .write_claude_live(&json!({ "env": { "ANTHROPIC_API_KEY": "live-key" } }))
+            .expect("seed Claude live");
+        service
+            .takeover_live_configs()
+            .await
+            .expect("take over Claude live");
+        assert!(
+            !crate::claude_settings_watcher::watcher_slot_is_empty_for_tests(),
+            "CC_SWITCH_TEST_WATCHER=1 must allow watcher replacement after takeover"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn takeover_live_config_strict_starts_watcher_with_test_opt_in() {
+        let _home = TempHome::new();
+        let _test_watcher = EnvVarGuard::set("CC_SWITCH_TEST_WATCHER", "1");
+        let _slot_guard = WatcherSlotGuard;
+        crate::settings::reload_settings().expect("reload settings");
+        crate::claude_settings_watcher::clear_watcher_slot_for_tests();
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let provider = Provider::with_id(
+            "p1".to_string(),
+            "P1".to_string(),
+            json!({ "env": { "ANTHROPIC_API_KEY": "provider-key" } }),
+            None,
+        );
+        seed_claude_current_provider(&db, &provider);
+        service
+            .write_claude_live(&json!({ "env": { "ANTHROPIC_API_KEY": "live-key" } }))
+            .expect("seed Claude live");
+        service
+            .takeover_live_config_strict(&AppType::Claude)
+            .await
+            .expect("strictly take over Claude live");
+        assert!(
+            !crate::claude_settings_watcher::watcher_slot_is_empty_for_tests(),
+            "CC_SWITCH_TEST_WATCHER=1 must allow watcher replacement after strict takeover"
+        );
     }
 
     #[tokio::test]
