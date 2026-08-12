@@ -7,6 +7,8 @@ import {
   stripClaudeOneMMarker,
   setModelSuffix,
   reapplySuffix,
+  readContextWindows,
+  writeContextWindow,
   stripModelSuffix,
   useModelState,
 } from "@/components/providers/forms/hooks/useModelState";
@@ -324,5 +326,54 @@ describe("reapplySuffix", () => {
     expect(reapplySuffix("deepseek-v4-pro[200k]", "glm-5.2[100k]")).toBe(
       "glm-5.2[200k]",
     );
+  });
+});
+
+describe("contextWindows", () => {
+  it("reads contextWindows from settings config", () => {
+    const config = JSON.stringify({
+      env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "glm-5.2" },
+      contextWindows: { ANTHROPIC_DEFAULT_SONNET_MODEL: 200000 },
+    });
+
+    expect(readContextWindows(config)).toEqual({
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 200000,
+    });
+  });
+
+  it("returns empty object for missing or invalid config", () => {
+    expect(readContextWindows("")).toEqual({});
+    expect(readContextWindows("{invalid")).toEqual({});
+    expect(readContextWindows(JSON.stringify({ env: {} }))).toEqual({});
+  });
+
+  it("窗口写入 contextWindows 且模型名不带后缀", () => {
+    const config = JSON.stringify({
+      env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "glm-5.2" },
+    });
+    const next = writeContextWindow(
+      config,
+      "ANTHROPIC_DEFAULT_SONNET_MODEL",
+      200000,
+    );
+    const parsed = JSON.parse(next);
+    expect(parsed.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("glm-5.2");
+    expect(parsed.contextWindows.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe(200000);
+  });
+
+  it("清空窗口时不写 contextWindows 也不写后缀", () => {
+    const config = JSON.stringify({
+      env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "glm-5.2" },
+    });
+    const next = writeContextWindow(
+      config,
+      "ANTHROPIC_DEFAULT_SONNET_MODEL",
+      null,
+    );
+    const parsed = JSON.parse(next);
+    expect(
+      parsed.contextWindows.ANTHROPIC_DEFAULT_SONNET_MODEL,
+    ).toBeUndefined();
+    expect(parsed.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("glm-5.2");
   });
 });

@@ -196,25 +196,65 @@ describe("ClaudeFormFields", () => {
     );
   });
 
-  it("角色模型上下文长度输入框能正确写入后缀", () => {
+  it("角色窗口输入框优先显示 contextWindows 中的值", () => {
+    renderCopilotForm({
+      defaultSonnetModel: "claude-sonnet",
+      settingsConfig: JSON.stringify({
+        env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet" },
+        contextWindows: { ANTHROPIC_DEFAULT_SONNET_MODEL: 200000 },
+      }),
+    });
+
+    const contextInputs = screen.getAllByLabelText("Context Window");
+    expect(contextInputs[0]).toHaveValue("200000");
+  });
+
+  it("角色模型上下文长度输入框写入 contextWindows 且模型名保持干净", () => {
     const onModelChange = vi.fn();
+    const onSettingsConfigChange = vi.fn();
     renderCopilotForm({
       defaultSonnetModel: "claude-sonnet",
       defaultSonnetModelName: "Claude Sonnet",
+      settingsConfig: JSON.stringify({
+        env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet" },
+      }),
       onModelChange,
+      onSettingsConfigChange,
     });
 
     // getAllByLabelText 返回所有 context window 输入框，顺序为：
     // [0] Sonnet, [1] Opus, [2] Fable, [3] Haiku, [4] Subagent, [5] 兜底模型
     const contextInputs = screen.getAllByLabelText("Context Window");
-    const sonnetContextInput = contextInputs[0];
+    fireEvent.change(contextInputs[0], { target: { value: "1M" } });
 
-    fireEvent.change(sonnetContextInput, { target: { value: "1M" } });
+    expect(onModelChange).not.toHaveBeenCalled();
+    const updated = JSON.parse(onSettingsConfigChange.mock.calls[0][0]);
+    expect(updated.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("claude-sonnet");
+    expect(updated.contextWindows.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe(1000000);
+  });
 
-    expect(onModelChange).toHaveBeenCalledWith(
-      "ANTHROPIC_DEFAULT_SONNET_MODEL",
-      "claude-sonnet[1m]",
-    );
+  it("兜底模型窗口输入框读取并写入 ANTHROPIC_MODEL 的 contextWindows", () => {
+    const onModelChange = vi.fn();
+    const onSettingsConfigChange = vi.fn();
+    renderCopilotForm({
+      claudeModel: "fallback-model",
+      settingsConfig: JSON.stringify({
+        env: { ANTHROPIC_MODEL: "fallback-model" },
+        contextWindows: { ANTHROPIC_MODEL: 800000 },
+      }),
+      onModelChange,
+      onSettingsConfigChange,
+    });
+
+    const contextInputs = screen.getAllByLabelText("Context Window");
+    expect(contextInputs[5]).toHaveValue("800000");
+
+    fireEvent.change(contextInputs[5], { target: { value: "200K" } });
+
+    expect(onModelChange).not.toHaveBeenCalled();
+    const updated = JSON.parse(onSettingsConfigChange.mock.calls[0][0]);
+    expect(updated.env.ANTHROPIC_MODEL).toBe("fallback-model");
+    expect(updated.contextWindows.ANTHROPIC_MODEL).toBe(200000);
   });
 
   it("关闭自动同步开关时走独立回调，避免被整包 settingsConfig 更新覆盖", () => {

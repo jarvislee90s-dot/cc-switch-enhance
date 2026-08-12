@@ -125,6 +125,32 @@ export function reapplySuffix(oldModel: string, newInput: string): string {
   return oldSuffix ? `${newBase}${oldSuffix}` : newBase;
 }
 
+export function readContextWindows(
+  settingsConfig: string,
+): Record<string, number> {
+  try {
+    const cfg = JSON.parse(settingsConfig || "{}") as Record<string, any>;
+    return (cfg.contextWindows ?? {}) as Record<string, number>;
+  } catch {
+    return {};
+  }
+}
+
+export function writeContextWindow(
+  config: string,
+  roleEnvKey: string,
+  value: number | null,
+): string {
+  const parsed = JSON.parse(config || "{}") as Record<string, any>;
+  parsed.contextWindows ??= {};
+  if (value === null || value <= 0) {
+    delete parsed.contextWindows[roleEnvKey];
+  } else {
+    parsed.contextWindows[roleEnvKey] = value;
+  }
+  return JSON.stringify(parsed, null, 2);
+}
+
 /**
  * Parse model values from settings config JSON
  */

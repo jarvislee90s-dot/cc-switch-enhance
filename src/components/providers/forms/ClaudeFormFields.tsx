@@ -58,6 +58,8 @@ import {
   parseModelSuffix,
   setModelSuffix,
   reapplySuffix,
+  readContextWindows,
+  writeContextWindow,
   stripModelSuffix,
   type ClaudeModelEnvField,
 } from "./hooks/useModelState";
@@ -94,6 +96,22 @@ function parseAutoSyncCompactRatio(config?: string): number | null {
 
 function formatAutoSyncCompactRatio(ratio: number | null): string {
   return ratio === null ? "" : String(ratio);
+}
+
+function parseContextWindowInput(input: string): number | null {
+  const suffixedModel = setModelSuffix("model", input);
+  return parseModelSuffix(suffixedModel).window ?? null;
+}
+
+function contextWindowInputValue(
+  settingsConfig: string | undefined,
+  roleEnvKey: string,
+  model: string,
+): string {
+  const window =
+    readContextWindows(settingsConfig ?? "{}")[roleEnvKey] ??
+    parseModelSuffix(model).window;
+  return window ? String(window) : "";
 }
 
 interface ClaudeFormFieldsProps {
@@ -376,6 +394,17 @@ export function ClaudeFormFields({
       );
     },
     [settingsConfig, onSettingsConfigChange, onAutoSyncContextWindowChange],
+  );
+
+  const handleContextWindowChange = useCallback(
+    (roleEnvKey: string, input: string) => {
+      if (!onSettingsConfigChange) return;
+      const window = parseContextWindowInput(input);
+      onSettingsConfigChange(
+        writeContextWindow(settingsConfig ?? "{}", roleEnvKey, window),
+      );
+    },
+    [settingsConfig, onSettingsConfigChange],
   );
 
   // 预设填充高级值后自动展开（仅从折叠→展开，不会自动折叠）
@@ -1096,7 +1125,6 @@ export function ClaudeFormFields({
 
               {modelRoleRows.map((row) => {
                 const modelBase = stripModelSuffix(row.model);
-                const suffixResult = parseModelSuffix(row.model);
 
                 return (
                   <div
@@ -1141,18 +1169,17 @@ export function ClaudeFormFields({
                       <Input
                         inputMode="text"
                         className="w-[90px] text-center font-mono text-sm"
-                        value={
-                          suffixResult.window
-                            ? row.model.slice(row.model.lastIndexOf("["))
-                            : ""
-                        }
+                        value={contextWindowInputValue(
+                          settingsConfig,
+                          row.modelField,
+                          row.model,
+                        )}
                         onChange={(event) => {
-                          // 上下文长度输入直接调 onModelChange，绕过
-                          // handleRoleModelChange 内的 reapplySuffix
-                          // （reapplySuffix 会剥离新后缀，仅用于改模型名）
-                          onModelChange(
+                          // 上下文长度写入 settingsConfig.contextWindows，
+                          // 不再把窗口拼进模型名。
+                          handleContextWindowChange(
                             row.modelField,
-                            setModelSuffix(row.model, event.target.value),
+                            event.target.value,
                           );
                         }}
                         placeholder={t(
@@ -1257,15 +1284,15 @@ export function ClaudeFormFields({
                 <Input
                   inputMode="text"
                   className="w-[90px] text-center font-mono text-sm"
-                  value={
-                    parseModelSuffix(claudeModel).window
-                      ? claudeModel.slice(claudeModel.lastIndexOf("["))
-                      : ""
-                  }
+                  value={contextWindowInputValue(
+                    settingsConfig,
+                    "ANTHROPIC_MODEL",
+                    claudeModel,
+                  )}
                   onChange={(event) => {
-                    onModelChange(
+                    handleContextWindowChange(
                       "ANTHROPIC_MODEL",
-                      setModelSuffix(claudeModel, event.target.value),
+                      event.target.value,
                     );
                   }}
                   placeholder={t("providerForm.modelContextWindowPlaceholder", {
