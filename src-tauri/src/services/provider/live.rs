@@ -1181,6 +1181,16 @@ const CLAUDE_BACKFILL_CONTEXT_KEYS: [(&str, &str); 2] = [
     ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "MAX"),
 ];
 
+fn provider_env_has_string_value(provider: &Provider, env_key: &str) -> bool {
+    provider
+        .settings_config
+        .get("env")
+        .and_then(Value::as_object)
+        .and_then(|env| env.get(env_key))
+        .and_then(Value::as_str)
+        .is_some()
+}
+
 fn auto_sync_ledger_value_relevant(value: &Value) -> bool {
     !value.is_null() && value.as_bool() != Some(false)
 }
@@ -1277,8 +1287,9 @@ fn strip_legacy_context_default_for_backfill(
     }
 }
 
-/// 优先按 autoSyncState 逐键判定：userExplicit 保留，lastWritten/staticInjected
-/// 匹配时删除；该键没有任何自动来源记录时退回旧的窗口剥离逻辑。
+/// 优先按 autoSyncState 逐键判定：provider env 显式键与 userExplicit 保留，
+/// lastWritten/staticInjected 匹配时删除；该键没有任何自动来源记录时退回旧的窗口剥离逻辑。
+/// provider env 中显式存在的字符串键也视为用户存储，始终保留。
 fn strip_auto_synced_context_defaults(settings: &mut Value, provider: &Provider) {
     let Some(state) = provider
         .settings_config
@@ -1298,6 +1309,9 @@ fn strip_auto_synced_context_defaults(settings: &mut Value, provider: &Provider)
             let Some(live_value) = env.get(env_key).and_then(Value::as_str) else {
                 continue;
             };
+            if provider_env_has_string_value(provider, env_key) {
+                continue;
+            }
             if backfill_user_explicit_value(state, short_key, env_key, live_value) {
                 continue;
             }
@@ -4722,6 +4736,29 @@ base_url = "https://a.example/v1"
         assert_eq!(
             settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
             json!("200000")
+        );
+    }
+
+    #[test]
+    fn backfill_keeps_provider_env_explicit_value_matching_last_written() {
+        let mut settings = json!({
+            "env": { "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "250000" }
+        });
+        let provider = Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "env": { "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "250000" },
+                "autoSyncState": {
+                    "lastWritten": { "MAX": "250000" }
+                }
+            }),
+            None,
+        );
+        strip_auto_synced_context_defaults(&mut settings, &provider);
+        assert_eq!(
+            settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
+            json!("250000")
         );
     }
 
