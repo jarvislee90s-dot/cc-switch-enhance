@@ -205,6 +205,61 @@ describe("EditProviderDialog", () => {
     ).toEqual(provider.settingsConfig);
   });
 
+  it("Claude live 配置缺少 contextWindows/autoSyncState 时保留数据库账本", async () => {
+    const dbContextWindows = {
+      ANTHROPIC_MODEL: 200000,
+      CLAUDE_CODE_SUBAGENT_MODEL: 1000000,
+    };
+    const dbAutoSyncState = {
+      lastWritten: { ACW: "160000", MAX: "200000" },
+      userExplicit: { MAX: "250000" },
+    };
+    const provider: Provider = {
+      id: "claude-db",
+      name: "Claude DB",
+      category: "aggregator",
+      settingsConfig: {
+        env: { ANTHROPIC_MODEL: "deepseek-v3" },
+        contextWindows: dbContextWindows,
+        autoSyncState: dbAutoSyncState,
+      },
+    };
+    const liveSettings = { env: { ANTHROPIC_MODEL: "deepseek-v3" } };
+    const handleSubmit = vi.fn().mockResolvedValue(undefined);
+
+    apiMocks.getCurrent.mockResolvedValue(provider.id);
+    apiMocks.getLiveProviderSettings.mockResolvedValue(liveSettings);
+
+    render(
+      <EditProviderDialog
+        open
+        provider={provider}
+        onOpenChange={vi.fn()}
+        onSubmit={handleSubmit}
+        appId="claude"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(
+        JSON.parse(screen.getByTestId("settings-config").textContent ?? "{}"),
+      ).toEqual({
+        ...liveSettings,
+        contextWindows: dbContextWindows,
+        autoSyncState: dbAutoSyncState,
+      });
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "common.save" }));
+
+    await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
+    expect(handleSubmit.mock.calls[0][0].provider.settingsConfig).toEqual({
+      ...liveSettings,
+      contextWindows: dbContextWindows,
+      autoSyncState: dbAutoSyncState,
+    });
+  });
+
   it("Claude live 配置缺少 autoSyncContextWindow 时保留数据库开关状态", async () => {
     const provider: Provider = {
       id: "claude-proxy",

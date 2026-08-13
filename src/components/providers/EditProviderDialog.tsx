@@ -180,6 +180,12 @@ export function EditProviderDialog({
     ) {
       const dbSettings = provider.settingsConfig as Record<string, unknown>;
       const merged = { ...base };
+      if (dbSettings.contextWindows !== undefined) {
+        merged.contextWindows = dbSettings.contextWindows;
+      }
+      if (dbSettings.autoSyncState !== undefined) {
+        merged.autoSyncState = dbSettings.autoSyncState;
+      }
       if (dbSettings.autoSyncContextWindow !== undefined) {
         merged.autoSyncContextWindow = dbSettings.autoSyncContextWindow;
       }
