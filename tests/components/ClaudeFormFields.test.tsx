@@ -44,7 +44,9 @@ const FormShell = ({ children }: PropsWithChildren) => {
   return <Form {...form}>{children}</Form>;
 };
 
-const renderCopilotForm = (overrides: Partial<ClaudeFormFieldsProps> = {}) => {
+const buildCopilotFormProps = (
+  overrides: Partial<ClaudeFormFieldsProps> = {},
+): ClaudeFormFieldsProps => {
   const props: ClaudeFormFieldsProps = {
     shouldShowApiKey: false,
     apiKey: "",
@@ -103,13 +105,15 @@ const renderCopilotForm = (overrides: Partial<ClaudeFormFieldsProps> = {}) => {
     onLocalProxyBodyOverrideChange: vi.fn(),
     ...overrides,
   };
+  return props;
+};
 
-  return render(
+const renderCopilotForm = (overrides: Partial<ClaudeFormFieldsProps> = {}) =>
+  render(
     <FormShell>
-      <ClaudeFormFields {...props} />
+      <ClaudeFormFields {...buildCopilotFormProps(overrides)} />
     </FormShell>,
   );
-};
 
 const renderStatefulCopilotForm = (
   initialConfig: string,
@@ -121,38 +125,8 @@ const renderStatefulCopilotForm = (
       settingsConfig,
       onConfigChange: setSettingsConfig,
     });
-    const props: ClaudeFormFieldsProps = {
-      shouldShowApiKey: false,
-      apiKey: "",
-      onApiKeyChange: vi.fn(),
-      category: "official",
-      shouldShowApiKeyLink: false,
-      websiteUrl: "",
-      isCopilotPreset: true,
-      usesOAuth: true,
-      isCopilotAuthenticated: true,
-      selectedGitHubAccountId: "gh-1",
-      onGitHubAccountSelect: vi.fn(),
-      isCodexOauthPreset: false,
-      isCodexOauthAuthenticated: false,
-      selectedCodexAccountId: null,
-      onCodexAccountSelect: vi.fn(),
-      codexFastMode: false,
-      onCodexFastModeChange: vi.fn(),
-      templateValueEntries: [],
-      templateValues: {},
-      templatePresetName: "",
-      onTemplateValueChange: vi.fn(),
-      shouldShowSpeedTest: false,
-      baseUrl: "",
-      onBaseUrlChange: vi.fn(),
-      isEndpointModalOpen: false,
-      onEndpointModalToggle: vi.fn(),
-      onCustomEndpointsChange: vi.fn(),
-      autoSelect: false,
-      onAutoSelectChange: vi.fn(),
-      showEndpointTools: true,
-      shouldShowModelSelector: true,
+    const props = buildCopilotFormProps({
+      ...overrides,
       claudeModel: modelState.claudeModel,
       defaultHaikuModel: modelState.defaultHaikuModel,
       defaultHaikuModelName: modelState.defaultHaikuModelName,
@@ -164,23 +138,9 @@ const renderStatefulCopilotForm = (
       defaultFableModelName: modelState.defaultFableModelName,
       subagentModel: modelState.subagentModel,
       onModelChange: modelState.handleModelChange,
-      speedTestEndpoints: [],
-      apiFormat: "anthropic",
-      onApiFormatChange: vi.fn(),
-      apiKeyField: "ANTHROPIC_AUTH_TOKEN",
-      onApiKeyFieldChange: vi.fn(),
-      isFullUrl: false,
-      onFullUrlChange: vi.fn(),
-      customUserAgent: "",
-      onCustomUserAgentChange: vi.fn(),
-      localProxyHeadersOverride: "",
-      onLocalProxyHeadersOverrideChange: vi.fn(),
-      localProxyBodyOverride: "",
-      onLocalProxyBodyOverrideChange: vi.fn(),
       settingsConfig,
       onSettingsConfigChange: setSettingsConfig,
-      ...overrides,
-    };
+    });
 
     return (
       <FormShell>

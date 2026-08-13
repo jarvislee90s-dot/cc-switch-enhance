@@ -9,9 +9,21 @@ import {
   readContextWindows,
   writeContextWindow,
   stripModelSuffix,
+  migrateLegacyModelSuffixes,
   useModelState,
 } from "@/components/providers/forms/hooks/useModelState";
 
+const INVALID_WINDOW_INPUTS = [
+  "1e3",
+  "1foo2",
+  "12abc34",
+  "1.5M",
+  "1,000,000",
+  "1_000_000",
+  "1 000 000",
+  "0",
+  "1G",
+];
 describe("useModelState", () => {
   it("hydrates role models and display names from Claude Code env", () => {
     const settingsConfig = JSON.stringify({
@@ -315,17 +327,7 @@ describe("parseModelSuffix", () => {
     });
   });
 
-  it.each([
-    "1e3",
-    "1foo2",
-    "12abc34",
-    "1.5M",
-    "1,000,000",
-    "1_000_000",
-    "1 000 000",
-    "0",
-    "1G",
-  ])("rejects [%s] as invalid suffix", (input) => {
+  it.each(INVALID_WINDOW_INPUTS)("rejects [%s] as invalid suffix", (input) => {
     expect(parseModelSuffix(`model[${input}]`)).toEqual({
       slug: `model[${input}]`,
       window: undefined,
@@ -370,17 +372,7 @@ describe("setModelSuffix", () => {
     expect(setModelSuffix("model", "1G")).toBe("model");
   });
 
-  it.each([
-    "1e3",
-    "1foo2",
-    "12abc34",
-    "1.5M",
-    "1,000,000",
-    "1_000_000",
-    "1 000 000",
-    "0",
-    "1G",
-  ])("returns base unchanged for invalid input %s", (input) => {
+  it.each(INVALID_WINDOW_INPUTS)("returns base unchanged for invalid input %s", (input) => {
     expect(setModelSuffix("model", input)).toBe("model");
   });
 });
@@ -513,5 +505,58 @@ describe("contextWindows", () => {
     const parsed = JSON.parse(next);
     expect(Array.isArray(parsed.contextWindows)).toBe(false);
     expect(parsed.contextWindows.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe(200000);
+  });
+});
+
+describe("migrateLegacyModelSuffixes", () => {
+  it("把合法旧后缀迁移进 contextWindows 并清理模型名", () => {
+    const config = JSON.stringify({
+      env: {
+        ANTHROPIC_MODEL: "deepseek[200k]",
+        ANTHROPIC_DEFAULT_SONNET_MODEL: "glm-5.2",
+        ANTHROPIC_DEFAULT_OPUS_MODEL: "kimi[1M]",
+      },
+    });
+    const next = migrateLegacyModelSuffixes(config);
+    const parsed = JSON.parse(next);
+    expect(parsed.env.ANTHROPIC_MODEL).toBe("deepseek");
+    expect(parsed.env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe("kimi");
+    expect(parsed.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("glm-5.2");
+    expect(parsed.contextWindows.ANTHROPIC_MODEL).toBe(200000);
+    expect(parsed.contextWindows.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe(1000000);
+    expect(parsed.contextWindows.ANTHROPIC_DEFAULT_SONNET_MODEL).toBeUndefined();
+  });
+
+  it("已有 contextWindows 时合并而非覆盖", () => {
+    const config = JSON.stringify({
+      env: { ANTHROPIC_MODEL: "deepseek[200k]" },
+      contextWindows: {
+        ANTHROPIC_DEFAULT_SONNET_MODEL: 160000,
+        ANTHROPIC_MODEL: 999,
+      },
+    });
+    const parsed = JSON.parse(migrateLegacyModelSuffixes(config));
+    expect(parsed.contextWindows.ANTHROPIC_MODEL).toBe(200000);
+    expect(parsed.contextWindows.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe(160000);
+  });
+
+  it("无合法后缀时返回原 config", () => {
+    const config = JSON.stringify({
+      env: { ANTHROPIC_MODEL: "deepseek-v3" },
+    });
+    expect(migrateLegacyModelSuffixes(config)).toBe(config);
+  });
+
+  it("非法后缀不迁移", () => {
+    const config = JSON.stringify({
+      env: { ANTHROPIC_MODEL: "deepseek[1.5m]" },
+    });
+    expect(migrateLegacyModelSuffixes(config)).toBe(config);
+  });
+
+  it("无效 JSON 不抛错并返回原 config", () => {
+    const invalid = "{invalid";
+    expect(() => migrateLegacyModelSuffixes(invalid)).not.toThrow();
+    expect(migrateLegacyModelSuffixes(invalid)).toBe(invalid);
   });
 });
