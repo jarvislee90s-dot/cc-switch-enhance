@@ -162,6 +162,42 @@ export function writeContextWindow(
 }
 
 /**
+ * 保存路径统一迁移：把 env 模型名中的合法旧后缀搬进 contextWindows，
+ * 模型名恢复干净。spec 1.1 要求迁移持久化写回 DB，这里在表单保存时执行。
+ * 返回原字符串当且仅当没有任何迁移发生（便于调用方判断）。
+ */
+export function migrateLegacyModelSuffixes(config: string): string {
+  let parsed: Record<string, any>;
+  try {
+    const candidate = JSON.parse(config || "{}") as unknown;
+    if (!isRecord(candidate)) return config;
+    parsed = candidate;
+  } catch {
+    return config;
+  }
+
+  const env = isRecord(parsed.env) ? parsed.env : undefined;
+  if (!env) return config;
+
+  const contextWindows = isRecord(parsed.contextWindows)
+    ? parsed.contextWindows
+    : {};
+  let changed = false;
+  for (const field of MODEL_ENV_FIELDS) {
+    const current = env[field];
+    if (typeof current !== "string") continue;
+    const parsedSuffix = parseModelSuffix(current);
+    if (parsedSuffix.window === undefined) continue;
+    env[field] = parsedSuffix.slug;
+    contextWindows[field] = parsedSuffix.window;
+    changed = true;
+  }
+  if (!changed) return config;
+  parsed.contextWindows = contextWindows;
+  return JSON.stringify(parsed, null, 2);
+}
+
+/**
  * Parse model values from settings config JSON
  */
 function parseModelsFromConfig(settingsConfig: string) {

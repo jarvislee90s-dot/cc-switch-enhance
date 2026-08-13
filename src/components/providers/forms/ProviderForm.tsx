@@ -115,6 +115,7 @@ import {
   useCodexOauth,
   useXaiOauth,
 } from "./hooks";
+import { migrateLegacyModelSuffixes } from "@/components/providers/forms/hooks/useModelState";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { useSettingsQuery } from "@/lib/query";
 import {
@@ -1489,6 +1490,8 @@ function ProviderFormFull({
         }
       }
       settingsConfig = JSON.stringify(omoConfig);
+    } else if (appId === "claude") {
+      settingsConfig = migrateLegacyModelSuffixes(values.settingsConfig);
     } else {
       settingsConfig = values.settingsConfig.trim();
     }
