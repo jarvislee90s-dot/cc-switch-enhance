@@ -478,7 +478,7 @@ describe("ClaudeFormFields", () => {
 
     expect(
       screen.getByText(
-        "对于[1M]后缀的模型Claude Code原生支持1M上下文，其他输入形式或不输入默认为200k，切换模型后终端内生效。",
+        "关闭后，切换模型不再自动更新上下文长度与压缩阈值。",
       ),
     ).toBeInTheDocument();
   });

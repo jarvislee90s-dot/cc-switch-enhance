@@ -588,12 +588,18 @@ describe("migrateLegacyModelSuffixes", () => {
 
   it("contextWindows 形状非法时整体跳过迁移", () => {
     // 与 Rust migrate_legacy_suffix_to_context_windows 一致：非对象 contextWindows
-    // 不改写 env，避免把用户数据悄悄重置为空对象。
+    // 不改写 env（后缀不被剥），避免把用户数据悄悄重置为空对象。
     const config = JSON.stringify({
       env: { ANTHROPIC_MODEL: "deepseek[200k]" },
       contextWindows: [],
     });
     expect(migrateLegacyModelSuffixes(config)).toBe(config);
+
+    const configBad = JSON.stringify({
+      env: { ANTHROPIC_MODEL: "deepseek[200k]" },
+      contextWindows: "bad",
+    });
+    expect(migrateLegacyModelSuffixes(configBad)).toBe(configBad);
   });
 
   it("无效 JSON 不抛错并返回原 config", () => {

@@ -1255,7 +1255,7 @@ export function ClaudeFormFields({
                 {
                   defaultValue: autoSyncContextWindow
                     ? "上下文长度和压缩阈值按切换的模型更新配置 json。切换后需重启 Claude Code（退出后用 claude --resume 恢复会话）才生效。多CC终端使用不同模型，以最后切换模型时的上下文长度作为全局变量。"
-                    : "对于[1M]后缀的模型Claude Code原生支持1M上下文，其他输入形式或不输入默认为200k，切换模型后终端内生效。",
+                    : "关闭后，切换模型不再自动更新上下文长度与压缩阈值。",
                 },
               )}
             </p>

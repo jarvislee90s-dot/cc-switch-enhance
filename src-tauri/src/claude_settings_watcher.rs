@@ -353,8 +353,8 @@ fn handle_settings_change(
         .expect("settings watcher provider mutex poisoned");
     let previous_settings = provider.settings_config.clone();
 
-    // 4. 检查 provider 的 autoSyncContextWindow 开关（字段缺失时按账本衔接前状态）
-    if !effective_auto_sync_enabled(&v, &provider) {
+    // 4. 检查 provider 的 autoSyncContextWindow 开关（字段缺失即关闭，spec：缺失该开关时默认关闭）
+    if !effective_auto_sync_enabled(&provider) {
         log::debug!("[ClaudeSettingsWatcher] auto-sync disabled for provider, skip");
         return;
     }
@@ -362,8 +362,8 @@ fn handle_settings_change(
     // 5. 写前检测用户手填：live 值不是自动目标时，覆盖或新增 userExplicit。
     // 检测必须在静态注入/无 active window 早退之前，保证用户手改会被记账；
     // 键结构按 spec 固定为 ACW / MAX 短键。
-    let explicit_acw = new_acw.filter(|value| !is_auto_target_value(&v, &provider, "ACW", value));
-    let explicit_max = new_max.filter(|value| !is_auto_target_value(&v, &provider, "MAX", value));
+    let explicit_acw = new_acw.filter(|value| !is_auto_target_value(&provider, "ACW", value));
+    let explicit_max = new_max.filter(|value| !is_auto_target_value(&provider, "MAX", value));
     if explicit_acw.is_some() || explicit_max.is_some() {
         record_user_explicit(&mut provider, explicit_acw, explicit_max);
         if !persist_settings(persist, &provider) {
@@ -521,49 +521,13 @@ pub(crate) fn is_auto_target_value(provider: &Provider, key: &str, value: &str) 
         })
 }
 
-/// autoSyncContextWindow 字段缺失时以 DB autoSyncState 账本为主信号，辅以
-/// live ACW/MAX 来源综合判定，衔接用户更新前的状态（不无条件默认 off）。
-/// 显式字段永远优先。
-pub(crate) fn effective_auto_sync_enabled(live: &Value, provider: &Provider) -> bool {
-    let settings = &provider.settings_config;
-    if let Some(enabled) = settings
+/// autoSyncContextWindow 开关有效值：显式字段优先，缺失即关闭（spec：缺失该开关时默认关闭）。
+pub(crate) fn effective_auto_sync_enabled(provider: &Provider) -> bool {
+    provider
+        .settings_config
         .get("autoSyncContextWindow")
         .and_then(Value::as_bool)
-    {
-        return enabled;
-    }
-    if auto_sync_ledger_has_auto_records(settings) {
-        return true;
-    }
-    // 辅助确认：live 的 ACW/MAX 命中自动来源目标值
-    let Some(env) = live.get("env").and_then(Value::as_object) else {
-        return false;
-    };
-    crate::claude_desktop_config::CLAUDE_CONTEXT_WINDOW_LEDGER_KEYS
-        .iter()
-        .any(|(env_key, short_key)| {
-            env.get(*env_key)
-                .and_then(Value::as_str)
-                .is_some_and(|value| is_auto_target_value(live, provider, short_key, value))
-        })
-}
-
-/// autoSyncState 账本（lastWritten / staticInjected）是否存在 ACW/MAX 记录。
-pub(crate) fn auto_sync_ledger_has_auto_records(settings: &Value) -> bool {
-    let Some(state) = settings.get("autoSyncState").and_then(Value::as_object) else {
-        return false;
-    };
-    ["lastWritten", "staticInjected"].iter().any(|source| {
-        state
-            .get(*source)
-            .and_then(Value::as_object)
-            .is_some_and(|obj| {
-                ["ACW", "MAX"].iter().any(|short_key| {
-                    obj.get(*short_key)
-                        .is_some_and(|value| !value.is_null() && value.as_bool() != Some(false))
-                })
-            })
-    })
+        .unwrap_or(false)
 }
 
 fn verify_file_unchanged(path: &std::path::Path, expected: &str) -> Result<(), String> {
@@ -1405,44 +1369,68 @@ mod tests {
         assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "432000");
     }
     #[test]
+    #[serial]
     fn fs_real_watcher_effort_change_no_trigger() {
         use std::fs;
         use std::thread;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
-        let initial = json!({
-            "model": "sonnet",
-            "env": {
-                "ANTHROPIC_DEFAULT_SONNET_MODEL":"MiniMax-M3[1M]","ANTHROPIC_DEFAULT_HAIKU_MODEL":"Kimi-K2.7-Code[30k]"
-            }
-        });
-        fs::write(&path, initial.to_string()).unwrap();
-
-        let provider = Arc::new(Mutex::new(make_provider(json!({
-            "ANTHROPIC_DEFAULT_SONNET_MODEL":"MiniMax-M3[1M]","ANTHROPIC_DEFAULT_HAIKU_MODEL":"Kimi-K2.7-Code[30k]"
-        }))));
+        // spawn 时文件尚不存在 → watcher 初始快照为空
+        let provider = Arc::new(Mutex::new(Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL":"MiniMax-M3[1M]",
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL":"Kimi-K2.7-Code[30k]"
+                },
+                // 开关开启 + 带窗口模型：让"effort-only 不触发"真正走到写入判定路径
+                "autoSyncContextWindow": true
+            }),
+            None,
+        )));
 
         let watcher =
             spawn_claude_settings_watcher(path.clone(), provider, noop_persist()).unwrap();
 
-        // 只改 effortLevel
-        let new_content = json!({
-            "model": "sonnet",
-            "effortLevel": "max",
-            "env": {
-                "ANTHROPIC_DEFAULT_SONNET_MODEL":"MiniMax-M3[1M]","ANTHROPIC_DEFAULT_HAIKU_MODEL":"Kimi-K2.7-Code[30k]"
-            }
-        });
-        fs::write(&path, new_content.to_string()).unwrap();
-
+        // 首次写：触发 watcher 建立快照并写入 ACW/MAX（1M 窗口）
+        fs::write(
+            &path,
+            json!({
+                "model": "sonnet",
+                "env": {
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL":"MiniMax-M3[1M]",
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL":"Kimi-K2.7-Code[30k]"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
         thread::sleep(Duration::from_millis(800));
 
-        // ACW/MAX 不应该被写入（model 没变）
+        // 只改 effortLevel（model / ACW / MAX 均未变化）→ 不应重写
+        fs::write(
+            &path,
+            json!({
+                "model": "sonnet",
+                "effortLevel": "max",
+                "env": {
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL":"MiniMax-M3[1M]",
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL":"Kimi-K2.7-Code[30k]"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(800));
+
         let content = fs::read_to_string(&path).unwrap();
         let v: Value = serde_json::from_str(&content).unwrap();
-        assert!(v["env"].get("CLAUDE_CODE_AUTO_COMPACT_WINDOW").is_none());
-        assert!(v["env"].get("CLAUDE_CODE_MAX_CONTEXT_TOKENS").is_none());
+        assert_eq!(v["effortLevel"], "max");
+        // 首次写入的 ACW/MAX 保持，effort-only 不重写
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "950000");
+        assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "1000000");
 
         drop(watcher);
     }
@@ -2659,35 +2647,10 @@ mod tests {
     }
 
     #[test]
-    fn effective_auto_sync_enabled_uses_ledger_when_field_missing() {
-        // F5：字段缺失时以 DB autoSyncState 账本为主信号 → 视为开启
-        let provider = Provider::with_id(
-            "p".to_string(),
-            "P".to_string(),
-            json!({
-                "env": {},
-                "autoSyncState": { "lastWritten": { "ACW": "28500", "MAX": "30000" } }
-            }),
-            None,
-        );
-        assert!(provider
-            .settings_config
-            .get("autoSyncContextWindow")
-            .is_none());
-        assert!(effective_auto_sync_enabled(
-            &provider.settings_config,
-            &provider
-        ));
-    }
-
-    #[test]
     fn effective_auto_sync_enabled_false_without_field_or_ledger() {
         let provider =
             Provider::with_id("p".to_string(), "P".to_string(), json!({ "env": {} }), None);
-        assert!(!effective_auto_sync_enabled(
-            &provider.settings_config,
-            &provider
-        ));
+        assert!(!effective_auto_sync_enabled(&provider));
     }
 
     #[test]
@@ -2703,10 +2666,7 @@ mod tests {
             }),
             None,
         );
-        assert!(!effective_auto_sync_enabled(
-            &provider.settings_config,
-            &provider
-        ));
+        assert!(!effective_auto_sync_enabled(&provider));
 
         let provider = Provider::with_id(
             "p".to_string(),
@@ -2714,35 +2674,14 @@ mod tests {
             json!({ "env": {}, "autoSyncContextWindow": true }),
             None,
         );
-        assert!(effective_auto_sync_enabled(
-            &provider.settings_config,
-            &provider
-        ));
-    }
-
-    #[test]
-    fn effective_auto_sync_enabled_confirms_via_env_auto_target() {
-        // 无字段、无账本时，live 的 ACW/MAX 命中自动来源目标 → 视为开启
-        let settings = json!({
-            "model": "sonnet",
-            "env": { "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "190000", "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "200000" }
-        });
-        let provider = Provider::with_id(
-            "p".to_string(),
-            "P".to_string(),
-            json!({
-                "env": { "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2" },
-                "contextWindows": { "ANTHROPIC_DEFAULT_SONNET_MODEL": 200000 }
-            }),
-            None,
-        );
-        assert!(effective_auto_sync_enabled(&settings, &provider));
+        assert!(effective_auto_sync_enabled(&provider));
     }
 
     #[test]
     #[serial]
-    fn fs_real_watcher_missing_field_with_ledger_keeps_auto_sync() {
-        // F5：autoSyncContextWindow 字段缺失但账本有记录时，watcher 仍应写入 ACW/MAX
+    fn fs_real_watcher_missing_field_does_not_auto_sync() {
+        // 方案 A：autoSyncContextWindow 字段缺失即关闭（即使账本有记录），
+        // watcher 不写 ACW/MAX。
         use std::fs;
         use std::thread;
 
@@ -2792,8 +2731,14 @@ mod tests {
         let content = fs::read_to_string(&path).unwrap();
         let v: Value = serde_json::from_str(&content).unwrap();
         assert_eq!(v["model"], "haiku");
-        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "28500");
-        assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "30000");
+        assert!(
+            v["env"].get("CLAUDE_CODE_AUTO_COMPACT_WINDOW").is_none(),
+            "字段缺失时 watcher 不应写 ACW"
+        );
+        assert!(
+            v["env"].get("CLAUDE_CODE_MAX_CONTEXT_TOKENS").is_none(),
+            "字段缺失时 watcher 不应写 MAX"
+        );
 
         drop(watcher);
     }

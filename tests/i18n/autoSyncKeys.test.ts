@@ -21,4 +21,14 @@ describe("auto sync locale coverage", () => {
       expect(value.trim().length).toBeGreaterThan(0);
     },
   );
+
+  it.each(locales)(
+    "defines providerForm.liveLoadFailed in %s",
+    (_locale, translations) => {
+      const value = translations.providerForm.liveLoadFailed;
+
+      expect(typeof value).toBe("string");
+      expect(value.trim().length).toBeGreaterThan(0);
+    },
+  );
 });

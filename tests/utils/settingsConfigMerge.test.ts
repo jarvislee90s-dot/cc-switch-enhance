@@ -4,6 +4,9 @@ import {
   applyAutoSyncContextWindowSetting,
   mergeSettingsConfigPreservingAutoSync,
   resolveAutoSyncContextWindow,
+  matchesAutoSyncSource,
+  hasUserExplicitValue,
+  restoreAutoSyncContextWindowValue,
 } from "@/utils/settingsConfigMerge";
 
 describe("mergeSettingsConfigPreservingAutoSync", () => {
@@ -368,7 +371,7 @@ describe("resolveAutoSyncContextWindow", () => {
     ).toBe(false);
   });
 
-  it("字段缺失但有账本记录时视为开启（衔接前状态）", () => {
+  it("字段缺失时即使账本有记录也视为关闭", () => {
     expect(
       resolveAutoSyncContextWindow(
         JSON.stringify({
@@ -376,7 +379,7 @@ describe("resolveAutoSyncContextWindow", () => {
           autoSyncState: { lastWritten: { ACW: "190000", MAX: "200000" } },
         }),
       ),
-    ).toBe(true);
+    ).toBe(false);
     expect(
       resolveAutoSyncContextWindow(
         JSON.stringify({
@@ -384,14 +387,14 @@ describe("resolveAutoSyncContextWindow", () => {
           autoSyncState: { staticInjected: { ACW: "262144", MAX: "262144" } },
         }),
       ),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it("字段缺失且无账本时视为关闭", () => {
     expect(resolveAutoSyncContextWindow(JSON.stringify({ env: {} }))).toBe(false);
   });
 
-  it("字段缺失无账本时，env ACW/MAX 命中 contextWindows 推导目标也视为开启", () => {
+  it("字段缺失时即使 env 命中 contextWindows 推导目标也视为关闭", () => {
     expect(
       resolveAutoSyncContextWindow(
         JSON.stringify({
@@ -402,10 +405,77 @@ describe("resolveAutoSyncContextWindow", () => {
           contextWindows: { ANTHROPIC_DEFAULT_SONNET_MODEL: 200000 },
         }),
       ),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it("无效 JSON 返回 false", () => {
     expect(resolveAutoSyncContextWindow("{invalid")).toBe(false);
   });
 });
+
+describe("ledger contract parity with Rust", () => {
+  it("账本使用 ACW/MAX 短键结构", () => {
+    // 关闭自动同步时按短键识别自动来源并清空 live ACW/MAX
+    const updated = applyAutoSyncContextWindowSetting(
+      JSON.stringify({
+        env: {
+          CLAUDE_CODE_AUTO_COMPACT_WINDOW: "160000",
+          CLAUDE_CODE_MAX_CONTEXT_TOKENS: "200000",
+        },
+        autoSyncContextWindow: true,
+        autoSyncState: {
+          lastWritten: { ACW: "160000", MAX: "200000" },
+          staticInjected: {},
+          userExplicit: {},
+        },
+      }),
+      false,
+    );
+    const parsed = JSON.parse(updated);
+    expect(parsed.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBeUndefined();
+    expect(parsed.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBeUndefined();
+  });
+
+  it("字符串 coercion：账本值为字符串时匹配 live 字符串", () => {
+    expect(
+      matchesAutoSyncSource({ staticInjected: { ACW: "200000" } }, "ACW", "200000"),
+    ).toBe(true);
+  });
+
+  it("字符串 coercion：数字型账本值不匹配（对齐 Rust as_str）", () => {
+    expect(
+      matchesAutoSyncSource({ staticInjected: { ACW: 200000 } }, "ACW", "200000"),
+    ).toBe(false);
+  });
+
+  it("null/false：false 不视为有意义显式值", () => {
+    expect(hasUserExplicitValue({ userExplicit: { MAX: false } }, "MAX")).toBe(false);
+    expect(
+      hasUserExplicitValue({ userExplicit: { MAX: "250000" } }, "MAX"),
+    ).toBe(true);
+  });
+
+  it("优先级：userExplicit 优先于 lastWritten/staticInjected", () => {
+    expect(
+      restoreAutoSyncContextWindowValue(
+        {
+          userExplicit: { MAX: "250000" },
+          lastWritten: { MAX: "200000" },
+          staticInjected: { MAX: "300000" },
+        },
+        "MAX",
+      ),
+    ).toBe("250000");
+    expect(
+      restoreAutoSyncContextWindowValue(
+        {
+          userExplicit: {},
+          lastWritten: { MAX: "200000" },
+          staticInjected: { MAX: "300000" },
+        },
+        "MAX",
+      ),
+    ).toBe("200000");
+  });
+});
+
