@@ -1,4 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from "react";
+import { isPlainObject } from "@/utils/providerConfigUtils";
 
 interface UseModelStateProps {
   settingsConfig: string;
@@ -51,7 +52,7 @@ export interface ModelSuffixResult {
   window?: number;
 }
 
-function parseWindowToken(token: string): number | undefined {
+export function parseWindowToken(token: string): number | undefined {
   const trimmed = token.trim();
   if (!trimmed) return undefined;
   // 与 Rust 端一致：全串校验，不接受小数、分隔符或未知单位
@@ -99,18 +100,14 @@ export function setModelSuffix(model: string, windowStr: string): string {
   return `${base}[${trimmed.toLowerCase()}]`;
 }
 
-function isRecord(value: unknown): value is Record<string, any> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 export function readContextWindows(
   settingsConfig: string,
 ): Record<string, number> {
   try {
     const cfg = JSON.parse(settingsConfig || "{}") as unknown;
-    if (!isRecord(cfg)) return {};
+    if (!isPlainObject(cfg)) return {};
     const contextWindows = cfg.contextWindows;
-    if (!isRecord(contextWindows)) return {};
+    if (!isPlainObject(contextWindows)) return {};
     const result: Record<string, number> = {};
     for (const [key, value] of Object.entries(contextWindows)) {
       if (typeof value === "number" && Number.isFinite(value) && value > 0) {
@@ -131,13 +128,13 @@ export function writeContextWindow(
   let parsed: Record<string, any>;
   try {
     const candidate = JSON.parse(config || "{}") as unknown;
-    if (!isRecord(candidate)) return config;
+    if (!isPlainObject(candidate)) return config;
     parsed = candidate;
   } catch {
     return config;
   }
 
-  const env = isRecord(parsed.env) ? parsed.env : undefined;
+  const env = isPlainObject(parsed.env) ? parsed.env : undefined;
   if (env) {
     const current = env[roleEnvKey];
     if (typeof current === "string") {
@@ -149,7 +146,7 @@ export function writeContextWindow(
     parsed.env = {};
   }
 
-  const contextWindows = isRecord(parsed.contextWindows)
+  const contextWindows = isPlainObject(parsed.contextWindows)
     ? parsed.contextWindows
     : {};
   parsed.contextWindows = contextWindows;
@@ -170,20 +167,23 @@ export function migrateLegacyModelSuffixes(config: string): string {
   let parsed: Record<string, any>;
   try {
     const candidate = JSON.parse(config || "{}") as unknown;
-    if (!isRecord(candidate)) return config;
+    if (!isPlainObject(candidate)) return config;
     parsed = candidate;
   } catch {
     return config;
   }
 
-  const env = isRecord(parsed.env) ? parsed.env : undefined;
+  const env = isPlainObject(parsed.env) ? parsed.env : undefined;
   if (!env) return config;
-  if (parsed.contextWindows !== undefined && !isRecord(parsed.contextWindows)) {
+  if (
+    parsed.contextWindows !== undefined &&
+    !isPlainObject(parsed.contextWindows)
+  ) {
     // 与 Rust migrate_legacy_suffix_to_context_windows 一致：形状非法时不迁移
     return config;
   }
 
-  const contextWindows = isRecord(parsed.contextWindows)
+  const contextWindows = isPlainObject(parsed.contextWindows)
     ? parsed.contextWindows
     : {};
   let changed = false;
@@ -384,16 +384,26 @@ export function useModelState({
               : "";
           const window =
             parseModelSuffix(oldModel).window ?? parseModelSuffix(value).window;
-          if (
-            window !== undefined &&
-            readContextWindows(JSON.stringify(currentConfig))[field] ===
-              undefined
-          ) {
+          if (window !== undefined) {
+            // 对象直读直写：省去 writeContextWindow 的 parse/stringify 往返。
+            const contextWindows = isPlainObject(currentConfig.contextWindows)
+              ? currentConfig.contextWindows
+              : {};
+            const existing = contextWindows[field];
+            const hasValidWindow =
+              typeof existing === "number" &&
+              Number.isFinite(existing) &&
+              existing > 0;
             // 只迁移缺失键，避免旧模型后缀覆盖用户已显式配置的 contextWindows
-            currentConfig = JSON.parse(
-              writeContextWindow(JSON.stringify(currentConfig), field, window),
-            );
-            if (!currentConfig.env) currentConfig.env = {};
+            if (!hasValidWindow) {
+              currentConfig.contextWindows = contextWindows;
+              if (typeof currentConfig.env[field] === "string") {
+                currentConfig.env[field] = stripModelSuffix(
+                  currentConfig.env[field] as string,
+                );
+              }
+              contextWindows[field] = window;
+            }
           }
         }
         const env = currentConfig.env as Record<string, unknown>;
@@ -404,7 +414,7 @@ export function useModelState({
           env[field] = trimmed;
         } else {
           delete env[field];
-          if (isRecord(currentConfig.contextWindows)) {
+          if (isPlainObject(currentConfig.contextWindows)) {
             delete currentConfig.contextWindows[field];
           }
         }

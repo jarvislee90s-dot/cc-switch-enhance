@@ -452,17 +452,7 @@ fn persist_settings(persist: &PersistSettingsCallback, provider: &Provider) -> b
 }
 
 fn record_user_explicit(provider: &mut Provider, acw: Option<&str>, max: Option<&str>) {
-    let Some(explicit) =
-        crate::services::provider::user_explicit_mut(&mut provider.settings_config)
-    else {
-        return;
-    };
-    if let Some(value) = acw {
-        explicit.insert("ACW".to_string(), Value::String(value.to_string()));
-    }
-    if let Some(value) = max {
-        explicit.insert("MAX".to_string(), Value::String(value.to_string()));
-    }
+    crate::services::provider::record_user_explicit_values(&mut provider.settings_config, acw, max);
 }
 
 fn record_last_written(provider: &mut Provider, acw: &str, max: &str) {
@@ -497,29 +487,19 @@ fn is_user_explicit(provider: &Provider, key: &str) -> bool {
 }
 
 fn is_auto_source_value(provider: &Provider, key: &str, value: &str) -> bool {
-    ["lastWritten", "staticInjected"].iter().any(|source| {
-        let Some(source_obj) = provider
-            .settings_config
-            .pointer(&format!("/autoSyncState/{source}"))
-            .and_then(Value::as_object)
-        else {
-            return false;
-        };
-        if source_obj.get(key).and_then(Value::as_str) == Some(value) {
-            return true;
-        }
-        false
-    })
+    let Some(state) = provider
+        .settings_config
+        .pointer("/autoSyncState")
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    crate::services::provider::auto_source_value_matches(state, key, value)
 }
 
 /// live 值与 DB 账本、staticInjected，或任意已配置角色的自动目标一致时，视为自动来源。
 /// 用于 watcher 重建后 DB lastWritten 缺失/过期时，仍不会把自动写入误判为 userExplicit。
-pub(crate) fn is_auto_target_value(
-    _settings: &Value,
-    provider: &Provider,
-    key: &str,
-    value: &str,
-) -> bool {
+pub(crate) fn is_auto_target_value(provider: &Provider, key: &str, value: &str) -> bool {
     if is_auto_source_value(provider, key, value) {
         return true;
     }

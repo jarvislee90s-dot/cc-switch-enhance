@@ -1,3 +1,5 @@
+import { isPlainObject } from "@/utils/providerConfigUtils";
+
 const CLAUDE_CONTEXT_WINDOW_ENV_KEYS = [
   "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
   "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
@@ -8,68 +10,20 @@ const CLAUDE_CONTEXT_WINDOW_STATE_KEYS = {
   CLAUDE_CODE_MAX_CONTEXT_TOKENS: "MAX",
 } as const;
 
-const AUTO_SYNC_COMPACT_RATIO_MIN = 0.2;
-const AUTO_SYNC_COMPACT_RATIO_MAX = 0.95;
+export const AUTO_SYNC_COMPACT_RATIO_MIN = 0.2;
+export const AUTO_SYNC_COMPACT_RATIO_MAX = 0.95;
 
 /**
- * 解析 autoSyncContextWindow 有效值：显式字段优先；字段缺失时以
- * autoSyncState 账本为主信号（lastWritten/staticInjected 有 ACW/MAX 记录 →
- * 视为开启），辅以 env ACW/MAX 命中 contextWindows 推导目标进一步确认，
- * 衔接用户更新前的状态，避免升级后行为突变。
+ * autoSyncContextWindow 开关有效值：显式字段优先，缺失即关闭
+ * （spec：缺失该开关时默认关闭）。
  */
 export function resolveAutoSyncContextWindow(config: string): boolean {
-  let parsed: Record<string, unknown>;
   try {
-    parsed = JSON.parse(config || "{}") as Record<string, unknown>;
+    const parsed = JSON.parse(config || "{}") as Record<string, unknown>;
+    return parsed.autoSyncContextWindow === true;
   } catch {
     return false;
   }
-  if (typeof parsed.autoSyncContextWindow === "boolean") {
-    return parsed.autoSyncContextWindow;
-  }
-  const state = parsed.autoSyncState;
-  if (isRecord(state)) {
-    for (const source of ["lastWritten", "staticInjected"] as const) {
-      const src = state[source];
-      if (
-        isRecord(src) &&
-        ["ACW", "MAX"].some(
-          (shortKey) =>
-            src[shortKey] !== undefined &&
-            src[shortKey] !== null &&
-            src[shortKey] !== false,
-        )
-      ) {
-        return true;
-      }
-    }
-  }
-  const env = parsed.env;
-  const contextWindows = parsed.contextWindows;
-  if (isRecord(env) && isRecord(contextWindows)) {
-    const ratio =
-      typeof parsed.autoSyncCompactRatio === "number" &&
-      Number.isFinite(parsed.autoSyncCompactRatio) &&
-      parsed.autoSyncCompactRatio >= AUTO_SYNC_COMPACT_RATIO_MIN &&
-      parsed.autoSyncCompactRatio <= AUTO_SYNC_COMPACT_RATIO_MAX
-        ? parsed.autoSyncCompactRatio
-        : 0.95;
-    const targets = new Set<string>();
-    for (const value of Object.values(contextWindows)) {
-      if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
-        continue;
-      }
-      targets.add(String(Math.floor(value * ratio)));
-      targets.add(String(value));
-    }
-    for (const envKey of CLAUDE_CONTEXT_WINDOW_ENV_KEYS) {
-      const liveValue = env[envKey];
-      if (typeof liveValue === "string" && targets.has(liveValue)) {
-        return true;
-      }
-    }
-  }
-  return false;
 }
 
 function removeClaudeContextWindowEnvFields(config: Record<string, unknown>) {
@@ -82,37 +36,51 @@ function removeClaudeContextWindowEnvFields(config: Record<string, unknown>) {
   }
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+function contextWindowValueAsString(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  }
+  if (
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    value > 0 &&
+    Number.isInteger(value)
+  ) {
+    return String(value);
+  }
+  return undefined;
 }
 
-function matchesAutoSyncSource(
+export function matchesAutoSyncSource(
   state: Record<string, unknown>,
   shortKey: string,
   liveValue: unknown,
 ): boolean {
+  // 与 Rust backfill/live 侧对齐：live 值先规范化成字符串，账本值只认字符串且严格相等；
+  // 数字型账本值不匹配（Rust as_str 对数字返回 None）。
+  const live = contextWindowValueAsString(liveValue);
+  if (live === undefined) return false;
   return ["lastWritten", "staticInjected"].some((sourceName) => {
     const source = state[sourceName];
-    if (!isRecord(source)) return false;
+    if (!isPlainObject(source)) return false;
     const sourceValue = source[shortKey];
-    return (
-      sourceValue !== undefined &&
-      sourceValue !== null &&
-      sourceValue !== false &&
-      String(sourceValue) === String(liveValue)
-    );
+    return typeof sourceValue === "string" && sourceValue === live;
   });
 }
 
-function hasUserExplicitValue(
+export function hasUserExplicitValue(
   state: Record<string, unknown>,
   shortKey: string,
 ): boolean {
   const userExplicit = state.userExplicit;
-  if (!isRecord(userExplicit)) return false;
+  if (!isPlainObject(userExplicit)) return false;
 
   const shortValue = userExplicit[shortKey];
-  return shortValue !== undefined && shortValue !== null;
+  // 与 Rust stored_user_explicit_value 对齐：null/false 不算有意义显式值
+  return (
+    shortValue !== undefined && shortValue !== null && shortValue !== false
+  );
 }
 
 function restorableLedgerValue(value: unknown): string | undefined {
@@ -123,18 +91,18 @@ function restorableLedgerValue(value: unknown): string | undefined {
   return undefined;
 }
 
-function restoreAutoSyncContextWindowValue(
+export function restoreAutoSyncContextWindowValue(
   state: Record<string, unknown>,
   shortKey: string,
 ): string | undefined {
   const userExplicit = state.userExplicit;
-  if (isRecord(userExplicit)) {
+  if (isPlainObject(userExplicit)) {
     const shortValue = restorableLedgerValue(userExplicit[shortKey]);
     if (shortValue !== undefined) return shortValue;
   }
   for (const sourceName of ["lastWritten", "staticInjected"] as const) {
     const source = state[sourceName];
-    if (!isRecord(source)) continue;
+    if (!isPlainObject(source)) continue;
     const value = restorableLedgerValue(source[shortKey]);
     if (value !== undefined) return value;
   }
@@ -146,7 +114,7 @@ function writeUserExplicitState(
   shortKey: string,
   liveValue: unknown,
 ) {
-  if (!isRecord(state.userExplicit)) {
+  if (!isPlainObject(state.userExplicit)) {
     state.userExplicit = {};
   }
   const userExplicit = state.userExplicit as Record<string, unknown>;
@@ -170,7 +138,7 @@ export function applyAutoSyncContextWindowSetting(
     parsed.autoSyncContextWindow = enabled;
     if (enabled) {
       const state = parsed.autoSyncState;
-      if (isRecord(state)) {
+      if (isPlainObject(state)) {
         const writes: Array<[string, string]> = [];
         for (const envKey of CLAUDE_CONTEXT_WINDOW_ENV_KEYS) {
           const shortKey = CLAUDE_CONTEXT_WINDOW_STATE_KEYS[envKey];
@@ -178,7 +146,7 @@ export function applyAutoSyncContextWindowSetting(
           if (value !== undefined) writes.push([envKey, value]);
         }
         if (writes.length > 0) {
-          if (!isRecord(parsed.env)) parsed.env = {};
+          if (!isPlainObject(parsed.env)) parsed.env = {};
           const env = parsed.env as Record<string, unknown>;
           for (const [envKey, value] of writes) env[envKey] = value;
         }
@@ -187,13 +155,13 @@ export function applyAutoSyncContextWindowSetting(
     }
 
     const state = parsed.autoSyncState;
-    if (!isRecord(state)) {
+    if (!isPlainObject(state)) {
       removeClaudeContextWindowEnvFields(parsed);
       return JSON.stringify(parsed, null, 2);
     }
 
     const env = parsed.env;
-    if (isRecord(env)) {
+    if (isPlainObject(env)) {
       for (const envKey of CLAUDE_CONTEXT_WINDOW_ENV_KEYS) {
         const liveValue = env[envKey];
         if (liveValue === undefined) continue;

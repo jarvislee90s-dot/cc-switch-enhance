@@ -34,6 +34,7 @@ use super::normalize_claude_models_in_value;
 const CODEX_OAUTH_CLAUDE_MAX_CONTEXT_TOKENS: &str = "372000";
 const CODEX_OAUTH_CLAUDE_AUTO_COMPACT_WINDOW: &str = "372000";
 const KIMI_FOR_CODING_CONTEXT_TOKENS: &str = "262144";
+const CLAUDE_SUBAGENT_ONE_M_MARKER: &str = "[1M]";
 
 pub(crate) fn provider_env_targets_gpt56(
     provider_env: Option<&serde_json::Map<String, Value>>,
@@ -129,6 +130,22 @@ pub(crate) fn user_explicit_mut(
     explicit.as_object_mut()
 }
 
+/// 把用户显式 ACW/MAX 写入 autoSyncState.userExplicit 短键账本。
+pub(crate) fn record_user_explicit_values(
+    settings: &mut Value,
+    acw: Option<&str>,
+    max: Option<&str>,
+) {
+    let Some(explicit) = user_explicit_mut(settings) else {
+        return;
+    };
+    if let Some(value) = acw {
+        explicit.insert("ACW".to_string(), Value::String(value.to_string()));
+    }
+    if let Some(value) = max {
+        explicit.insert("MAX".to_string(), Value::String(value.to_string()));
+    }
+}
 fn record_static_injected(settings: &mut Value, acw: &str, max: &str) {
     if let Some(state) = auto_sync_state_mut(settings) {
         state.insert(
@@ -260,7 +277,17 @@ fn apply_context_window_defaults(settings: &mut Value, provider: &Provider) {
     if has_explicit_acw || has_explicit_max {
         clear_static_injected(settings);
     } else if injected_writes.len() == 2 {
-        record_static_injected(settings, &injected_writes[0].1, &injected_writes[1].1);
+        let acw = injected_writes
+            .iter()
+            .find(|(key, _)| *key == "CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+            .map(|(_, value)| value.as_str())
+            .expect("ACW write present");
+        let max = injected_writes
+            .iter()
+            .find(|(key, _)| *key == "CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+            .map(|(_, value)| value.as_str())
+            .expect("MAX write present");
+        record_static_injected(settings, acw, max);
     }
 }
 
@@ -296,7 +323,7 @@ fn restore_claude_subagent_local_marker_for_effective(settings: &mut Value, prov
 
     env.insert(
         "CLAUDE_CODE_SUBAGENT_MODEL".to_string(),
-        Value::String(format!("{model}[1M]")),
+        Value::String(format!("{model}{CLAUDE_SUBAGENT_ONE_M_MARKER}")),
     );
 }
 
@@ -1070,12 +1097,7 @@ fn merge_manual_live_context_windows(live: &Value, provider: &Provider, settings
         if stored_user_explicit_value(provider, short_key).as_deref() == Some(live_value.as_str()) {
             continue;
         }
-        if crate::claude_settings_watcher::is_auto_target_value(
-            live,
-            provider,
-            short_key,
-            &live_value,
-        ) {
+        if crate::claude_settings_watcher::is_auto_target_value(provider, short_key, &live_value) {
             continue;
         }
         match short_key {
@@ -1102,15 +1124,7 @@ fn merge_manual_live_context_windows(live: &Value, provider: &Provider, settings
             Value::String(value.clone()),
         );
     }
-    let Some(explicit) = user_explicit_mut(settings) else {
-        return;
-    };
-    if let Some(value) = manual_acw {
-        explicit.insert("ACW".to_string(), Value::String(value));
-    }
-    if let Some(value) = manual_max {
-        explicit.insert("MAX".to_string(), Value::String(value));
-    }
+    record_user_explicit_values(settings, manual_acw.as_deref(), manual_max.as_deref());
 }
 
 pub(crate) fn write_live_with_common_config(
@@ -1304,10 +1318,7 @@ fn auto_sync_ledger_value_relevant(value: &Value) -> bool {
     !value.is_null() && value.as_bool() != Some(false)
 }
 
-fn auto_sync_key_has_auto_source_record(
-    state: &serde_json::Map<String, Value>,
-    short_key: &str,
-) -> bool {
+fn has_auto_source_record(state: &serde_json::Map<String, Value>, short_key: &str) -> bool {
     ["lastWritten", "staticInjected"].iter().any(|source| {
         state
             .get(*source)
@@ -1335,19 +1346,29 @@ fn backfill_user_explicit_value(
     false
 }
 
-fn backfill_auto_source_value(
+/// 任一自动来源（lastWritten / staticInjected）的该短键值是否等于 expected
+/// （字符串严格相等，对齐 Rust as_str 语义）。
+pub(crate) fn auto_source_value_matches(
     state: &serde_json::Map<String, Value>,
     short_key: &str,
-    live_value: &str,
+    expected: &str,
 ) -> bool {
     ["lastWritten", "staticInjected"].iter().any(|source| {
         state
             .get(*source)
             .and_then(Value::as_object)
             .is_some_and(|source_obj| {
-                source_obj.get(short_key).and_then(Value::as_str) == Some(live_value)
+                source_obj.get(short_key).and_then(Value::as_str) == Some(expected)
             })
     })
+}
+
+fn backfill_auto_source_value(
+    state: &serde_json::Map<String, Value>,
+    short_key: &str,
+    live_value: &str,
+) -> bool {
+    auto_source_value_matches(state, short_key, live_value)
 }
 
 fn strip_legacy_context_defaults_for_backfill(settings: &mut Value, provider: &Provider) {
@@ -1413,7 +1434,7 @@ fn strip_auto_synced_context_defaults(settings: &mut Value, provider: &Provider)
             }
             if backfill_auto_source_value(state, short_key, live_value) {
                 remove_keys.push(env_key);
-            } else if !auto_sync_key_has_auto_source_record(state, short_key) {
+            } else if !has_auto_source_record(state, short_key) {
                 legacy_keys.push(env_key);
             }
         }
@@ -1447,10 +1468,9 @@ fn restore_claude_internal_fields_for_backfill(settings: &mut Value, provider: &
         let Some(live_model) = live_env.and_then(|e| e.get(key)).and_then(Value::as_str) else {
             continue;
         };
-        if crate::proxy::model_mapper::strip_one_m_suffix_for_upstream(stored_model) == live_model {
-            let restored_model =
-                crate::proxy::model_mapper::strip_one_m_suffix_for_upstream(stored_model);
-            restore_models.push((key.to_string(), restored_model.to_string()));
+        let stripped = crate::proxy::model_mapper::strip_one_m_suffix_for_upstream(stored_model);
+        if stripped == live_model {
+            restore_models.push((key.to_string(), stripped.to_string()));
         }
     }
     let Some(obj) = settings.as_object_mut() else {

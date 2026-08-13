@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import {
@@ -56,10 +56,10 @@ import type {
 } from "@/types";
 import {
   parseModelSuffix,
-  setModelSuffix,
   readContextWindows,
   writeContextWindow,
   stripModelSuffix,
+  parseWindowToken,
   type ClaudeModelEnvField,
 } from "./hooks/useModelState";
 import {
@@ -70,6 +70,8 @@ import {
   applyAutoSyncCompactRatioSetting,
   applyAutoSyncContextWindowSetting,
   resolveAutoSyncContextWindow,
+  AUTO_SYNC_COMPACT_RATIO_MIN,
+  AUTO_SYNC_COMPACT_RATIO_MAX,
 } from "@/utils/settingsConfigMerge";
 
 interface EndpointCandidate {
@@ -83,8 +85,8 @@ function parseAutoSyncCompactRatio(config?: string): number | null {
     if (
       typeof ratio === "number" &&
       Number.isFinite(ratio) &&
-      ratio >= 0.2 &&
-      ratio <= 0.95
+      ratio >= AUTO_SYNC_COMPACT_RATIO_MIN &&
+      ratio <= AUTO_SYNC_COMPACT_RATIO_MAX
     ) {
       return ratio;
     }
@@ -99,18 +101,16 @@ function formatAutoSyncCompactRatio(ratio: number | null): string {
 }
 
 function parseContextWindowInput(input: string): number | null {
-  const suffixedModel = setModelSuffix("model", input);
-  return parseModelSuffix(suffixedModel).window ?? null;
+  // 与 setModelSuffix + parseModelSuffix 等价：trim 后按纯数字/Kk/Mm 解析
+  return parseWindowToken(input) ?? null;
 }
 
 function contextWindowInputValue(
-  settingsConfig: string | undefined,
+  contextWindows: Record<string, number>,
   roleEnvKey: string,
   model: string,
 ): string {
-  const window =
-    readContextWindows(settingsConfig ?? "{}")[roleEnvKey] ??
-    parseModelSuffix(model).window;
+  const window = contextWindows[roleEnvKey] ?? parseModelSuffix(model).window;
   return window ? String(window) : "";
 }
 
@@ -310,6 +310,12 @@ export function ClaudeFormFields({
     );
   }, [settingsConfig]);
 
+  // 每行窗口输入框共用一次解析，避免每次渲染整份 settingsConfig JSON.parse
+  const contextWindows = useMemo(
+    () => readContextWindows(settingsConfig ?? "{}"),
+    [settingsConfig],
+  );
+
   const [autoSyncCompactRatioInput, setAutoSyncCompactRatioInput] = useState(
     () => formatAutoSyncCompactRatio(parseAutoSyncCompactRatio(settingsConfig)),
   );
@@ -338,7 +344,11 @@ export function ClaudeFormFields({
         return;
       }
       const parsed = Number(value);
-      if (Number.isFinite(parsed) && parsed >= 0.2 && parsed <= 0.95) {
+      if (
+        Number.isFinite(parsed) &&
+        parsed >= AUTO_SYNC_COMPACT_RATIO_MIN &&
+        parsed <= AUTO_SYNC_COMPACT_RATIO_MAX
+      ) {
         setAutoSyncCompactRatioError("");
         if (onAutoSyncCompactRatioChange) {
           onAutoSyncCompactRatioChange(parsed);
@@ -1163,7 +1173,7 @@ export function ClaudeFormFields({
                         inputMode="text"
                         className="w-[90px] text-center font-mono text-sm"
                         value={contextWindowInputValue(
-                          settingsConfig,
+                          contextWindows,
                           row.modelField,
                           row.model,
                         )}
@@ -1217,8 +1227,8 @@ export function ClaudeFormFields({
               <Input
                 id="auto-sync-compact-ratio"
                 type="number"
-                min={0.2}
-                max={0.95}
+                min={AUTO_SYNC_COMPACT_RATIO_MIN}
+                max={AUTO_SYNC_COMPACT_RATIO_MAX}
                 step={0.05}
                 className="h-7 w-20 text-center"
                 value={autoSyncCompactRatioInput}
@@ -1278,7 +1288,7 @@ export function ClaudeFormFields({
                   inputMode="text"
                   className="w-[90px] text-center font-mono text-sm"
                   value={contextWindowInputValue(
-                    settingsConfig,
+                    contextWindows,
                     "ANTHROPIC_MODEL",
                     claudeModel,
                   )}

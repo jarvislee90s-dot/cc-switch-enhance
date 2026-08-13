@@ -38,8 +38,8 @@ pub(crate) use live::{
 };
 
 pub(crate) use live::{
-    auto_sync_state_mut, ensure_claude_settings_watcher, static_context_window_fallback,
-    user_explicit_mut,
+    auto_source_value_matches, auto_sync_state_mut, ensure_claude_settings_watcher,
+    record_user_explicit_values, static_context_window_fallback,
 };
 
 // Internal re-exports

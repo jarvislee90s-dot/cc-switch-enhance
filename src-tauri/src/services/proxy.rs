@@ -352,29 +352,45 @@ impl ProxyService {
         }
     }
 
+    const CLAUDE_ROLE_SOURCE_FALLBACK: &[(&str, &[&str])] = &[
+        (
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            &[
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                "ANTHROPIC_SMALL_FAST_MODEL",
+                "ANTHROPIC_MODEL",
+            ],
+        ),
+        (
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            &[
+                "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                "ANTHROPIC_MODEL",
+                "ANTHROPIC_SMALL_FAST_MODEL",
+            ],
+        ),
+        (
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            &[
+                "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                "ANTHROPIC_MODEL",
+                "ANTHROPIC_SMALL_FAST_MODEL",
+            ],
+        ),
+        (
+            "ANTHROPIC_DEFAULT_FABLE_MODEL",
+            &["ANTHROPIC_DEFAULT_FABLE_MODEL"],
+        ),
+    ];
+
     fn claude_takeover_source_key(
         env: &Map<String, Value>,
         model_key: &str,
     ) -> Option<&'static str> {
-        let candidates = match model_key {
-            "ANTHROPIC_DEFAULT_HAIKU_MODEL" => &[
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-                "ANTHROPIC_SMALL_FAST_MODEL",
-                "ANTHROPIC_MODEL",
-            ][..],
-            "ANTHROPIC_DEFAULT_SONNET_MODEL" => &[
-                "ANTHROPIC_DEFAULT_SONNET_MODEL",
-                "ANTHROPIC_MODEL",
-                "ANTHROPIC_SMALL_FAST_MODEL",
-            ][..],
-            "ANTHROPIC_DEFAULT_OPUS_MODEL" => &[
-                "ANTHROPIC_DEFAULT_OPUS_MODEL",
-                "ANTHROPIC_MODEL",
-                "ANTHROPIC_SMALL_FAST_MODEL",
-            ][..],
-            "ANTHROPIC_DEFAULT_FABLE_MODEL" => &["ANTHROPIC_DEFAULT_FABLE_MODEL"][..],
-            _ => return None,
-        };
+        let candidates = Self::CLAUDE_ROLE_SOURCE_FALLBACK
+            .iter()
+            .find(|(role, _)| *role == model_key)
+            .map(|(_, keys)| *keys)?;
         candidates
             .iter()
             .find(|key| Self::claude_env_string(env, key).is_some())
