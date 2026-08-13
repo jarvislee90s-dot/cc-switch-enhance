@@ -178,6 +178,10 @@ export function migrateLegacyModelSuffixes(config: string): string {
 
   const env = isRecord(parsed.env) ? parsed.env : undefined;
   if (!env) return config;
+  if (parsed.contextWindows !== undefined && !isRecord(parsed.contextWindows)) {
+    // 与 Rust migrate_legacy_suffix_to_context_windows 一致：形状非法时不迁移
+    return config;
+  }
 
   const contextWindows = isRecord(parsed.contextWindows)
     ? parsed.contextWindows
@@ -188,8 +192,12 @@ export function migrateLegacyModelSuffixes(config: string): string {
     if (typeof current !== "string") continue;
     const parsedSuffix = parseModelSuffix(current);
     if (parsedSuffix.window === undefined) continue;
+    // 与 Rust migrate_legacy_suffix_to_context_windows 对齐：始终剥离 env 后缀，
+    // 但 contextWindows 只在键缺失时填充，已存在的用户配置不被后缀覆盖。
     env[field] = parsedSuffix.slug;
-    contextWindows[field] = parsedSuffix.window;
+    if (!(field in contextWindows)) {
+      contextWindows[field] = parsedSuffix.window;
+    }
     changed = true;
   }
   if (!changed) return config;
@@ -376,7 +384,12 @@ export function useModelState({
               : "";
           const window =
             parseModelSuffix(oldModel).window ?? parseModelSuffix(value).window;
-          if (window !== undefined) {
+          if (
+            window !== undefined &&
+            readContextWindows(JSON.stringify(currentConfig))[field] ===
+              undefined
+          ) {
+            // 只迁移缺失键，避免旧模型后缀覆盖用户已显式配置的 contextWindows
             currentConfig = JSON.parse(
               writeContextWindow(JSON.stringify(currentConfig), field, window),
             );

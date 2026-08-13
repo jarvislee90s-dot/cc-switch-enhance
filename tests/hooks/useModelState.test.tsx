@@ -165,6 +165,35 @@ describe("useModelState", () => {
     );
   });
 
+  it("handleModelChange 不以后缀覆盖已配置的 contextWindows", () => {
+    let latestConfig = JSON.stringify({
+      env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "glm-5.2[200k]" },
+      contextWindows: { ANTHROPIC_DEFAULT_SONNET_MODEL: 300000 },
+    });
+    const onConfigChange = vi.fn((config: string) => {
+      latestConfig = config;
+    });
+
+    const { result } = renderHook(() =>
+      useModelState({
+        settingsConfig: latestConfig,
+        onConfigChange,
+      }),
+    );
+
+    act(() => {
+      result.current.handleModelChange(
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "glm-5.3",
+      );
+    });
+
+    const parsed = JSON.parse(latestConfig);
+    expect(parsed.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("glm-5.3");
+    // 用户显式配置的窗口保留，旧后缀只用于缺失键迁移
+    expect(parsed.contextWindows.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe(300000);
+  });
+
   it("handleModelChange 将旧模型后缀迁移到 contextWindows", () => {
     let latestConfig = JSON.stringify({
       env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "glm-5.2[200k]" },
@@ -527,7 +556,9 @@ describe("migrateLegacyModelSuffixes", () => {
     expect(parsed.contextWindows.ANTHROPIC_DEFAULT_SONNET_MODEL).toBeUndefined();
   });
 
-  it("已有 contextWindows 时合并而非覆盖", () => {
+  it("已有 contextWindows 时保留用户值，不以后缀覆盖", () => {
+    // 与 Rust migrate_legacy_suffix_to_context_windows 一致：只填充缺失键，
+    // 已存在的 contextWindows 是用户显式配置，不能被子遗留后缀覆盖。
     const config = JSON.stringify({
       env: { ANTHROPIC_MODEL: "deepseek[200k]" },
       contextWindows: {
@@ -536,7 +567,8 @@ describe("migrateLegacyModelSuffixes", () => {
       },
     });
     const parsed = JSON.parse(migrateLegacyModelSuffixes(config));
-    expect(parsed.contextWindows.ANTHROPIC_MODEL).toBe(200000);
+    expect(parsed.env.ANTHROPIC_MODEL).toBe("deepseek");
+    expect(parsed.contextWindows.ANTHROPIC_MODEL).toBe(999);
     expect(parsed.contextWindows.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe(160000);
   });
 
@@ -550,6 +582,16 @@ describe("migrateLegacyModelSuffixes", () => {
   it("非法后缀不迁移", () => {
     const config = JSON.stringify({
       env: { ANTHROPIC_MODEL: "deepseek[1.5m]" },
+    });
+    expect(migrateLegacyModelSuffixes(config)).toBe(config);
+  });
+
+  it("contextWindows 形状非法时整体跳过迁移", () => {
+    // 与 Rust migrate_legacy_suffix_to_context_windows 一致：非对象 contextWindows
+    // 不改写 env，避免把用户数据悄悄重置为空对象。
+    const config = JSON.stringify({
+      env: { ANTHROPIC_MODEL: "deepseek[200k]" },
+      contextWindows: [],
     });
     expect(migrateLegacyModelSuffixes(config)).toBe(config);
   });
