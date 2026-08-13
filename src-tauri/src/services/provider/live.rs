@@ -71,24 +71,71 @@ pub(crate) fn is_kimi_for_coding_provider(provider: &Provider) -> bool {
         == Some("https://api.kimi.com/coding")
 }
 
-const CLAUDE_CONTEXT_WINDOW_ENV_KEYS: [&str; 2] = [
-    "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
-    "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
-];
+/// Kimi / Codex OAuth 静态回退窗口的单一来源（F6/D3）：
+/// 返回 (ACW, MAX) 字符串对，5 处调用点统一引用，行为由维护者 P1-2 固定：
+/// Kimi For Coding 262144、Codex OAuth（env 全部指向 gpt-5.6）372000。
+pub(crate) fn static_context_window_fallback(
+    provider: &Provider,
+) -> Option<(&'static str, &'static str)> {
+    let provider_env = provider
+        .settings_config
+        .get("env")
+        .and_then(Value::as_object);
+    if provider.is_codex_oauth() && provider_env_targets_gpt56(provider_env) {
+        Some((
+            CODEX_OAUTH_CLAUDE_AUTO_COMPACT_WINDOW,
+            CODEX_OAUTH_CLAUDE_MAX_CONTEXT_TOKENS,
+        ))
+    } else if is_kimi_for_coding_provider(provider) {
+        Some((
+            KIMI_FOR_CODING_CONTEXT_TOKENS,
+            KIMI_FOR_CODING_CONTEXT_TOKENS,
+        ))
+    } else {
+        None
+    }
+}
 
-fn record_static_injected(settings: &mut Value, acw: &str, max: &str) {
-    let Some(obj) = settings.as_object_mut() else {
-        return;
-    };
-    let state = obj.entry("autoSyncState").or_insert_with(|| json!({}));
+/// 获取或创建 settings 顶层 autoSyncState 的 &mut Value（统一 get-or-create 样板）。
+pub(crate) fn auto_sync_state_value_mut(settings: &mut Value) -> Option<&mut Value> {
+    let obj = settings.as_object_mut()?;
+    let state = obj
+        .entry("autoSyncState".to_string())
+        .or_insert_with(|| json!({}));
     if !state.is_object() {
         *state = json!({});
     }
-    let state = state.as_object_mut().expect("autoSyncState object");
-    state.insert(
-        "staticInjected".to_string(),
-        json!({ "ACW": acw, "MAX": max }),
-    );
+    Some(state)
+}
+
+/// 获取或创建 settings 顶层 autoSyncState 对象。
+pub(crate) fn auto_sync_state_mut(
+    settings: &mut Value,
+) -> Option<&mut serde_json::Map<String, Value>> {
+    auto_sync_state_value_mut(settings)?.as_object_mut()
+}
+
+/// 获取或创建 autoSyncState.userExplicit 对象。
+pub(crate) fn user_explicit_mut(
+    settings: &mut Value,
+) -> Option<&mut serde_json::Map<String, Value>> {
+    let state = auto_sync_state_mut(settings)?;
+    let explicit = state
+        .entry("userExplicit".to_string())
+        .or_insert_with(|| json!({}));
+    if !explicit.is_object() {
+        *explicit = json!({});
+    }
+    explicit.as_object_mut()
+}
+
+fn record_static_injected(settings: &mut Value, acw: &str, max: &str) {
+    if let Some(state) = auto_sync_state_mut(settings) {
+        state.insert(
+            "staticInjected".to_string(),
+            json!({ "ACW": acw, "MAX": max }),
+        );
+    }
 }
 
 fn clear_static_injected(settings: &mut Value) {
@@ -103,18 +150,19 @@ fn clear_static_injected(settings: &mut Value) {
 /// Claude Code assigns unknown non-Claude model ids a 200K context window.
 /// Codex OAuth deliberately exposes GPT ids through Claude Code, so enrich the
 /// effective live settings for both newly-created and already-saved providers.
-/// Explicit user values always win; the defaults are only injected when every
-/// configured model targets gpt-5.6.
-fn apply_codex_oauth_claude_context_defaults(settings: &mut Value, provider: &Provider) {
-    if !provider.is_codex_oauth() {
+/// Explicit user values always win; the static defaults (Kimi 262144 / Codex
+/// OAuth gpt-5.6 372000) are only injected when the provider kind applies.
+/// 非静态供应商直接返回，不碰 apply_context_window_defaults 已写好的 staticInjected。
+fn apply_static_context_defaults(settings: &mut Value, provider: &Provider) {
+    if !provider.is_codex_oauth() && !is_kimi_for_coding_provider(provider) {
         return;
     }
 
+    let fallback = static_context_window_fallback(provider);
     let provider_env = provider
         .settings_config
         .get("env")
         .and_then(Value::as_object);
-    let inject_defaults = provider_env_targets_gpt56(provider_env);
     let (has_explicit, injected_count) = {
         let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) else {
             return;
@@ -124,17 +172,18 @@ fn apply_codex_oauth_claude_context_defaults(settings: &mut Value, provider: &Pr
         for (key, default_value) in [
             (
                 "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
-                CODEX_OAUTH_CLAUDE_MAX_CONTEXT_TOKENS,
+                fallback.map(|(_acw, max)| max),
             ),
             (
                 "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
-                CODEX_OAUTH_CLAUDE_AUTO_COMPACT_WINDOW,
+                fallback.map(|(acw, _max)| acw),
             ),
         ] {
             if let Some(value) = provider_env.and_then(|provider_env| provider_env.get(key)) {
+                // 显式 provider 值优先，覆盖 common config 的注入值
                 env.insert(key.to_string(), value.clone());
                 has_explicit = true;
-            } else if inject_defaults {
+            } else if let Some(default_value) = default_value {
                 env.insert(key.to_string(), Value::String(default_value.to_string()));
                 injected_count += 1;
             }
@@ -145,57 +194,9 @@ fn apply_codex_oauth_claude_context_defaults(settings: &mut Value, provider: &Pr
     if has_explicit {
         clear_static_injected(settings);
     } else if injected_count == 2 {
-        record_static_injected(
-            settings,
-            CODEX_OAUTH_CLAUDE_AUTO_COMPACT_WINDOW,
-            CODEX_OAUTH_CLAUDE_MAX_CONTEXT_TOKENS,
-        );
-    }
-}
-
-/// Kimi For Coding serves a 256K window, but Claude Code caps unknown models at
-/// 200K unless `CLAUDE_CODE_MAX_CONTEXT_TOKENS` is set — and that env is ignored
-/// for `claude-`-prefixed ids, so these defaults only bite when the provider also
-/// routes the endpoint's `kimi-for-coding` alias (the preset does). Keep the
-/// defaults provider-owned so an old shared snippet cannot override them.
-fn apply_kimi_for_coding_context_defaults(settings: &mut Value, provider: &Provider) {
-    if !is_kimi_for_coding_provider(provider) {
-        return;
-    }
-
-    let provider_env = provider
-        .settings_config
-        .get("env")
-        .and_then(Value::as_object);
-    let (has_explicit, injected_count) = {
-        let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) else {
-            return;
-        };
-        let mut has_explicit = false;
-        let mut injected_count = 0;
-        for key in CLAUDE_CONTEXT_WINDOW_ENV_KEYS {
-            if let Some(value) = provider_env.and_then(|provider_env| provider_env.get(key)) {
-                env.insert(key.to_string(), value.clone());
-                has_explicit = true;
-            } else {
-                env.insert(
-                    key.to_string(),
-                    Value::String(KIMI_FOR_CODING_CONTEXT_TOKENS.to_string()),
-                );
-                injected_count += 1;
-            }
+        if let Some((acw, max)) = fallback {
+            record_static_injected(settings, acw, max);
         }
-        (has_explicit, injected_count)
-    };
-
-    if has_explicit {
-        clear_static_injected(settings);
-    } else if injected_count == 2 {
-        record_static_injected(
-            settings,
-            KIMI_FOR_CODING_CONTEXT_TOKENS,
-            KIMI_FOR_CODING_CONTEXT_TOKENS,
-        );
     }
 }
 
@@ -324,16 +325,9 @@ fn merge_auto_sync_state_into_provider(provider_settings: &mut Value, effective_
     else {
         return;
     };
-    let Some(provider_obj) = provider_settings.as_object_mut() else {
+    let Some(state) = auto_sync_state_mut(provider_settings) else {
         return;
     };
-    let state = provider_obj
-        .entry("autoSyncState")
-        .or_insert_with(|| json!({}));
-    if !state.is_object() {
-        *state = json!({});
-    }
-    let state = state.as_object_mut().expect("autoSyncState object");
     if let Some(static_injected) = effective_state.get("staticInjected") {
         state.insert("staticInjected".to_string(), static_injected.clone());
     } else {
@@ -343,15 +337,10 @@ fn merge_auto_sync_state_into_provider(provider_settings: &mut Value, effective_
         .get("userExplicit")
         .and_then(Value::as_object)
     {
-        let target = state
-            .entry("userExplicit".to_string())
-            .or_insert_with(|| json!({}));
-        if !target.is_object() {
-            *target = json!({});
-        }
-        let target = target.as_object_mut().expect("userExplicit object");
-        for (key, value) in user_explicit {
-            target.insert(key.clone(), value.clone());
+        if let Some(target) = user_explicit_mut(provider_settings) {
+            for (key, value) in user_explicit {
+                target.insert(key.clone(), value.clone());
+            }
         }
     }
 }
@@ -867,15 +856,9 @@ fn merge_watcher_auto_sync_state(stored_settings: &mut Value, watcher_settings: 
     let Some(watcher_state) = watcher_settings.get("autoSyncState") else {
         return;
     };
-    let Some(stored_obj) = stored_settings.as_object_mut() else {
+    let Some(stored_state) = auto_sync_state_value_mut(stored_settings) else {
         return;
     };
-    let stored_state = stored_obj
-        .entry("autoSyncState".to_string())
-        .or_insert_with(|| json!({}));
-    if !stored_state.is_object() {
-        *stored_state = json!({});
-    }
     json_deep_merge(stored_state, watcher_state);
 }
 
@@ -1024,8 +1007,7 @@ pub(crate) fn build_effective_settings_with_common_config(
         restore_claude_subagent_local_marker_for_effective(&mut effective_settings, provider);
         // contextWindows 先注入；Kimi/Codex OAuth 固定兜底后写，避免 staticInjected 被误判为显式清掉。
         apply_context_window_defaults(&mut effective_settings, provider);
-        apply_codex_oauth_claude_context_defaults(&mut effective_settings, provider);
-        apply_kimi_for_coding_context_defaults(&mut effective_settings, provider);
+        apply_static_context_defaults(&mut effective_settings, provider);
     }
 
     Ok(effective_settings)
@@ -1063,7 +1045,7 @@ fn apply_stored_user_explicit_values(provider: &Provider, settings: &mut Value) 
     let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) else {
         return;
     };
-    for (env_key, short_key) in CLAUDE_BACKFILL_CONTEXT_KEYS {
+    for (env_key, short_key) in crate::claude_desktop_config::CLAUDE_CONTEXT_WINDOW_LEDGER_KEYS {
         if let Some(value) = stored_user_explicit_value(provider, short_key) {
             env.insert(env_key.to_string(), Value::String(value));
         }
@@ -1073,7 +1055,7 @@ fn apply_stored_user_explicit_values(provider: &Provider, settings: &mut Value) 
 fn merge_manual_live_context_windows(live: &Value, provider: &Provider, settings: &mut Value) {
     let mut manual_acw = None;
     let mut manual_max = None;
-    for (env_key, short_key) in CLAUDE_BACKFILL_CONTEXT_KEYS {
+    for (env_key, short_key) in crate::claude_desktop_config::CLAUDE_CONTEXT_WINDOW_LEDGER_KEYS {
         let Some(live_value) = live
             .get("env")
             .and_then(Value::as_object)
@@ -1120,23 +1102,9 @@ fn merge_manual_live_context_windows(live: &Value, provider: &Provider, settings
             Value::String(value.clone()),
         );
     }
-    let Some(obj) = settings.as_object_mut() else {
+    let Some(explicit) = user_explicit_mut(settings) else {
         return;
     };
-    let state = obj
-        .entry("autoSyncState".to_string())
-        .or_insert_with(|| json!({}));
-    if !state.is_object() {
-        *state = json!({});
-    }
-    let state = state.as_object_mut().expect("autoSyncState object");
-    let explicit = state
-        .entry("userExplicit".to_string())
-        .or_insert_with(|| json!({}));
-    if !explicit.is_object() {
-        *explicit = json!({});
-    }
-    let explicit = explicit.as_object_mut().expect("userExplicit object");
     if let Some(value) = manual_acw {
         explicit.insert("ACW".to_string(), Value::String(value));
     }
@@ -1254,59 +1222,26 @@ pub(crate) fn strip_common_config_from_live_settings(
 /// 之后调整默认值或更换模型时旧值永远压住新默认。仅当"注入会发生且注入的
 /// 就是这个值、且存储配置本来没有显式值"时才剥；用户显式存储的值和手改
 /// live 成其他数字的值都保留。
-fn strip_injected_codex_oauth_context_defaults(settings: &mut Value, provider: &Provider) {
-    if !provider.is_codex_oauth() {
+fn strip_injected_static_context_defaults(settings: &mut Value, provider: &Provider) {
+    let Some((acw, max)) = static_context_window_fallback(provider) else {
         return;
-    }
+    };
     let provider_env = provider
         .settings_config
         .get("env")
         .and_then(Value::as_object);
-    if !provider_env_targets_gpt56(provider_env) {
-        return;
-    }
     let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) else {
         return;
     };
     for (key, default_value) in [
-        (
-            "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
-            CODEX_OAUTH_CLAUDE_MAX_CONTEXT_TOKENS,
-        ),
-        (
-            "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
-            CODEX_OAUTH_CLAUDE_AUTO_COMPACT_WINDOW,
-        ),
+        ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", max),
+        ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", acw),
     ] {
         let stored_explicit = provider_env.is_some_and(|e| e.contains_key(key));
         if stored_explicit {
             continue;
         }
         if env.get(key).and_then(Value::as_str) == Some(default_value) {
-            env.remove(key);
-        }
-    }
-}
-
-fn strip_injected_kimi_for_coding_context_defaults(settings: &mut Value, provider: &Provider) {
-    if !is_kimi_for_coding_provider(provider) {
-        return;
-    }
-    let provider_env = provider
-        .settings_config
-        .get("env")
-        .and_then(Value::as_object);
-    let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) else {
-        return;
-    };
-    for key in [
-        "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
-        "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
-    ] {
-        if provider_env.is_some_and(|provider_env| provider_env.contains_key(key)) {
-            continue;
-        }
-        if env.get(key).and_then(Value::as_str) == Some(KIMI_FOR_CODING_CONTEXT_TOKENS) {
             env.remove(key);
         }
     }
@@ -1343,11 +1278,6 @@ fn strip_injected_model_suffix_context_defaults(settings: &mut Value, provider: 
         }
     }
 }
-
-const CLAUDE_BACKFILL_CONTEXT_KEYS: [(&str, &str); 2] = [
-    ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "ACW"),
-    ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "MAX"),
-];
 
 fn provider_env_has_explicit_value(provider: &Provider, env_key: &str) -> bool {
     provider
@@ -1409,8 +1339,7 @@ fn backfill_auto_source_value(
 }
 
 fn strip_legacy_context_defaults_for_backfill(settings: &mut Value, provider: &Provider) {
-    strip_injected_codex_oauth_context_defaults(settings, provider);
-    strip_injected_kimi_for_coding_context_defaults(settings, provider);
+    strip_injected_static_context_defaults(settings, provider);
     strip_injected_model_suffix_context_defaults(settings, provider);
 }
 
@@ -1459,7 +1388,8 @@ fn strip_auto_synced_context_defaults(settings: &mut Value, provider: &Provider)
         let Some(env) = settings.get("env").and_then(Value::as_object) else {
             return;
         };
-        for (env_key, short_key) in CLAUDE_BACKFILL_CONTEXT_KEYS {
+        for (env_key, short_key) in crate::claude_desktop_config::CLAUDE_CONTEXT_WINDOW_LEDGER_KEYS
+        {
             let Some(live_value) = env.get(env_key).and_then(Value::as_str) else {
                 continue;
             };

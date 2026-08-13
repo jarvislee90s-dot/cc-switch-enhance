@@ -51,22 +51,11 @@ pub(crate) fn resolve_active_model_window(
     };
     // 3. 优先读取 contextWindows 显式窗口，其次回退到 env 模型名后缀；
     // 两者都没有时，保留 Codex OAuth / Kimi 的固定兜底窗口。
-    let provider_env = provider
-        .settings_config
-        .get("env")
-        .and_then(Value::as_object);
     let window =
         crate::claude_desktop_config::resolve_context_window(&provider.settings_config, env_key)
             .or_else(|| {
-                if provider.is_codex_oauth()
-                    && crate::services::provider::provider_env_targets_gpt56(provider_env)
-                {
-                    Some(372000)
-                } else if crate::services::provider::is_kimi_for_coding_provider(provider) {
-                    Some(262144)
-                } else {
-                    None
-                }
+                crate::services::provider::static_context_window_fallback(provider)
+                    .and_then(|(acw, _max)| acw.parse().ok())
             });
     window.map(|w| ActiveModelWindow {
         model: model.to_string(),
@@ -97,19 +86,7 @@ enum AutoTarget {
 /// 收集 provider 中所有角色可用窗口：contextWindows 优先，其次模型名后缀，
 /// 并额外包含 Codex OAuth / Kimi 的固定兜底 ACW/MAX 原始对。
 fn configured_role_auto_targets(provider: &Provider) -> Vec<AutoTarget> {
-    let provider_env = provider
-        .settings_config
-        .get("env")
-        .and_then(Value::as_object);
-    let static_fallback = if provider.is_codex_oauth()
-        && crate::services::provider::provider_env_targets_gpt56(provider_env)
-    {
-        Some(("372000", "372000"))
-    } else if crate::services::provider::is_kimi_for_coding_provider(provider) {
-        Some(("262144", "262144"))
-    } else {
-        None
-    };
+    let static_fallback = crate::services::provider::static_context_window_fallback(provider);
 
     let mut targets = WATCHER_ROLE_ENV_KEYS
         .iter()
@@ -408,13 +385,8 @@ fn handle_settings_change(
 
     // 6. 只有静态注入实际生效的路径需要跳过：Kimi 固定注入，或 Codex OAuth 的
     // env 模型全部指向 gpt-5.6。其他 Codex OAuth 配置仍按 contextWindows 增强。
-    let provider_env = provider
-        .settings_config
-        .get("env")
-        .and_then(Value::as_object);
-    let static_injection_active = crate::services::provider::is_kimi_for_coding_provider(&provider)
-        || (provider.is_codex_oauth()
-            && crate::services::provider::provider_env_targets_gpt56(provider_env));
+    let static_injection_active =
+        crate::services::provider::static_context_window_fallback(&provider).is_some();
     if static_injection_active {
         log::debug!(
             "[ClaudeSettingsWatcher] static ACW/MAX for {}, skip watcher rewrite",
@@ -485,23 +457,11 @@ fn persist_settings(persist: &PersistSettingsCallback, provider: &Provider) -> b
 }
 
 fn record_user_explicit(provider: &mut Provider, acw: Option<&str>, max: Option<&str>) {
-    let Some(obj) = provider.settings_config.as_object_mut() else {
+    let Some(explicit) =
+        crate::services::provider::user_explicit_mut(&mut provider.settings_config)
+    else {
         return;
     };
-    let state = obj
-        .entry("autoSyncState".to_string())
-        .or_insert_with(|| serde_json::json!({}));
-    if !state.is_object() {
-        *state = serde_json::json!({});
-    }
-    let state = state.as_object_mut().expect("autoSyncState object");
-    let explicit = state
-        .entry("userExplicit".to_string())
-        .or_insert_with(|| serde_json::json!({}));
-    if !explicit.is_object() {
-        *explicit = serde_json::json!({});
-    }
-    let explicit = explicit.as_object_mut().expect("userExplicit object");
     if let Some(value) = acw {
         explicit.insert("ACW".to_string(), Value::String(value.to_string()));
     }
@@ -511,27 +471,20 @@ fn record_user_explicit(provider: &mut Provider, acw: Option<&str>, max: Option<
 }
 
 fn record_last_written(provider: &mut Provider, acw: &str, max: &str) {
-    let Some(obj) = provider.settings_config.as_object_mut() else {
-        return;
-    };
-    let state = obj
-        .entry("autoSyncState".to_string())
-        .or_insert_with(|| serde_json::json!({}));
-    if !state.is_object() {
-        *state = serde_json::json!({});
+    if let Some(state) =
+        crate::services::provider::auto_sync_state_mut(&mut provider.settings_config)
+    {
+        state.insert(
+            "lastWritten".to_string(),
+            serde_json::json!({ "ACW": acw, "MAX": max }),
+        );
     }
-    state.as_object_mut().expect("autoSyncState object").insert(
-        "lastWritten".to_string(),
-        serde_json::json!({ "ACW": acw, "MAX": max }),
-    );
 }
 
 fn legacy_env_key(key: &str) -> Option<&'static str> {
-    match key {
-        "ACW" => Some("CLAUDE_CODE_AUTO_COMPACT_WINDOW"),
-        "MAX" => Some("CLAUDE_CODE_MAX_CONTEXT_TOKENS"),
-        _ => None,
-    }
+    crate::claude_desktop_config::CLAUDE_CONTEXT_WINDOW_LEDGER_KEYS
+        .iter()
+        .find_map(|(env_key, short_key)| (*short_key == key).then_some(*env_key))
 }
 
 fn is_user_explicit(provider: &Provider, key: &str) -> bool {

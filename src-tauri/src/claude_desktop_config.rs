@@ -88,6 +88,12 @@ pub(crate) const CLAUDE_MODEL_ENV_KEYS: [&str; 6] = [
     "CLAUDE_CODE_SUBAGENT_MODEL",
 ];
 
+/// Claude ACW/MAX env 键 ↔ autoSyncState 账本短键映射，全项目单一来源。
+pub(crate) const CLAUDE_CONTEXT_WINDOW_LEDGER_KEYS: [(&str, &str); 2] = [
+    ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "ACW"),
+    ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "MAX"),
+];
+
 pub(crate) fn migrate_legacy_suffix_to_context_windows(
     settings_config: &mut serde_json::Value,
 ) -> bool {
