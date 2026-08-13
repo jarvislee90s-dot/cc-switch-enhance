@@ -11,6 +11,67 @@ const CLAUDE_CONTEXT_WINDOW_STATE_KEYS = {
 const AUTO_SYNC_COMPACT_RATIO_MIN = 0.2;
 const AUTO_SYNC_COMPACT_RATIO_MAX = 0.95;
 
+/**
+ * 解析 autoSyncContextWindow 有效值：显式字段优先；字段缺失时以
+ * autoSyncState 账本为主信号（lastWritten/staticInjected 有 ACW/MAX 记录 →
+ * 视为开启），辅以 env ACW/MAX 命中 contextWindows 推导目标进一步确认，
+ * 衔接用户更新前的状态，避免升级后行为突变。
+ */
+export function resolveAutoSyncContextWindow(config: string): boolean {
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(config || "{}") as Record<string, unknown>;
+  } catch {
+    return false;
+  }
+  if (typeof parsed.autoSyncContextWindow === "boolean") {
+    return parsed.autoSyncContextWindow;
+  }
+  const state = parsed.autoSyncState;
+  if (isRecord(state)) {
+    for (const source of ["lastWritten", "staticInjected"] as const) {
+      const src = state[source];
+      if (
+        isRecord(src) &&
+        ["ACW", "MAX"].some(
+          (shortKey) =>
+            src[shortKey] !== undefined &&
+            src[shortKey] !== null &&
+            src[shortKey] !== false,
+        )
+      ) {
+        return true;
+      }
+    }
+  }
+  const env = parsed.env;
+  const contextWindows = parsed.contextWindows;
+  if (isRecord(env) && isRecord(contextWindows)) {
+    const ratio =
+      typeof parsed.autoSyncCompactRatio === "number" &&
+      Number.isFinite(parsed.autoSyncCompactRatio) &&
+      parsed.autoSyncCompactRatio >= AUTO_SYNC_COMPACT_RATIO_MIN &&
+      parsed.autoSyncCompactRatio <= AUTO_SYNC_COMPACT_RATIO_MAX
+        ? parsed.autoSyncCompactRatio
+        : 0.95;
+    const targets = new Set<string>();
+    for (const value of Object.values(contextWindows)) {
+      if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+        continue;
+      }
+      targets.add(String(Math.floor(value * ratio)));
+      targets.add(String(value));
+    }
+    for (const envKey of CLAUDE_CONTEXT_WINDOW_ENV_KEYS) {
+      const liveValue = env[envKey];
+      if (typeof liveValue === "string" && targets.has(liveValue)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 function removeClaudeContextWindowEnvFields(config: Record<string, unknown>) {
   const env = config.env;
   if (!env || typeof env !== "object" || Array.isArray(env)) return;

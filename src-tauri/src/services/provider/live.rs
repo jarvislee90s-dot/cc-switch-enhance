@@ -1161,6 +1161,18 @@ pub(crate) fn write_live_with_common_config(
         let mut updated_config = provider.settings_config.clone();
         normalize_claude_models_in_value(&mut updated_config);
         crate::claude_desktop_config::migrate_legacy_suffix_to_context_windows(&mut updated_config);
+        // F5：字段缺失但账本有记录时物化 autoSyncContextWindow: true，
+        // 避免升级后行为突变；显式字段缺失才补，显式 false 保持尊重。
+        if updated_config.get("autoSyncContextWindow").is_none()
+            && crate::claude_settings_watcher::auto_sync_ledger_has_auto_records(
+                &effective_provider.settings_config,
+            )
+        {
+            updated_config
+                .as_object_mut()
+                .expect("settings config should be an object")
+                .insert("autoSyncContextWindow".to_string(), serde_json::json!(true));
+        }
         merge_auto_sync_state_into_provider(
             &mut updated_config,
             &effective_provider.settings_config,
@@ -3179,7 +3191,7 @@ mod tests {
         assert_eq!(live["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"], "glm-5.2");
         assert_eq!(live["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], "subagent-model");
         assert_eq!(live["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "1000000");
-        assert_eq!(live["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "1000000");
+        assert_eq!(live["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "950000");
         assert!(live.get("contextWindows").is_none());
         assert!(live.get("autoSyncState").is_none());
 
@@ -3201,7 +3213,7 @@ mod tests {
         );
         assert_eq!(
             stored.settings_config["autoSyncState"]["staticInjected"],
-            json!({ "ACW": "1000000", "MAX": "1000000" })
+            json!({ "ACW": "950000", "MAX": "1000000" })
         );
         assert_eq!(
             stored.settings_config["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"],
@@ -3267,6 +3279,47 @@ mod tests {
         assert_eq!(
             stored.settings_config["contextWindows"]["ANTHROPIC_DEFAULT_SONNET_MODEL"],
             json!(200000)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn write_live_with_common_config_materializes_auto_sync_from_ledger() {
+        // F5：autoSyncContextWindow 字段缺失但账本有记录时，保存应物化
+        // autoSyncContextWindow: true 写回 DB，衔接用户更新前的状态。
+        let _home = TempHome::new();
+        let _test_watcher_unset = EnvVarGuard::remove("CC_SWITCH_TEST_WATCHER");
+        crate::claude_settings_watcher::clear_watcher_slot_for_tests();
+        let db = Database::memory().expect("create memory db");
+        let provider = Provider::with_id(
+            "ledger-on".to_string(),
+            "Ledger On".to_string(),
+            json!({
+                "env": { "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2" },
+                "contextWindows": { "ANTHROPIC_DEFAULT_SONNET_MODEL": 200000 },
+                "autoSyncState": {
+                    "lastWritten": { "ACW": "190000", "MAX": "200000" }
+                }
+            }),
+            None,
+        );
+        assert!(provider
+            .settings_config
+            .get("autoSyncContextWindow")
+            .is_none());
+        db.save_provider(AppType::Claude.as_str(), &provider)
+            .expect("save provider");
+
+        write_live_with_common_config(&db, &AppType::Claude, &provider).expect("write live");
+
+        let stored = db
+            .get_provider_by_id("ledger-on", AppType::Claude.as_str())
+            .expect("get provider")
+            .expect("stored provider exists");
+        assert_eq!(stored.settings_config["autoSyncContextWindow"], json!(true));
+        assert_eq!(
+            stored.settings_config["autoSyncState"]["lastWritten"],
+            json!({ "ACW": "190000", "MAX": "200000" })
         );
     }
 
@@ -4180,11 +4233,11 @@ base_url = "https://a.example/v1"
         );
         assert_eq!(
             effective["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
-            "1000000"
+            "950000"
         );
         assert_eq!(
             effective["autoSyncState"]["staticInjected"],
-            json!({ "ACW": "1000000", "MAX": "1000000" })
+            json!({ "ACW": "950000", "MAX": "1000000" })
         );
     }
 
@@ -4306,7 +4359,7 @@ base_url = "https://a.example/v1"
         );
         assert_eq!(
             effective["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
-            "1000000"
+            "950000"
         );
     }
 
@@ -4344,7 +4397,7 @@ base_url = "https://a.example/v1"
         );
         assert_eq!(
             effective["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
-            "1000000"
+            "950000"
         );
     }
 
@@ -4378,7 +4431,7 @@ base_url = "https://a.example/v1"
         );
         assert_eq!(
             effective["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
-            "1000000"
+            "950000"
         );
     }
 
@@ -4533,7 +4586,7 @@ base_url = "https://a.example/v1"
             "autoSyncState": {}
         });
 
-        apply_kimi_for_coding_context_defaults(&mut settings, &provider);
+        apply_static_context_defaults(&mut settings, &provider);
         apply_context_window_defaults(&mut settings, &provider);
 
         assert_eq!(
@@ -4612,7 +4665,7 @@ base_url = "https://a.example/v1"
         );
         assert_eq!(
             effective["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
-            "1000000"
+            "950000"
         );
     }
 
@@ -4640,7 +4693,7 @@ base_url = "https://a.example/v1"
         );
         assert_eq!(
             effective["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
-            "1000000"
+            "950000"
         );
     }
 
@@ -4875,7 +4928,7 @@ base_url = "https://a.example/v1"
         // live 会注入 ACW/MAX，并剥离旧后缀
         assert_eq!(live["env"]["ANTHROPIC_MODEL"], "fallback-model");
         assert_eq!(live["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "1000000");
-        assert_eq!(live["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "1000000");
+        assert_eq!(live["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "950000");
 
         // 注入产物只应活在 live，切走回填后必须剥掉
         let backfilled =
@@ -5146,7 +5199,7 @@ base_url = "https://a.example/v1"
     fn backfill_falls_back_per_key_when_ledger_has_only_other_key() {
         let mut settings = json!({
             "env": {
-                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1000000",
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "950000",
                 "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "250000"
             }
         });
@@ -5242,7 +5295,7 @@ base_url = "https://a.example/v1"
     fn backfill_ignores_non_string_short_user_explicit_marker() {
         let mut settings = json!({
             "env": {
-                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1000000",
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "950000",
                 "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "250000"
             }
         });

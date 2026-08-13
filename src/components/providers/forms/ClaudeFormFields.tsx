@@ -69,6 +69,7 @@ import {
 import {
   applyAutoSyncCompactRatioSetting,
   applyAutoSyncContextWindowSetting,
+  resolveAutoSyncContextWindow,
 } from "@/utils/settingsConfigMerge";
 
 interface EndpointCandidate {
@@ -299,28 +300,14 @@ export function ClaudeFormFields({
   // 更新 settingsConfig，但 react-hook-form 的 setValue 默认不触发 re-render，
   // 直接派生会导致 Switch 点击后 checked 不更新（看起来"不能切换"）。
   // local state 立即响应点击，useEffect 在 settingsConfig 外部变化时同步。
-  const [autoSyncContextWindow, setAutoSyncContextWindow] = useState(() => {
-    try {
-      const parsed = JSON.parse(settingsConfig ?? "{}");
-      return (parsed as Record<string, unknown>).autoSyncContextWindow === true;
-    } catch {
-      return false;
-    }
-  });
+  const [autoSyncContextWindow, setAutoSyncContextWindow] = useState(() =>
+    resolveAutoSyncContextWindow(settingsConfig ?? "{}"),
+  );
 
   useEffect(() => {
-    if (!settingsConfig) {
-      setAutoSyncContextWindow(false);
-      return;
-    }
-    try {
-      const parsed = JSON.parse(settingsConfig ?? "{}");
-      setAutoSyncContextWindow(
-        (parsed as Record<string, unknown>).autoSyncContextWindow === true,
-      );
-    } catch {
-      setAutoSyncContextWindow(false);
-    }
+    setAutoSyncContextWindow(
+      resolveAutoSyncContextWindow(settingsConfig ?? "{}"),
+    );
   }, [settingsConfig]);
 
   const [autoSyncCompactRatioInput, setAutoSyncCompactRatioInput] = useState(
@@ -1265,7 +1252,7 @@ export function ClaudeFormFields({
             <p className="mt-1.5 ml-1 text-xs leading-relaxed text-muted-foreground">
               {t("providerForm.autoSyncCompactRatioHint", {
                 defaultValue:
-                  "该参数是模型自动压缩上下文窗口的比例，范围 0.2~0.95，留空按 1 处理。",
+                  "该参数是模型自动压缩上下文窗口的比例，范围 0.2~0.95，留空按 0.95 处理。",
               })}
             </p>
 

@@ -63,14 +63,14 @@ pub(crate) fn resolve_active_model_window(
     })
 }
 
-/// 读取 provider 的自动压缩比例，缺失或非法时默认 1。
+/// 读取 provider 的自动压缩比例，缺失或非法时默认 0.95。
 pub(crate) fn provider_compact_ratio(provider: &Provider) -> f64 {
     provider
         .settings_config
         .get("autoSyncCompactRatio")
         .and_then(Value::as_f64)
         .filter(|ratio| ratio.is_finite() && (0.2..=0.95).contains(ratio))
-        .unwrap_or(1.0)
+        .unwrap_or(0.95)
 }
 
 /// Claude Code 中可配置模型角色对应的 env key，和 live 注入逻辑保持一致。
@@ -113,7 +113,7 @@ pub(crate) fn build_env_writes(window: u64, ratio: f64) -> Vec<(&'static str, St
     let ratio = if ratio.is_finite() && (0.2..=0.95).contains(&ratio) {
         ratio
     } else {
-        1.0
+        0.95
     };
     let acw = ((window as f64) * ratio).floor() as u64;
     vec![
@@ -353,13 +353,8 @@ fn handle_settings_change(
         .expect("settings watcher provider mutex poisoned");
     let previous_settings = provider.settings_config.clone();
 
-    // 4. 检查 provider 的 autoSyncContextWindow 开关
-    let auto_sync = provider
-        .settings_config
-        .get("autoSyncContextWindow")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if !auto_sync {
+    // 4. 检查 provider 的 autoSyncContextWindow 开关（字段缺失时按账本衔接前状态）
+    if !effective_auto_sync_enabled(&v, &provider) {
         log::debug!("[ClaudeSettingsWatcher] auto-sync disabled for provider, skip");
         return;
     }
@@ -544,6 +539,51 @@ pub(crate) fn is_auto_target_value(
                 _ => false,
             },
         })
+}
+
+/// autoSyncContextWindow 字段缺失时以 DB autoSyncState 账本为主信号，辅以
+/// live ACW/MAX 来源综合判定，衔接用户更新前的状态（不无条件默认 off）。
+/// 显式字段永远优先。
+pub(crate) fn effective_auto_sync_enabled(live: &Value, provider: &Provider) -> bool {
+    let settings = &provider.settings_config;
+    if let Some(enabled) = settings
+        .get("autoSyncContextWindow")
+        .and_then(Value::as_bool)
+    {
+        return enabled;
+    }
+    if auto_sync_ledger_has_auto_records(settings) {
+        return true;
+    }
+    // 辅助确认：live 的 ACW/MAX 命中自动来源目标值
+    let Some(env) = live.get("env").and_then(Value::as_object) else {
+        return false;
+    };
+    crate::claude_desktop_config::CLAUDE_CONTEXT_WINDOW_LEDGER_KEYS
+        .iter()
+        .any(|(env_key, short_key)| {
+            env.get(*env_key)
+                .and_then(Value::as_str)
+                .is_some_and(|value| is_auto_target_value(live, provider, short_key, value))
+        })
+}
+
+/// autoSyncState 账本（lastWritten / staticInjected）是否存在 ACW/MAX 记录。
+pub(crate) fn auto_sync_ledger_has_auto_records(settings: &Value) -> bool {
+    let Some(state) = settings.get("autoSyncState").and_then(Value::as_object) else {
+        return false;
+    };
+    ["lastWritten", "staticInjected"].iter().any(|source| {
+        state
+            .get(*source)
+            .and_then(Value::as_object)
+            .is_some_and(|obj| {
+                ["ACW", "MAX"].iter().any(|short_key| {
+                    obj.get(*short_key)
+                        .is_some_and(|value| !value.is_null() && value.as_bool() != Some(false))
+                })
+            })
+    })
 }
 
 fn verify_file_unchanged(path: &std::path::Path, expected: &str) -> Result<(), String> {
@@ -792,10 +832,10 @@ mod tests {
     }
 
     #[test]
-    fn compact_ratio_defaults_to_one_when_missing_or_invalid() {
+    fn compact_ratio_defaults_to_095_when_missing_or_invalid() {
         let missing =
             Provider::with_id("p".to_string(), "P".to_string(), json!({ "env": {} }), None);
-        assert_eq!(provider_compact_ratio(&missing), 1.0);
+        assert_eq!(provider_compact_ratio(&missing), 0.95);
 
         let too_low = Provider::with_id(
             "p".to_string(),
@@ -803,7 +843,7 @@ mod tests {
             json!({ "autoSyncCompactRatio": 0.1 }),
             None,
         );
-        assert_eq!(provider_compact_ratio(&too_low), 1.0);
+        assert_eq!(provider_compact_ratio(&too_low), 0.95);
 
         let too_high = Provider::with_id(
             "p".to_string(),
@@ -811,7 +851,7 @@ mod tests {
             json!({ "autoSyncCompactRatio": 1.5 }),
             None,
         );
-        assert_eq!(provider_compact_ratio(&too_high), 1.0);
+        assert_eq!(provider_compact_ratio(&too_high), 0.95);
     }
 
     #[test]
@@ -822,7 +862,7 @@ mod tests {
             json!({ "autoSyncCompactRatio": 1.0 }),
             None,
         );
-        assert_eq!(provider_compact_ratio(&explicit_one), 1.0);
+        assert_eq!(provider_compact_ratio(&explicit_one), 0.95);
 
         let too_high = Provider::with_id(
             "p".to_string(),
@@ -830,7 +870,7 @@ mod tests {
             json!({ "autoSyncCompactRatio": 0.96 }),
             None,
         );
-        assert_eq!(provider_compact_ratio(&too_high), 1.0);
+        assert_eq!(provider_compact_ratio(&too_high), 0.95);
     }
 
     #[test]
@@ -880,13 +920,13 @@ mod tests {
     }
 
     #[test]
-    fn build_writes_fallback_to_one_for_ratio_above_095() {
+    fn build_writes_fallback_to_095_for_ratio_above_095() {
         for ratio in [0.96, 1.0] {
             let writes = build_env_writes(30000, ratio);
             assert_eq!(
                 writes,
                 vec![
-                    ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "30000".to_string()),
+                    ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "28500".to_string()),
                     ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "30000".to_string()),
                 ]
             );
@@ -899,7 +939,23 @@ mod tests {
         assert_eq!(
             writes,
             vec![
-                ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "30000".to_string()),
+                ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "28500".to_string()),
+                ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "30000".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn compact_ratio_defaults_to_095_when_missing() {
+        // D1：autoSyncCompactRatio 缺失时默认 0.95，开箱行为 ACW = 窗口 × 0.95。
+        let missing =
+            Provider::with_id("p".to_string(), "P".to_string(), json!({ "env": {} }), None);
+        assert_eq!(provider_compact_ratio(&missing), 0.95);
+        let writes = build_env_writes(30000, provider_compact_ratio(&missing));
+        assert_eq!(
+            writes,
+            vec![
+                ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "28500".to_string()),
                 ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "30000".to_string()),
             ]
         );
@@ -1177,7 +1233,7 @@ mod tests {
         let content = fs::read_to_string(&path).unwrap();
         let v: Value = serde_json::from_str(&content).unwrap();
         assert_eq!(v["model"], "haiku");
-        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "30000");
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "28500");
         assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "30000");
 
         drop(watcher);
@@ -1486,7 +1542,7 @@ mod tests {
         let content = fs::read_to_string(&path).unwrap();
         let v: Value = serde_json::from_str(&content).unwrap();
         assert_eq!(v["model"], "haiku");
-        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "30000");
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "28500");
         assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "30000");
     }
 
@@ -1608,7 +1664,7 @@ mod tests {
         let content = fs::read_to_string(&path).unwrap();
         let v: Value = serde_json::from_str(&content).unwrap();
         assert_eq!(v["model"], "haiku");
-        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "30000");
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "28500");
         assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "30000");
     }
 
@@ -1775,27 +1831,27 @@ mod tests {
 
         let content = fs::read_to_string(&path).unwrap();
         let v: Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "30000");
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "28500");
         assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "30000");
 
         let provider_guard = provider.lock().unwrap();
         assert_eq!(
             provider_guard.settings_config["autoSyncState"]["lastWritten"],
-            json!({ "ACW": "30000", "MAX": "30000" })
+            json!({ "ACW": "28500", "MAX": "30000" })
         );
         drop(provider_guard);
         assert_eq!(
             *state.lock().unwrap(),
             Some(WatcherSnapshot {
                 model: Some("haiku".to_string()),
-                acw: Some("30000".to_string()),
+                acw: Some("28500".to_string()),
                 max: Some("30000".to_string()),
             })
         );
         assert!(!should_process(
             &state,
             Some("haiku"),
-            Some("30000"),
+            Some("28500"),
             Some("30000")
         ));
     }
@@ -1862,7 +1918,7 @@ mod tests {
 
         let content = fs::read_to_string(&path).unwrap();
         let v: Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "200000");
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "190000");
         assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "200000");
         let provider_guard = provider.lock().unwrap();
         assert!(provider_guard
@@ -2377,13 +2433,13 @@ mod tests {
 
         let content = fs::read_to_string(&path).unwrap();
         let v: Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "30000");
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "28500");
         assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "30000");
         assert_eq!(
             *state.lock().unwrap(),
             Some(WatcherSnapshot {
                 model: Some("haiku".to_string()),
-                acw: Some("30000".to_string()),
+                acw: Some("28500".to_string()),
                 max: Some("30000".to_string()),
             })
         );
@@ -2620,5 +2676,145 @@ mod tests {
         assert!(verify_file_unchanged(&path, "first").is_ok());
         std::fs::write(&path, "second").unwrap();
         assert!(verify_file_unchanged(&path, "first").is_err());
+    }
+
+    #[test]
+    fn effective_auto_sync_enabled_uses_ledger_when_field_missing() {
+        // F5：字段缺失时以 DB autoSyncState 账本为主信号 → 视为开启
+        let provider = Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "env": {},
+                "autoSyncState": { "lastWritten": { "ACW": "28500", "MAX": "30000" } }
+            }),
+            None,
+        );
+        assert!(provider
+            .settings_config
+            .get("autoSyncContextWindow")
+            .is_none());
+        assert!(effective_auto_sync_enabled(
+            &provider.settings_config,
+            &provider
+        ));
+    }
+
+    #[test]
+    fn effective_auto_sync_enabled_false_without_field_or_ledger() {
+        let provider =
+            Provider::with_id("p".to_string(), "P".to_string(), json!({ "env": {} }), None);
+        assert!(!effective_auto_sync_enabled(
+            &provider.settings_config,
+            &provider
+        ));
+    }
+
+    #[test]
+    fn effective_auto_sync_enabled_respects_explicit_field() {
+        // 显式字段优先：即使账本有记录，显式 false 仍为关闭
+        let provider = Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "env": {},
+                "autoSyncContextWindow": false,
+                "autoSyncState": { "staticInjected": { "ACW": "262144", "MAX": "262144" } }
+            }),
+            None,
+        );
+        assert!(!effective_auto_sync_enabled(
+            &provider.settings_config,
+            &provider
+        ));
+
+        let provider = Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({ "env": {}, "autoSyncContextWindow": true }),
+            None,
+        );
+        assert!(effective_auto_sync_enabled(
+            &provider.settings_config,
+            &provider
+        ));
+    }
+
+    #[test]
+    fn effective_auto_sync_enabled_confirms_via_env_auto_target() {
+        // 无字段、无账本时，live 的 ACW/MAX 命中自动来源目标 → 视为开启
+        let settings = json!({
+            "model": "sonnet",
+            "env": { "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "190000", "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "200000" }
+        });
+        let provider = Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "env": { "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2" },
+                "contextWindows": { "ANTHROPIC_DEFAULT_SONNET_MODEL": 200000 }
+            }),
+            None,
+        );
+        assert!(effective_auto_sync_enabled(&settings, &provider));
+    }
+
+    #[test]
+    #[serial]
+    fn fs_real_watcher_missing_field_with_ledger_keeps_auto_sync() {
+        // F5：autoSyncContextWindow 字段缺失但账本有记录时，watcher 仍应写入 ACW/MAX
+        use std::fs;
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let initial = json!({
+            "model": "sonnet",
+            "env": {
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "MiniMax-M3[1M]",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "Kimi-K2.7-Code[30k]"
+            }
+        });
+        fs::write(&path, initial.to_string()).unwrap();
+
+        let provider = Arc::new(Mutex::new(Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "MiniMax-M3[1M]",
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "Kimi-K2.7-Code[30k]"
+                },
+                "autoSyncState": { "lastWritten": { "ACW": "1", "MAX": "2" } }
+            }),
+            None,
+        )));
+
+        let watcher =
+            spawn_claude_settings_watcher(path.clone(), provider, noop_persist()).unwrap();
+
+        // 模拟外部程序修改 model 字段
+        fs::write(
+            &path,
+            json!({
+                "model": "haiku",
+                "env": {
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "Kimi-K2.7-Code[30k]",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "MiniMax-M3[1M]"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        thread::sleep(Duration::from_millis(800));
+
+        let content = fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["model"], "haiku");
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "28500");
+        assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "30000");
+
+        drop(watcher);
     }
 }

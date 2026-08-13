@@ -121,6 +121,41 @@ impl ProxyService {
             auth_policy,
             takeover_model_fields,
         );
+        Self::sync_claude_takeover_context_window_env(config, provider);
+    }
+
+    /// takeover 出口按三类来源账本刷新 ACW/MAX：
+    /// live 中 userExplicit 账本记录的值保留（用户手写优先）；lastWritten/staticInjected
+    /// 或无记录的值刷新为 effective provider 的目标值；provider 无目标则清掉陈旧自动值。
+    fn sync_claude_takeover_context_window_env(config: &mut Value, effective_provider: &Provider) {
+        let Some(env) = config.get_mut("env").and_then(Value::as_object_mut) else {
+            return;
+        };
+        let provider_env = effective_provider
+            .settings_config
+            .get("env")
+            .and_then(Value::as_object);
+        let user_explicit = effective_provider
+            .settings_config
+            .pointer("/autoSyncState/userExplicit")
+            .and_then(Value::as_object);
+        for (env_key, short_key) in crate::claude_desktop_config::CLAUDE_CONTEXT_WINDOW_LEDGER_KEYS
+        {
+            let is_user_explicit = user_explicit
+                .and_then(|ledger| ledger.get(short_key))
+                .is_some_and(|value| !value.is_null() && value.as_bool() != Some(false));
+            if is_user_explicit {
+                continue;
+            }
+            match provider_env.and_then(|provider_env| provider_env.get(env_key)) {
+                Some(target) => {
+                    env.insert(env_key.to_string(), target.clone());
+                }
+                None => {
+                    env.remove(env_key);
+                }
+            }
+        }
     }
 
     fn apply_claude_takeover_fields_with_policy(
@@ -3759,6 +3794,125 @@ mod tests {
     }
 
     #[test]
+    fn claude_takeover_refreshes_auto_source_acw_max_from_effective_provider() {
+        // 异常状态下前一供应商直连残留的陈旧 ACW/MAX 在接管后必须刷新为
+        // effective provider 的目标值（无 userExplicit 账本时按自动来源处理）。
+        let provider = Provider::with_id(
+            "deepseek".to_string(),
+            "DeepSeek".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+                    "ANTHROPIC_MODEL": "deepseek-v3",
+                    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "152000",
+                    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "160000"
+                }
+            }),
+            None,
+        );
+
+        let mut live_config = json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://stale.example.com",
+                "ANTHROPIC_MODEL": "stale-model",
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "99999",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "88888"
+            }
+        });
+        ProxyService::apply_claude_takeover_fields_for_provider(
+            &mut live_config,
+            "http://127.0.0.1:15721",
+            &provider,
+        );
+
+        let env = live_config
+            .get("env")
+            .and_then(Value::as_object)
+            .expect("env should exist");
+        assert_env_str(env, "CLAUDE_CODE_AUTO_COMPACT_WINDOW", Some("152000"));
+        assert_env_str(env, "CLAUDE_CODE_MAX_CONTEXT_TOKENS", Some("160000"));
+    }
+
+    #[test]
+    fn claude_takeover_preserves_user_explicit_acw_max_from_ledger() {
+        // userExplicit 账本来源的 live 值在接管时不得被目标窗口覆盖。
+        let provider = Provider::with_id(
+            "deepseek".to_string(),
+            "DeepSeek".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+                    "ANTHROPIC_MODEL": "deepseek-v3",
+                    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "152000",
+                    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "160000"
+                },
+                "autoSyncState": {
+                    "userExplicit": { "ACW": "111111", "MAX": "222222" }
+                }
+            }),
+            None,
+        );
+
+        let mut live_config = json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://stale.example.com",
+                "ANTHROPIC_MODEL": "stale-model",
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "111111",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "222222"
+            }
+        });
+        ProxyService::apply_claude_takeover_fields_for_provider(
+            &mut live_config,
+            "http://127.0.0.1:15721",
+            &provider,
+        );
+
+        let env = live_config
+            .get("env")
+            .and_then(Value::as_object)
+            .expect("env should exist");
+        assert_env_str(env, "CLAUDE_CODE_AUTO_COMPACT_WINDOW", Some("111111"));
+        assert_env_str(env, "CLAUDE_CODE_MAX_CONTEXT_TOKENS", Some("222222"));
+    }
+
+    #[test]
+    fn claude_takeover_clears_stale_acw_max_when_provider_has_no_target() {
+        // effective provider 没有 ACW/MAX 目标时，接管应清掉残留的陈旧自动值。
+        let provider = Provider::with_id(
+            "plain".to_string(),
+            "Plain".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.example.com",
+                    "ANTHROPIC_MODEL": "claude-haiku-4.5"
+                }
+            }),
+            None,
+        );
+
+        let mut live_config = json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://stale.example.com",
+                "ANTHROPIC_MODEL": "stale-model",
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "200000",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "200000"
+            }
+        });
+        ProxyService::apply_claude_takeover_fields_for_provider(
+            &mut live_config,
+            "http://127.0.0.1:15721",
+            &provider,
+        );
+
+        let env = live_config
+            .get("env")
+            .and_then(Value::as_object)
+            .expect("env should exist");
+        assert_env_str(env, "CLAUDE_CODE_AUTO_COMPACT_WINDOW", None);
+        assert_env_str(env, "CLAUDE_CODE_MAX_CONTEXT_TOKENS", None);
+    }
+
+    #[test]
     fn managed_account_claude_takeover_sources_codex_models_from_provider() {
         let mut provider = Provider::with_id(
             "codex".to_string(),
@@ -5961,7 +6115,7 @@ model = "gpt-5.1-codex"
         }
         assert_eq!(
             backup_config["autoSyncState"]["staticInjected"]["ACW"],
-            json!("1000000")
+            json!("950000")
         );
         assert_eq!(
             backup_config["autoSyncState"]["staticInjected"]["MAX"],

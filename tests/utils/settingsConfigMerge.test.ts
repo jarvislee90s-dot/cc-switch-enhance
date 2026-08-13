@@ -3,6 +3,7 @@ import {
   applyAutoSyncCompactRatioSetting,
   applyAutoSyncContextWindowSetting,
   mergeSettingsConfigPreservingAutoSync,
+  resolveAutoSyncContextWindow,
 } from "@/utils/settingsConfigMerge";
 
 describe("mergeSettingsConfigPreservingAutoSync", () => {
@@ -348,4 +349,63 @@ describe("mergeSettingsConfigPreservingAutoSync", () => {
     expect(parsed.autoSyncState.userExplicit).toEqual({ MAX: "200000" });
   });
 
+});
+
+describe("resolveAutoSyncContextWindow", () => {
+  it("显式字段优先返回", () => {
+    expect(
+      resolveAutoSyncContextWindow(
+        JSON.stringify({ autoSyncContextWindow: true, autoSyncState: {} }),
+      ),
+    ).toBe(true);
+    expect(
+      resolveAutoSyncContextWindow(
+        JSON.stringify({
+          autoSyncContextWindow: false,
+          autoSyncState: { lastWritten: { ACW: "1", MAX: "2" } },
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("字段缺失但有账本记录时视为开启（衔接前状态）", () => {
+    expect(
+      resolveAutoSyncContextWindow(
+        JSON.stringify({
+          env: {},
+          autoSyncState: { lastWritten: { ACW: "190000", MAX: "200000" } },
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      resolveAutoSyncContextWindow(
+        JSON.stringify({
+          env: {},
+          autoSyncState: { staticInjected: { ACW: "262144", MAX: "262144" } },
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("字段缺失且无账本时视为关闭", () => {
+    expect(resolveAutoSyncContextWindow(JSON.stringify({ env: {} }))).toBe(false);
+  });
+
+  it("字段缺失无账本时，env ACW/MAX 命中 contextWindows 推导目标也视为开启", () => {
+    expect(
+      resolveAutoSyncContextWindow(
+        JSON.stringify({
+          env: {
+            CLAUDE_CODE_AUTO_COMPACT_WINDOW: "190000",
+            CLAUDE_CODE_MAX_CONTEXT_TOKENS: "200000",
+          },
+          contextWindows: { ANTHROPIC_DEFAULT_SONNET_MODEL: 200000 },
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("无效 JSON 返回 false", () => {
+    expect(resolveAutoSyncContextWindow("{invalid")).toBe(false);
+  });
 });
