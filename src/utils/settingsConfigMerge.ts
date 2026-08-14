@@ -69,20 +69,6 @@ export function matchesAutoSyncSource(
   });
 }
 
-export function hasUserExplicitValue(
-  state: Record<string, unknown>,
-  shortKey: string,
-): boolean {
-  const userExplicit = state.userExplicit;
-  if (!isPlainObject(userExplicit)) return false;
-
-  const shortValue = userExplicit[shortKey];
-  // 与 Rust stored_user_explicit_value 对齐：null/false 不算有意义显式值
-  return (
-    shortValue !== undefined && shortValue !== null && shortValue !== false
-  );
-}
-
 function restorableLedgerValue(value: unknown): string | undefined {
   if (typeof value === "string") return value;
   if (typeof value === "number" && Number.isFinite(value) && value > 0) {
@@ -95,11 +81,6 @@ export function restoreAutoSyncContextWindowValue(
   state: Record<string, unknown>,
   shortKey: string,
 ): string | undefined {
-  const userExplicit = state.userExplicit;
-  if (isPlainObject(userExplicit)) {
-    const shortValue = restorableLedgerValue(userExplicit[shortKey]);
-    if (shortValue !== undefined) return shortValue;
-  }
   for (const sourceName of ["lastWritten", "staticInjected"] as const) {
     const source = state[sourceName];
     if (!isPlainObject(source)) continue;
@@ -109,25 +90,12 @@ export function restoreAutoSyncContextWindowValue(
   return undefined;
 }
 
-function writeUserExplicitState(
-  state: Record<string, unknown>,
-  shortKey: string,
-  liveValue: unknown,
-) {
-  if (!isPlainObject(state.userExplicit)) {
-    state.userExplicit = {};
-  }
-  const userExplicit = state.userExplicit as Record<string, unknown>;
-  userExplicit[shortKey] = liveValue;
-}
-
 /**
  * 写入自动同步开关状态。
  *
- * 关闭时按 autoSyncState 清理自动写入的 ACW/MAX；live 中非自动来源的值
- * 视为关闭瞬间用户写入，保留并记入 userExplicit。无账本时沿用旧行为删除。
- * 开启时优先从 userExplicit 恢复 ACW/MAX；没有显式值时从
- * lastWritten/staticInjected 恢复；都没有则不写回。
+ * 关闭时按 autoSyncState 清理等于 lastWritten/staticInjected 的自动值，
+ * 其余 live 值原样保留（不再写入 userExplicit）。
+ * 开启时从 lastWritten/staticInjected 恢复；都没有则不写回。
  */
 export function applyAutoSyncContextWindowSetting(
   config: string,
@@ -166,13 +134,9 @@ export function applyAutoSyncContextWindowSetting(
         const liveValue = env[envKey];
         if (liveValue === undefined) continue;
         const shortKey = CLAUDE_CONTEXT_WINDOW_STATE_KEYS[envKey];
-        if (!hasUserExplicitValue(state, shortKey)) {
-          if (matchesAutoSyncSource(state, shortKey, liveValue)) {
-            delete env[envKey];
-            continue;
-          }
+        if (matchesAutoSyncSource(state, shortKey, liveValue)) {
+          delete env[envKey];
         }
-        writeUserExplicitState(state, shortKey, liveValue);
       }
     }
     return JSON.stringify(parsed, null, 2);

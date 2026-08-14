@@ -5,7 +5,6 @@ import {
   mergeSettingsConfigPreservingAutoSync,
   resolveAutoSyncContextWindow,
   matchesAutoSyncSource,
-  hasUserExplicitValue,
   restoreAutoSyncContextWindowValue,
 } from "@/utils/settingsConfigMerge";
 
@@ -86,12 +85,14 @@ describe("mergeSettingsConfigPreservingAutoSync", () => {
     });
   });
 
-  it("重新开启自动同步时从 userExplicit 恢复 ACW/MAX", () => {
+  it("重新开启自动同步时忽略 userExplicit，从 lastWritten/staticInjected 恢复", () => {
     const updated = applyAutoSyncContextWindowSetting(
       JSON.stringify({
         env: { ANTHROPIC_MODEL: "model[1M]" },
         autoSyncState: {
-          userExplicit: { ACW: "160000", MAX: "200000" }
+          userExplicit: { ACW: "160000", MAX: "200000" },
+          lastWritten: { ACW: "170000" },
+          staticInjected: { MAX: "262144" },
         },
       }),
       true,
@@ -100,12 +101,14 @@ describe("mergeSettingsConfigPreservingAutoSync", () => {
     expect(JSON.parse(updated)).toEqual({
       env: {
         ANTHROPIC_MODEL: "model[1M]",
-        CLAUDE_CODE_AUTO_COMPACT_WINDOW: "160000",
-        CLAUDE_CODE_MAX_CONTEXT_TOKENS: "200000",
+        CLAUDE_CODE_AUTO_COMPACT_WINDOW: "170000",
+        CLAUDE_CODE_MAX_CONTEXT_TOKENS: "262144",
       },
       autoSyncContextWindow: true,
       autoSyncState: {
         userExplicit: { ACW: "160000", MAX: "200000" },
+        lastWritten: { ACW: "170000" },
+        staticInjected: { MAX: "262144" },
       },
     });
   });
@@ -303,7 +306,7 @@ describe("mergeSettingsConfigPreservingAutoSync", () => {
     expect(parsed.autoSyncState.staticInjected).toEqual({ MAX: "262144" });
   });
 
-  it("关闭瞬间 live 中的非自动值保留并写入短键 userExplicit", () => {
+  it("关闭瞬间 live 中的非自动值保留且不写 userExplicit", () => {
     const updated = applyAutoSyncContextWindowSetting(
       JSON.stringify({
         env: {
@@ -314,7 +317,6 @@ describe("mergeSettingsConfigPreservingAutoSync", () => {
         autoSyncState: {
           lastWritten: { ACW: "160000", MAX: "200000" },
           staticInjected: {},
-          userExplicit: {},
         },
       }),
       false,
@@ -323,17 +325,14 @@ describe("mergeSettingsConfigPreservingAutoSync", () => {
     const parsed = JSON.parse(updated);
     expect(parsed.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe("250000");
     expect(parsed.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe("250000");
-    expect(parsed.autoSyncState.userExplicit).toEqual({
-      ACW: "250000",
-      MAX: "250000",
-    });
+    expect(parsed.autoSyncState.userExplicit).toBeUndefined();
     expect(parsed.autoSyncState.lastWritten).toEqual({
       ACW: "160000",
       MAX: "200000",
     });
   });
 
-  it("关闭时优先 userExplicit，即使同一 live 值同时匹配 lastWritten", () => {
+  it("关闭时 live 值匹配 lastWritten 即删除，userExplicit 不再优先", () => {
     const updated = applyAutoSyncContextWindowSetting(
       JSON.stringify({
         env: { CLAUDE_CODE_MAX_CONTEXT_TOKENS: "200000" },
@@ -348,7 +347,7 @@ describe("mergeSettingsConfigPreservingAutoSync", () => {
     );
 
     const parsed = JSON.parse(updated);
-    expect(parsed.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe("200000");
+    expect(parsed.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBeUndefined();
     expect(parsed.autoSyncState.userExplicit).toEqual({ MAX: "200000" });
   });
 
@@ -448,14 +447,8 @@ describe("ledger contract parity with Rust", () => {
     ).toBe(false);
   });
 
-  it("null/false：false 不视为有意义显式值", () => {
-    expect(hasUserExplicitValue({ userExplicit: { MAX: false } }, "MAX")).toBe(false);
-    expect(
-      hasUserExplicitValue({ userExplicit: { MAX: "250000" } }, "MAX"),
-    ).toBe(true);
-  });
 
-  it("优先级：userExplicit 优先于 lastWritten/staticInjected", () => {
+  it("恢复只读 lastWritten/staticInjected，忽略 userExplicit", () => {
     expect(
       restoreAutoSyncContextWindowValue(
         {
@@ -465,17 +458,16 @@ describe("ledger contract parity with Rust", () => {
         },
         "MAX",
       ),
-    ).toBe("250000");
+    ).toBe("200000");
     expect(
       restoreAutoSyncContextWindowValue(
         {
-          userExplicit: {},
-          lastWritten: { MAX: "200000" },
+          userExplicit: { MAX: "250000" },
+          lastWritten: {},
           staticInjected: { MAX: "300000" },
         },
         "MAX",
       ),
-    ).toBe("200000");
+    ).toBe("300000");
   });
 });
-
