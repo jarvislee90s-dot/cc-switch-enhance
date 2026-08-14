@@ -124,9 +124,8 @@ impl ProxyService {
         Self::sync_claude_takeover_context_window_env(config, provider);
     }
 
-    /// takeover 出口按三类来源账本刷新 ACW/MAX：
-    /// live 中 userExplicit 账本记录的值保留（用户手写优先）；lastWritten/staticInjected
-    /// 或无记录的值刷新为 effective provider 的目标值；provider 无目标则清掉陈旧自动值。
+    /// takeover 出口刷新 ACW/MAX：一律按 effective provider 的目标值刷新，
+    /// provider 无目标则清掉陈旧自动值（userExplicit 来源已移除，不再保留）。
     fn sync_claude_takeover_context_window_env(config: &mut Value, effective_provider: &Provider) {
         let Some(env) = config.get_mut("env").and_then(Value::as_object_mut) else {
             return;
@@ -135,18 +134,7 @@ impl ProxyService {
             .settings_config
             .get("env")
             .and_then(Value::as_object);
-        let user_explicit = effective_provider
-            .settings_config
-            .pointer("/autoSyncState/userExplicit")
-            .and_then(Value::as_object);
-        for (env_key, short_key) in crate::claude_desktop_config::CLAUDE_CONTEXT_WINDOW_LEDGER_KEYS
-        {
-            let is_user_explicit = user_explicit
-                .and_then(|ledger| ledger.get(short_key))
-                .is_some_and(|value| !value.is_null() && value.as_bool() != Some(false));
-            if is_user_explicit {
-                continue;
-            }
+        for (env_key, _) in crate::claude_desktop_config::CLAUDE_CONTEXT_WINDOW_LEDGER_KEYS {
             match provider_env.and_then(|provider_env| provider_env.get(env_key)) {
                 Some(target) => {
                     env.insert(env_key.to_string(), target.clone());
@@ -3847,48 +3835,6 @@ mod tests {
             .expect("env should exist");
         assert_env_str(env, "CLAUDE_CODE_AUTO_COMPACT_WINDOW", Some("152000"));
         assert_env_str(env, "CLAUDE_CODE_MAX_CONTEXT_TOKENS", Some("160000"));
-    }
-
-    #[test]
-    fn claude_takeover_preserves_user_explicit_acw_max_from_ledger() {
-        // userExplicit 账本来源的 live 值在接管时不得被目标窗口覆盖。
-        let provider = Provider::with_id(
-            "deepseek".to_string(),
-            "DeepSeek".to_string(),
-            json!({
-                "env": {
-                    "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
-                    "ANTHROPIC_MODEL": "deepseek-v3",
-                    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "152000",
-                    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "160000"
-                },
-                "autoSyncState": {
-                    "userExplicit": { "ACW": "111111", "MAX": "222222" }
-                }
-            }),
-            None,
-        );
-
-        let mut live_config = json!({
-            "env": {
-                "ANTHROPIC_BASE_URL": "https://stale.example.com",
-                "ANTHROPIC_MODEL": "stale-model",
-                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "111111",
-                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "222222"
-            }
-        });
-        ProxyService::apply_claude_takeover_fields_for_provider(
-            &mut live_config,
-            "http://127.0.0.1:15721",
-            &provider,
-        );
-
-        let env = live_config
-            .get("env")
-            .and_then(Value::as_object)
-            .expect("env should exist");
-        assert_env_str(env, "CLAUDE_CODE_AUTO_COMPACT_WINDOW", Some("111111"));
-        assert_env_str(env, "CLAUDE_CODE_MAX_CONTEXT_TOKENS", Some("222222"));
     }
 
     #[test]

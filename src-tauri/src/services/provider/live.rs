@@ -116,36 +116,6 @@ pub(crate) fn auto_sync_state_mut(
     auto_sync_state_value_mut(settings)?.as_object_mut()
 }
 
-/// 获取或创建 autoSyncState.userExplicit 对象。
-pub(crate) fn user_explicit_mut(
-    settings: &mut Value,
-) -> Option<&mut serde_json::Map<String, Value>> {
-    let state = auto_sync_state_mut(settings)?;
-    let explicit = state
-        .entry("userExplicit".to_string())
-        .or_insert_with(|| json!({}));
-    if !explicit.is_object() {
-        *explicit = json!({});
-    }
-    explicit.as_object_mut()
-}
-
-/// 把用户显式 ACW/MAX 写入 autoSyncState.userExplicit 短键账本。
-pub(crate) fn record_user_explicit_values(
-    settings: &mut Value,
-    acw: Option<&str>,
-    max: Option<&str>,
-) {
-    let Some(explicit) = user_explicit_mut(settings) else {
-        return;
-    };
-    if let Some(value) = acw {
-        explicit.insert("ACW".to_string(), Value::String(value.to_string()));
-    }
-    if let Some(value) = max {
-        explicit.insert("MAX".to_string(), Value::String(value.to_string()));
-    }
-}
 fn record_static_injected(settings: &mut Value, acw: &str, max: &str) {
     if let Some(state) = auto_sync_state_mut(settings) {
         state.insert(
@@ -359,16 +329,6 @@ fn merge_auto_sync_state_into_provider(provider_settings: &mut Value, effective_
         state.insert("staticInjected".to_string(), static_injected.clone());
     } else {
         state.remove("staticInjected");
-    }
-    if let Some(user_explicit) = effective_state
-        .get("userExplicit")
-        .and_then(Value::as_object)
-    {
-        if let Some(target) = user_explicit_mut(provider_settings) {
-            for (key, value) in user_explicit {
-                target.insert(key.clone(), value.clone());
-            }
-        }
     }
 }
 
@@ -1040,93 +1000,6 @@ pub(crate) fn build_effective_settings_with_common_config(
     Ok(effective_settings)
 }
 
-fn context_window_value_as_string(value: &Value) -> Option<String> {
-    if let Some(text) = value.as_str() {
-        let trimmed = text.trim();
-        return (!trimmed.is_empty()).then(|| trimmed.to_string());
-    }
-    if let Some(number) = value.as_u64() {
-        return Some(number.to_string());
-    }
-    value
-        .as_f64()
-        .filter(|number| number.is_finite() && number.fract() == 0.0)
-        .map(|number| (number as u64).to_string())
-}
-
-fn stored_user_explicit_value(provider: &Provider, short_key: &str) -> Option<String> {
-    let explicit = provider
-        .settings_config
-        .pointer("/autoSyncState/userExplicit")
-        .and_then(Value::as_object)?;
-    if let Some(value) = explicit.get(short_key) {
-        if value.is_null() || value.as_bool() == Some(false) {
-            return None;
-        }
-        return context_window_value_as_string(value);
-    }
-    None
-}
-
-fn apply_stored_user_explicit_values(provider: &Provider, settings: &mut Value) {
-    let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) else {
-        return;
-    };
-    for (env_key, short_key) in crate::claude_desktop_config::CLAUDE_CONTEXT_WINDOW_LEDGER_KEYS {
-        if let Some(value) = stored_user_explicit_value(provider, short_key) {
-            env.insert(env_key.to_string(), Value::String(value));
-        }
-    }
-}
-
-fn merge_manual_live_context_windows(live: &Value, provider: &Provider, settings: &mut Value) {
-    let mut manual_acw = None;
-    let mut manual_max = None;
-    for (env_key, short_key) in crate::claude_desktop_config::CLAUDE_CONTEXT_WINDOW_LEDGER_KEYS {
-        let Some(live_value) = live
-            .get("env")
-            .and_then(Value::as_object)
-            .and_then(|env| env.get(env_key))
-            .and_then(context_window_value_as_string)
-        else {
-            continue;
-        };
-        if provider_env_has_explicit_value(provider, env_key) {
-            continue;
-        }
-        if stored_user_explicit_value(provider, short_key).as_deref() == Some(live_value.as_str()) {
-            continue;
-        }
-        if crate::claude_settings_watcher::is_auto_target_value(provider, short_key, &live_value) {
-            continue;
-        }
-        match short_key {
-            "ACW" => manual_acw = Some(live_value),
-            "MAX" => manual_max = Some(live_value),
-            _ => {}
-        }
-    }
-    if manual_acw.is_none() && manual_max.is_none() {
-        return;
-    }
-    let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) else {
-        return;
-    };
-    if let Some(value) = manual_acw.as_ref() {
-        env.insert(
-            "CLAUDE_CODE_AUTO_COMPACT_WINDOW".to_string(),
-            Value::String(value.clone()),
-        );
-    }
-    if let Some(value) = manual_max.as_ref() {
-        env.insert(
-            "CLAUDE_CODE_MAX_CONTEXT_TOKENS".to_string(),
-            Value::String(value.clone()),
-        );
-    }
-    record_user_explicit_values(settings, manual_acw.as_deref(), manual_max.as_deref());
-}
-
 pub(crate) fn write_live_with_common_config(
     db: &Database,
     app_type: &AppType,
@@ -1147,25 +1020,6 @@ pub(crate) fn write_live_with_common_config(
     }
 
     if matches!(app_type, AppType::Claude) {
-        apply_stored_user_explicit_values(provider, &mut effective_provider.settings_config);
-        let live_path = get_claude_settings_path();
-        if live_path.exists() {
-            match read_json_file(&live_path) {
-                Ok(live) => {
-                    merge_manual_live_context_windows(
-                        &live,
-                        provider,
-                        &mut effective_provider.settings_config,
-                    );
-                }
-                Err(err) => {
-                    log::warn!(
-                        "[ClaudeLive] failed to read live settings before write for '{}': {err}",
-                        provider.id
-                    );
-                }
-            }
-        }
         strip_legacy_suffixes_from_claude_models(&mut effective_provider.settings_config);
     }
 
@@ -1319,21 +1173,6 @@ fn has_auto_source_record(state: &serde_json::Map<String, Value>, short_key: &st
     })
 }
 
-fn backfill_user_explicit_value(
-    state: &serde_json::Map<String, Value>,
-    short_key: &str,
-    live_value: &str,
-) -> bool {
-    let Some(explicit) = state.get("userExplicit").and_then(Value::as_object) else {
-        return false;
-    };
-    if let Some(value) = explicit.get(short_key) {
-        // 短键新账本只保存实际字符串；null / 非字符串视为无显式值。
-        return value.as_str() == Some(live_value);
-    }
-    false
-}
-
 /// 任一自动来源（lastWritten / staticInjected）的该短键值是否等于 expected
 /// （字符串严格相等，对齐 Rust as_str 语义）。
 pub(crate) fn auto_source_value_matches(
@@ -1391,7 +1230,7 @@ fn strip_legacy_context_default_for_backfill(
     }
 }
 
-/// 优先按 autoSyncState 逐键判定：provider env 显式键与 userExplicit 保留，
+/// 优先按 autoSyncState 逐键判定：provider env 显式键保留，
 /// lastWritten/staticInjected 匹配时删除；该键没有任何自动来源记录时退回旧的窗口剥离逻辑。
 /// provider env 中显式存在的字符串键也视为用户存储，始终保留。
 fn strip_auto_synced_context_defaults(settings: &mut Value, provider: &Provider) {
@@ -1415,9 +1254,6 @@ fn strip_auto_synced_context_defaults(settings: &mut Value, provider: &Provider)
                 continue;
             };
             if provider_env_has_explicit_value(provider, env_key) {
-                continue;
-            }
-            if backfill_user_explicit_value(state, short_key, live_value) {
                 continue;
             }
             if backfill_auto_source_value(state, short_key, live_value) {
@@ -2791,104 +2627,6 @@ mod tests {
         assert!(
             crate::claude_settings_watcher::watcher_slot_is_empty_for_tests(),
             "tests must not spawn or replace the Claude watcher by default"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn write_live_with_common_config_preserves_manual_live_context_edit() {
-        let _home = TempHome::new();
-        let _test_watcher_unset = EnvVarGuard::remove("CC_SWITCH_TEST_WATCHER");
-        crate::claude_settings_watcher::clear_watcher_slot_for_tests();
-        let db = Database::memory().expect("create memory db");
-        let provider = Provider::with_id(
-            "manual-live".to_string(),
-            "Manual Live".to_string(),
-            json!({ "env": { "ANTHROPIC_MODEL": "fallback-model" } }),
-            None,
-        );
-        db.save_provider(AppType::Claude.as_str(), &provider)
-            .expect("save provider");
-        let live_path = get_claude_settings_path();
-        write_json_file(
-            &live_path,
-            &json!({
-                "env": {
-                    "ANTHROPIC_MODEL": "fallback-model",
-                    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "765432",
-                    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1234567"
-                }
-            }),
-        )
-        .expect("seed manually edited live");
-
-        write_live_with_common_config(&db, &AppType::Claude, &provider).expect("write live");
-
-        let live: Value = read_json_file(&live_path).expect("read live");
-        assert_eq!(
-            live["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
-            json!("765432")
-        );
-        assert_eq!(
-            live["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
-            json!("1234567")
-        );
-
-        let stored = db
-            .get_provider_by_id("manual-live", AppType::Claude.as_str())
-            .expect("get provider")
-            .expect("stored provider exists");
-        assert_eq!(
-            stored.settings_config["autoSyncState"]["userExplicit"]["ACW"],
-            json!("765432")
-        );
-        assert_eq!(
-            stored.settings_config["autoSyncState"]["userExplicit"]["MAX"],
-            json!("1234567")
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn write_live_with_common_config_syncs_new_user_explicit_into_watcher_snapshot() {
-        let _home = TempHome::new();
-        let _test_watcher = EnvVarGuard::set("CC_SWITCH_TEST_WATCHER", "1");
-        let _slot_guard = WatcherSlotGuard;
-        let _disable_watcher_removed = EnvVarGuard::remove("CC_SWITCH_DISABLE_WATCHER");
-        crate::claude_settings_watcher::clear_watcher_slot_for_tests();
-        let db = Database::memory().expect("create memory db");
-        let provider = Provider::with_id(
-            "watcher-snapshot".to_string(),
-            "Watcher Snapshot".to_string(),
-            json!({ "env": { "ANTHROPIC_MODEL": "fallback-model" } }),
-            None,
-        );
-        db.save_provider(AppType::Claude.as_str(), &provider)
-            .expect("save provider");
-        let live_path = get_claude_settings_path();
-        write_json_file(
-            &live_path,
-            &json!({
-                "env": {
-                    "ANTHROPIC_MODEL": "fallback-model",
-                    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "765432",
-                    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1234567"
-                }
-            }),
-        )
-        .expect("seed manually edited live");
-
-        write_live_with_common_config(&db, &AppType::Claude, &provider).expect("write live");
-
-        let snapshot = crate::claude_settings_watcher::watcher_provider_settings_config_for_tests()
-            .expect("watcher provider snapshot exists");
-        assert_eq!(
-            snapshot["autoSyncState"]["userExplicit"]["ACW"],
-            json!("765432")
-        );
-        assert_eq!(
-            snapshot["autoSyncState"]["userExplicit"]["MAX"],
-            json!("1234567")
         );
     }
 
@@ -4282,31 +4020,6 @@ base_url = "https://a.example/v1"
     }
 
     #[test]
-    fn context_window_suffix_respects_user_explicit_acw() {
-        let db = Database::memory().expect("create memory db");
-        let provider = Provider::with_id(
-            "test-explicit".to_string(),
-            "Test".to_string(),
-            json!({
-                "env": {
-                    "ANTHROPIC_BASE_URL": "https://example.com",
-                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "deepseek-v4-pro[1m]",
-                    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "500000"
-                }
-            }),
-            None,
-        );
-
-        let effective =
-            build_effective_settings_with_common_config(&db, &AppType::Claude, &provider)
-                .expect("build effective settings");
-        assert_eq!(
-            effective["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
-            json!("500000")
-        );
-    }
-
-    #[test]
     fn sanitize_strips_auto_sync_context_window() {
         // autoSyncContextWindow 是 cc-switch 专用字段，watcher 从 provider.settings_config
         // 读取，不应泄露到 Claude Code 的 settings.json
@@ -4446,36 +4159,6 @@ base_url = "https://a.example/v1"
         assert_eq!(
             effective["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
             "950000"
-        );
-    }
-
-    #[test]
-    fn context_window_defaults_preserve_user_explicit_values() {
-        let db = Database::memory().expect("create memory db");
-        let provider = Provider::with_id(
-            "test".to_string(),
-            "Test".to_string(),
-            json!({
-                "env": {
-                    "ANTHROPIC_MODEL": "fallback-model[1M]",
-                    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "999999",
-                    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "888888"
-                }
-            }),
-            None,
-        );
-
-        let effective =
-            build_effective_settings_with_common_config(&db, &AppType::Claude, &provider)
-                .expect("build effective settings");
-        // 用户显式设的值不被覆盖
-        assert_eq!(
-            effective["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
-            json!("999999")
-        );
-        assert_eq!(
-            effective["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
-            json!("888888")
         );
     }
 
@@ -4709,38 +4392,6 @@ base_url = "https://a.example/v1"
             effective["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
             "950000"
         );
-    }
-
-    #[test]
-    fn auto_sync_disabled_preserves_user_explicit_context_window_fields() {
-        let db = Database::memory().expect("create memory db");
-        let provider = Provider::with_id(
-            "test-off-explicit".to_string(),
-            "Test Off Explicit".to_string(),
-            json!({
-                "env": {
-                    "ANTHROPIC_MODEL": "fallback-model[1M]",
-                    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "999999",
-                    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "888888"
-                },
-                "autoSyncContextWindow": false
-            }),
-            None,
-        );
-
-        let effective =
-            build_effective_settings_with_common_config(&db, &AppType::Claude, &provider)
-                .expect("build effective settings");
-        assert_eq!(
-            effective["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
-            json!("999999")
-        );
-        assert_eq!(
-            effective["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
-            json!("888888")
-        );
-        assert_eq!(effective["env"]["ANTHROPIC_MODEL"], json!("fallback-model"));
-        assert!(effective.get("autoSyncState").is_none());
     }
 
     #[test]
@@ -4988,42 +4639,6 @@ base_url = "https://a.example/v1"
         assert_eq!(backfilled["autoSyncCompactRatio"], json!(0.5));
     }
     #[test]
-    fn claude_backfill_keeps_user_explicit_context_window_values() {
-        let db = Database::memory().expect("create memory db");
-        let provider = Provider::with_id(
-            "test".to_string(),
-            "Test".to_string(),
-            json!({
-                "env": {
-                    "ANTHROPIC_MODEL": "fallback-model[1M]",
-                    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "999999",
-                    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "888888"
-                }
-            }),
-            None,
-        );
-
-        let live = json!({
-            "env": {
-                "ANTHROPIC_MODEL": "fallback-model[1M]",
-                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "999999",
-                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "888888"
-            }
-        });
-        let backfilled =
-            strip_common_config_from_live_settings(&db, &AppType::Claude, &provider, live);
-        // 用户显式写的 ACW/MAX 保留
-        assert_eq!(
-            backfilled["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
-            json!("999999")
-        );
-        assert_eq!(
-            backfilled["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
-            json!("888888")
-        );
-    }
-
-    #[test]
     fn claude_backfill_keeps_user_edited_live_context_window_values() {
         let db = Database::memory().expect("create memory db");
         let provider = Provider::with_id(
@@ -5051,65 +4666,6 @@ base_url = "https://a.example/v1"
             backfilled["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
             json!("765432")
         );
-    }
-
-    #[test]
-    fn backfill_keeps_user_explicit_and_removes_auto_synced_values() {
-        let mut settings = json!({
-            "env": {
-                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "160000",
-                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "250000"
-            }
-        });
-        let provider = Provider::with_id(
-            "p".to_string(),
-            "P".to_string(),
-            json!({
-                "autoSyncState": {
-                    "lastWritten": { "ACW": "160000", "MAX": "200000" },
-                    "staticInjected": { "ACW": "262144", "MAX": "262144" },
-                    "userExplicit": { "ACW": null, "MAX": "250000" }
-                }
-            }),
-            None,
-        );
-        strip_auto_synced_context_defaults(&mut settings, &provider);
-        assert!(settings["env"]
-            .get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
-            .is_none());
-        assert_eq!(
-            settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
-            json!("250000")
-        );
-    }
-
-    #[test]
-    fn backfill_removes_auto_value_when_user_explicit_holds_a_different_value() {
-        let mut settings = json!({
-            "env": {
-                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "160000",
-                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "200000"
-            }
-        });
-        let provider = Provider::with_id(
-            "p".to_string(),
-            "P".to_string(),
-            json!({
-                "autoSyncState": {
-                    "lastWritten": { "ACW": "160000", "MAX": "200000" },
-                    "staticInjected": { "ACW": "262144", "MAX": "262144" },
-                    "userExplicit": { "ACW": null, "MAX": "250000" }
-                }
-            }),
-            None,
-        );
-        strip_auto_synced_context_defaults(&mut settings, &provider);
-        assert!(settings["env"]
-            .get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
-            .is_none());
-        assert!(settings["env"]
-            .get("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
-            .is_none());
     }
 
     #[test]
@@ -5239,27 +4795,6 @@ base_url = "https://a.example/v1"
     }
 
     #[test]
-    fn backfill_prefers_user_explicit_when_matching_last_written() {
-        let mut settings = json!({ "env": { "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "200000" } });
-        let provider = Provider::with_id(
-            "p".to_string(),
-            "P".to_string(),
-            json!({
-                "autoSyncState": {
-                    "lastWritten": { "MAX": "200000" },
-                    "userExplicit": { "MAX": "200000" }
-                }
-            }),
-            None,
-        );
-        strip_auto_synced_context_defaults(&mut settings, &provider);
-        assert_eq!(
-            settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
-            json!("200000")
-        );
-    }
-
-    #[test]
     fn backfill_keeps_provider_env_explicit_value_matching_last_written() {
         let mut settings = json!({
             "env": { "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "250000" }
@@ -5299,35 +4834,6 @@ base_url = "https://a.example/v1"
             None,
         );
         strip_auto_synced_context_defaults(&mut settings, &provider);
-        assert_eq!(
-            settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
-            json!("250000")
-        );
-    }
-
-    #[test]
-    fn backfill_ignores_non_string_short_user_explicit_marker() {
-        let mut settings = json!({
-            "env": {
-                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "950000",
-                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "250000"
-            }
-        });
-        let provider = Provider::with_id(
-            "p".to_string(),
-            "P".to_string(),
-            json!({
-                "env": { "ANTHROPIC_MODEL": "fallback-model[1M]" },
-                "autoSyncState": {
-                    "userExplicit": { "ACW": false, "MAX": "250000" }
-                }
-            }),
-            None,
-        );
-        strip_auto_synced_context_defaults(&mut settings, &provider);
-        assert!(settings["env"]
-            .get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
-            .is_none());
         assert_eq!(
             settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
             json!("250000")
