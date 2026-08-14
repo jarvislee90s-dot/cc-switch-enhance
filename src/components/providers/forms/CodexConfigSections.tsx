@@ -18,6 +18,7 @@ import {
   setCodexTopLevelInt,
   removeCodexTopLevelField,
 } from "@/utils/providerConfigUtils";
+import { parseWindowToken } from "./hooks/useModelState";
 
 interface CodexAuthSectionProps {
   value: string;
@@ -211,12 +212,13 @@ export const CodexConfigSection: React.FC<CodexConfigSectionProps> = ({
       fieldName: "model_context_window" | "model_auto_compact_token_limit",
       rawValue: string,
     ) => {
-      const numericValue = rawValue.replace(/[^\d]/g, "");
+      // 允许 K/M 尾缀（500K / 2m），解析由 parseWindowToken 完成。
+      const numericValue = parseWindowToken(rawValue.trim());
       const toml = numericValue
         ? setCodexTopLevelInt(
             localValueRef.current || "",
             fieldName,
-            Number(numericValue),
+            numericValue,
           )
         : removeCodexTopLevelField(localValueRef.current || "", fieldName);
       handleLocalChange(toml);
@@ -295,7 +297,7 @@ export const CodexConfigSection: React.FC<CodexConfigSectionProps> = ({
           <input
             type="text"
             inputMode="numeric"
-            pattern="[0-9]*"
+            pattern="[0-9]*[KkMm]?"
             aria-label={t("codexConfig.contextWindow")}
             value={topLevelIntValues.contextWindow}
             placeholder={t("codexConfig.contextWindowPlaceholder")}
@@ -313,7 +315,7 @@ export const CodexConfigSection: React.FC<CodexConfigSectionProps> = ({
           <input
             type="text"
             inputMode="numeric"
-            pattern="[0-9]*"
+            pattern="[0-9]*[KkMm]?"
             aria-label={t("codexConfig.autoCompactLimit")}
             value={topLevelIntValues.autoCompactLimit}
             placeholder={t("codexConfig.autoCompactLimitPlaceholder")}

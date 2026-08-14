@@ -64,7 +64,8 @@ describe("CodexConfigSection top-level integer fields", () => {
     const input = screen.getByLabelText(label) as HTMLInputElement;
     fireEvent.change(input, { target: { value: "12abc" } });
 
-    expect(input).toHaveValue("12");
+    // 不再硬剥非数字：非法 token 视为无效输入，字段被移除。
+    expect(input).toHaveValue("");
   });
 
   it.each([
@@ -83,5 +84,29 @@ describe("CodexConfigSection top-level integer fields", () => {
 
     const updated = onChange.mock.calls[0][0] as string;
     expect(updated).not.toMatch(new RegExp(`^${field}\\s*=`, "m"));
+  });
+
+  it("输入 500k 写入 model_context_window = 500000", () => {
+    const onChange = renderSection();
+
+    fireEvent.change(screen.getByLabelText("上下文大小"), {
+      target: { value: "500k" },
+    });
+
+    expect(onChange).toHaveBeenCalledWith(
+      expect.stringContaining("model_context_window = 500000"),
+    );
+  });
+
+  it("输入 2m 写入 model_auto_compact_token_limit = 2000000", () => {
+    const onChange = renderSection();
+
+    fireEvent.change(screen.getByLabelText("自动压缩阈值"), {
+      target: { value: "2m" },
+    });
+
+    expect(onChange).toHaveBeenCalledWith(
+      expect.stringContaining("model_auto_compact_token_limit = 2000000"),
+    );
   });
 });

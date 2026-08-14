@@ -113,7 +113,7 @@ describe("useModelState", () => {
     expect(result.current.defaultSonnetModelName).toBe("deepseek-v4-pro");
   });
 
-  it("writes clean Claude Code subagent model env and strips legacy suffix", () => {
+  it("writes Claude Code subagent model env raw without frontend stripping", () => {
     let latestConfig = JSON.stringify({
       env: {
         ANTHROPIC_MODEL: "fallback-model",
@@ -139,7 +139,7 @@ describe("useModelState", () => {
 
     let env = JSON.parse(latestConfig).env;
     expect(env.ANTHROPIC_MODEL).toBe("fallback-model");
-    expect(env.CLAUDE_CODE_SUBAGENT_MODEL).toBe("subagent-model");
+    expect(env.CLAUDE_CODE_SUBAGENT_MODEL).toBe("subagent-model[1M]");
 
     act(() => {
       result.current.handleModelChange("CLAUDE_CODE_SUBAGENT_MODEL", "");
@@ -221,7 +221,7 @@ describe("useModelState", () => {
     expect(parsed.contextWindows.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe(200000);
   });
 
-  it("handleModelChange 将新输入后缀迁移到 contextWindows", () => {
+  it("handleModelChange 保留新输入后缀原样并迁移到 contextWindows", () => {
     let latestConfig = JSON.stringify({
       env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "glm-5.2" },
     });
@@ -244,7 +244,7 @@ describe("useModelState", () => {
     });
 
     const parsed = JSON.parse(latestConfig);
-    expect(parsed.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("glm-5.3");
+    expect(parsed.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("glm-5.3[1M]");
     expect(parsed.contextWindows.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe(1000000);
   });
 
@@ -272,6 +272,35 @@ describe("useModelState", () => {
     expect(
       parsed.contextWindows?.ANTHROPIC_DEFAULT_SONNET_MODEL,
     ).toBeUndefined();
+  });
+
+  it("handleModelChange 输入 deepseek[200k] 后 model state 保留原样", () => {
+    let latestConfig = JSON.stringify({
+      env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "glm-5.2" },
+    });
+    const onConfigChange = vi.fn((config: string) => {
+      latestConfig = config;
+    });
+
+    const { result } = renderHook(() =>
+      useModelState({
+        settingsConfig: latestConfig,
+        onConfigChange,
+      }),
+    );
+
+    act(() => {
+      result.current.handleModelChange(
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "deepseek[200k]",
+      );
+    });
+
+    // 前端不再硬剥后缀：state 与 env 都保留原样，迁移交给保存路径。
+    expect(result.current.defaultSonnetModel).toBe("deepseek[200k]");
+    const parsed = JSON.parse(latestConfig);
+    expect(parsed.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("deepseek[200k]");
+    expect(parsed.contextWindows.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe(200000);
   });
 });
 describe("parseModelSuffix", () => {

@@ -316,6 +316,12 @@ export function ClaudeFormFields({
     [settingsConfig],
   );
 
+  // 上下文长度输入框：输入过程中保留用户原样字符串（支持 200k / 2m），
+  // 失焦时才解析写入 contextWindows；未输入时回退到已存值显示。
+  const [rawWindowInput, setRawWindowInput] = useState<Record<string, string>>(
+    {},
+  );
+
   const [autoSyncCompactRatioInput, setAutoSyncCompactRatioInput] = useState(
     () => formatAutoSyncCompactRatio(parseAutoSyncCompactRatio(settingsConfig)),
   );
@@ -409,6 +415,18 @@ export function ClaudeFormFields({
       );
     },
     [settingsConfig, onSettingsConfigChange],
+  );
+
+  const commitWindow = useCallback(
+    (field: ClaudeModelEnvField, raw: string) => {
+      handleContextWindowChange(field, raw.trim());
+      setRawWindowInput((prev) => {
+        const next = { ...prev };
+        delete next[field];
+        return next;
+      });
+    },
+    [handleContextWindowChange],
   );
 
   // 预设填充高级值后自动展开（仅从折叠→展开，不会自动折叠）
@@ -794,7 +812,7 @@ export function ClaudeFormFields({
   const handleRoleModelChange = (row: ModelRoleRow, value: string) => {
     const oldModelBase = stripModelSuffix(row.model).trim();
     // 窗口后缀由 contextWindows 承载，模型名保存时只保留干净名称。
-    const nextModel = stripModelSuffix(value).trim();
+    const nextModel = value.trim();
     const displayName = row.displayName?.trim() ?? "";
     const shouldSyncDisplayName = !displayName || displayName === oldModelBase;
     onModelChange(row.modelField, nextModel);
@@ -1163,7 +1181,7 @@ export function ClaudeFormFields({
                     )}
                     {renderModelInput(
                       row.inputId,
-                      modelBase,
+                      row.model,
                       row.modelField,
                       t("providerForm.modelPlaceholder", { defaultValue: "" }),
                       (value) => handleRoleModelChange(row, value),
@@ -1172,18 +1190,25 @@ export function ClaudeFormFields({
                       <Input
                         inputMode="text"
                         className="w-[90px] text-center font-mono text-sm"
-                        value={contextWindowInputValue(
-                          contextWindows,
-                          row.modelField,
-                          row.model,
-                        )}
-                        onChange={(event) => {
-                          // 上下文长度写入 settingsConfig.contextWindows，
-                          // 不再把窗口拼进模型名。
-                          handleContextWindowChange(
+                        value={
+                          rawWindowInput[row.modelField] ??
+                          contextWindowInputValue(
+                            contextWindows,
                             row.modelField,
-                            event.target.value,
-                          );
+                            row.model,
+                          )
+                        }
+                        onChange={(event) => {
+                          // 输入中原样显示（支持 K/M），失焦时再解析写入。
+                          setRawWindowInput((prev) => ({
+                            ...prev,
+                            [row.modelField]: event.target.value,
+                          }));
+                        }}
+                        onBlur={() => {
+                          const raw = rawWindowInput[row.modelField];
+                          if (raw === undefined) return;
+                          commitWindow(row.modelField, raw);
                         }}
                         placeholder={t(
                           "providerForm.modelContextWindowPlaceholder",
@@ -1275,28 +1300,32 @@ export function ClaudeFormFields({
               <div className="grid grid-cols-1 gap-2 md:grid-cols-[1fr_minmax(0,104px)]">
                 {renderModelInput(
                   "claudeModel",
-                  stripModelSuffix(claudeModel),
+                  claudeModel,
                   "ANTHROPIC_MODEL",
                   t("providerForm.modelPlaceholder", { defaultValue: "" }),
-                  (value) =>
-                    onModelChange(
-                      "ANTHROPIC_MODEL",
-                      stripModelSuffix(value).trim(),
-                    ),
+                  (value) => onModelChange("ANTHROPIC_MODEL", value.trim()),
                 )}
                 <Input
                   inputMode="text"
                   className="w-[90px] text-center font-mono text-sm"
-                  value={contextWindowInputValue(
-                    contextWindows,
-                    "ANTHROPIC_MODEL",
-                    claudeModel,
-                  )}
-                  onChange={(event) => {
-                    handleContextWindowChange(
+                  value={
+                    rawWindowInput.ANTHROPIC_MODEL ??
+                    contextWindowInputValue(
+                      contextWindows,
                       "ANTHROPIC_MODEL",
-                      event.target.value,
-                    );
+                      claudeModel,
+                    )
+                  }
+                  onChange={(event) => {
+                    setRawWindowInput((prev) => ({
+                      ...prev,
+                      ANTHROPIC_MODEL: event.target.value,
+                    }));
+                  }}
+                  onBlur={() => {
+                    const raw = rawWindowInput.ANTHROPIC_MODEL;
+                    if (raw === undefined) return;
+                    commitWindow("ANTHROPIC_MODEL", raw);
                   }}
                   placeholder={t("providerForm.modelContextWindowPlaceholder", {
                     defaultValue: "1M / 200K",

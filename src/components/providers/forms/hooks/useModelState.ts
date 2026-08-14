@@ -349,9 +349,9 @@ export function useModelState({
     (field: ClaudeModelEnvField, value: string) => {
       isUserEditingRef.current = true;
 
-      const nextValue = MODEL_ENV_FIELDS.includes(field)
-        ? stripModelSuffix(value).trim()
-        : value.trim();
+      // 前端不再硬剥模型后缀（允许 deepseek[200k] 原样输入），
+      // 剥离与迁移由保存路径 migrateLegacyModelSuffixes 完成。
+      const nextValue = value.trim();
 
       if (field === "ANTHROPIC_MODEL") setClaudeModel(nextValue);
       if (field === "ANTHROPIC_DEFAULT_HAIKU_MODEL")

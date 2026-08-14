@@ -245,7 +245,7 @@ describe("ClaudeFormFields", () => {
     );
   });
 
-  it("角色模型名输入从旧后缀模型改为新模型时不回填后缀", () => {
+  it("角色模型名输入保留新模型后缀原样，不前端剥离", () => {
     const onModelChange = vi.fn();
     renderCopilotForm({
       defaultSonnetModel: "claude-sonnet[200k]",
@@ -253,14 +253,10 @@ describe("ClaudeFormFields", () => {
       onModelChange,
     });
 
-    const modelInput = screen.getByDisplayValue("claude-sonnet");
-    fireEvent.change(modelInput, { target: { value: "glm-5.2[100k]" } });
+    const modelInput = screen.getByDisplayValue("claude-sonnet[200k]");
+    fireEvent.change(modelInput, { target: { value: "glm-5.2[200k]" } });
 
     expect(onModelChange).toHaveBeenCalledWith(
-      "ANTHROPIC_DEFAULT_SONNET_MODEL",
-      "glm-5.2",
-    );
-    expect(onModelChange).not.toHaveBeenCalledWith(
       "ANTHROPIC_DEFAULT_SONNET_MODEL",
       "glm-5.2[200k]",
     );
@@ -273,7 +269,7 @@ describe("ClaudeFormFields", () => {
       }),
     );
 
-    const modelInput = screen.getByDisplayValue("glm-5.2");
+    const modelInput = document.getElementById("claudeDefaultSonnetModel") as HTMLInputElement;
     fireEvent.change(modelInput, { target: { value: "glm-5.3" } });
 
     const config = getConfig();
@@ -294,6 +290,7 @@ describe("ClaudeFormFields", () => {
 
     const contextInputs = screen.getAllByLabelText("Context Window");
     fireEvent.change(contextInputs[0], { target: { value: "1.5M" } });
+    fireEvent.blur(contextInputs[0]);
 
     expect(onSettingsConfigChange).not.toHaveBeenCalled();
   });
@@ -328,6 +325,7 @@ describe("ClaudeFormFields", () => {
     // [0] Sonnet, [1] Opus, [2] Fable, [3] Haiku, [4] Subagent, [5] 兜底模型
     const contextInputs = screen.getAllByLabelText("Context Window");
     fireEvent.change(contextInputs[0], { target: { value: "1M" } });
+    fireEvent.blur(contextInputs[0]);
 
     expect(onModelChange).not.toHaveBeenCalled();
     const updated = JSON.parse(onSettingsConfigChange.mock.calls[0][0]);
@@ -348,6 +346,7 @@ describe("ClaudeFormFields", () => {
 
     const contextInputs = screen.getAllByLabelText("Context Window");
     fireEvent.change(contextInputs[0], { target: { value: "200K" } });
+    fireEvent.blur(contextInputs[0]);
 
     const updated = JSON.parse(onSettingsConfigChange.mock.calls[0][0]);
     expect(updated.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("model");
@@ -368,6 +367,7 @@ describe("ClaudeFormFields", () => {
 
     const contextInputs = screen.getAllByLabelText("Context Window");
     fireEvent.change(contextInputs[0], { target: { value: "" } });
+    fireEvent.blur(contextInputs[0]);
 
     const updated = JSON.parse(onSettingsConfigChange.mock.calls[0][0]);
     expect(updated.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("model");
@@ -393,6 +393,7 @@ describe("ClaudeFormFields", () => {
     expect(contextInputs[5]).toHaveValue("800000");
 
     fireEvent.change(contextInputs[5], { target: { value: "200K" } });
+    fireEvent.blur(contextInputs[5]);
 
     expect(onModelChange).not.toHaveBeenCalled();
     const updated = JSON.parse(onSettingsConfigChange.mock.calls[0][0]);
@@ -400,17 +401,20 @@ describe("ClaudeFormFields", () => {
     expect(updated.contextWindows.ANTHROPIC_MODEL).toBe(200000);
   });
 
-  it("兜底模型名输入会剥离旧后缀", () => {
+  it("兜底模型名输入保留新模型后缀原样", () => {
     const onModelChange = vi.fn();
     renderCopilotForm({
       claudeModel: "fallback-model[1M]",
       onModelChange,
     });
 
-    const modelInput = screen.getByDisplayValue("fallback-model");
+    const modelInput = document.getElementById("claudeModel") as HTMLInputElement;
     fireEvent.change(modelInput, { target: { value: "new-model[200K]" } });
 
-    expect(onModelChange).toHaveBeenCalledWith("ANTHROPIC_MODEL", "new-model");
+    expect(onModelChange).toHaveBeenCalledWith(
+      "ANTHROPIC_MODEL",
+      "new-model[200K]",
+    );
   });
 
   it("关闭自动同步开关时走独立回调，避免被整包 settingsConfig 更新覆盖", () => {
@@ -590,5 +594,42 @@ describe("ClaudeFormFields", () => {
     });
 
     expect(screen.getByLabelText("压缩比例")).toBeDisabled();
+  });
+
+  it("上下文长度框输入 200k 原样显示，失焦后写入 contextWindows 200000", () => {
+    const onSettingsConfigChange = vi.fn();
+    renderCopilotForm({
+      defaultSonnetModel: "claude-sonnet",
+      settingsConfig: JSON.stringify({
+        env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet" },
+      }),
+      onSettingsConfigChange,
+    });
+
+    const contextInputs = screen.getAllByLabelText("Context Window");
+    fireEvent.change(contextInputs[0], { target: { value: "200k" } });
+    expect(contextInputs[0]).toHaveValue("200k");
+
+    fireEvent.blur(contextInputs[0]);
+    const updated = JSON.parse(onSettingsConfigChange.mock.calls[0][0]);
+    expect(updated.contextWindows.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe(200000);
+  });
+
+  it("模型名输入 glm-5.2[200k] 原样显示，不前端剥离", () => {
+    renderStatefulCopilotForm(
+      JSON.stringify({
+        env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "glm-5.2" },
+      }),
+    );
+
+    const modelInput = document.getElementById("claudeDefaultSonnetModel") as HTMLInputElement;
+    fireEvent.change(modelInput, { target: { value: "glm-5.2[200k]" } });
+
+    // 模型名输入框原样显示带后缀值（显示名输入可能同值，故按 id 断言）。
+    expect(
+
+      (document.getElementById("claudeDefaultSonnetModel") as HTMLInputElement)
+        .value,
+    ).toBe("glm-5.2[200k]");
   });
 });
