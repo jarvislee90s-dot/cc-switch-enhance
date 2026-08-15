@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import {
@@ -422,15 +429,53 @@ export function ClaudeFormFields({
 
   const commitWindow = useCallback(
     (field: ClaudeModelEnvField, raw: string) => {
-      handleContextWindowChange(field, raw.trim());
+      const trimmed = raw.trim();
+      const window = trimmed ? parseContextWindowInput(trimmed) : null;
+      const accepted = !trimmed || window !== null;
+      if (accepted) {
+        handleContextWindowChange(field, trimmed);
+      }
       setRawWindowInput((prev) => {
         const next = { ...prev };
-        delete next[field];
+        if (trimmed && window !== null) {
+          // 合法 K/M 输入：解析值已写入 contextWindows，输入框继续原样显示。
+          next[field] = trimmed;
+        } else {
+          // 空或非法输入：回退到已存值显示，避免把非法文本误当成已提交。
+          delete next[field];
+        }
         return next;
       });
     },
     [handleContextWindowChange],
   );
+
+  // 回车只结束该输入框的编辑状态（等价于失焦提交解析），不触发表单整体保存。
+  const commitContextWindowFromKeyDown = useCallback(
+    (
+      event: ReactKeyboardEvent<HTMLInputElement>,
+      field: ClaudeModelEnvField,
+    ) => {
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      event.stopPropagation();
+      const raw = rawWindowInput[field];
+      if (raw !== undefined) {
+        commitWindow(field, raw);
+      }
+      event.currentTarget.blur();
+    },
+    [commitWindow, rawWindowInput],
+  );
+
+  const clearRawWindowInput = useCallback((field: ClaudeModelEnvField) => {
+    setRawWindowInput((prev) => {
+      if (!(field in prev)) return prev;
+      const next = { ...prev };
+      delete next[field];
+      return next;
+    });
+  }, []);
 
   // 预设填充高级值后自动展开（仅从折叠→展开，不会自动折叠）
   useEffect(() => {
@@ -820,6 +865,10 @@ export function ClaudeFormFields({
     const displayName = row.displayName?.trim() ?? "";
     const shouldSyncDisplayName = !displayName || displayName === oldModelBase;
     onModelChange(row.modelField, nextModel);
+    // 模型名变化后窗口值可能随之变化（后缀迁移），清掉该角色的原样输入缓存。
+    if (nextModel !== row.model) {
+      clearRawWindowInput(row.modelField);
+    }
     if (row.displayNameField && shouldSyncDisplayName) {
       onModelChange(row.displayNameField, stripModelSuffix(nextModel).trim());
     }
@@ -1214,6 +1263,9 @@ export function ClaudeFormFields({
                           if (raw === undefined) return;
                           commitWindow(row.modelField, raw);
                         }}
+                        onKeyDown={(event) =>
+                          commitContextWindowFromKeyDown(event, row.modelField)
+                        }
                         placeholder={t(
                           "providerForm.modelContextWindowPlaceholder",
                           {
@@ -1315,7 +1367,10 @@ export function ClaudeFormFields({
                   claudeModel,
                   "ANTHROPIC_MODEL",
                   t("providerForm.modelPlaceholder", { defaultValue: "" }),
-                  (value) => onModelChange("ANTHROPIC_MODEL", value.trim()),
+                  (value) => {
+                    clearRawWindowInput("ANTHROPIC_MODEL");
+                    onModelChange("ANTHROPIC_MODEL", value.trim());
+                  },
                 )}
                 <Input
                   inputMode="text"
@@ -1339,6 +1394,9 @@ export function ClaudeFormFields({
                     if (raw === undefined) return;
                     commitWindow("ANTHROPIC_MODEL", raw);
                   }}
+                  onKeyDown={(event) =>
+                    commitContextWindowFromKeyDown(event, "ANTHROPIC_MODEL")
+                  }
                   placeholder={t("providerForm.modelContextWindowPlaceholder", {
                     defaultValue: "1M / 200K",
                   })}

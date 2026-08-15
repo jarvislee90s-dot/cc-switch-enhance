@@ -622,6 +622,48 @@ describe("ClaudeFormFields", () => {
     fireEvent.blur(contextInputs[0]);
     const updated = JSON.parse(onSettingsConfigChange.mock.calls[0][0]);
     expect(updated.contextWindows.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe(200000);
+    // 合法 K/M 输入失焦后仍原样显示，不再受控归一化成数字。
+    expect(contextInputs[0]).toHaveValue("200k");
+  });
+
+  it("上下文长度框输入 2m 后按回车只结束编辑状态并写入解析值", () => {
+    const onSettingsConfigChange = vi.fn();
+    renderCopilotForm({
+      defaultSonnetModel: "claude-sonnet",
+      settingsConfig: JSON.stringify({
+        env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet" },
+      }),
+      onSettingsConfigChange,
+    });
+
+    const contextInputs = screen.getAllByLabelText("Context Window");
+    fireEvent.focus(contextInputs[0]);
+    fireEvent.change(contextInputs[0], { target: { value: "2m" } });
+    fireEvent.keyDown(contextInputs[0], { key: "Enter" });
+
+    // 回车即提交解析（等价于失焦），不依赖表单保存。
+    const updated = JSON.parse(onSettingsConfigChange.mock.calls[0][0]);
+    expect(updated.contextWindows.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe(2000000);
+    expect(contextInputs[0]).toHaveValue("2m");
+  });
+
+  it("上下文长度框非法输入失焦后回退到已存值且不写入", () => {
+    const onSettingsConfigChange = vi.fn();
+    renderCopilotForm({
+      defaultSonnetModel: "claude-sonnet",
+      settingsConfig: JSON.stringify({
+        env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet" },
+        contextWindows: { ANTHROPIC_DEFAULT_SONNET_MODEL: 200000 },
+      }),
+      onSettingsConfigChange,
+    });
+
+    const contextInputs = screen.getAllByLabelText("Context Window");
+    fireEvent.change(contextInputs[0], { target: { value: "200M3" } });
+    fireEvent.blur(contextInputs[0]);
+
+    expect(onSettingsConfigChange).not.toHaveBeenCalled();
+    expect(contextInputs[0]).toHaveValue("200000");
   });
 
   it("模型名输入 glm-5.2[200k] 原样显示，不前端剥离", () => {
