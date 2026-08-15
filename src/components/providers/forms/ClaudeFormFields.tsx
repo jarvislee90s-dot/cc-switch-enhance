@@ -202,6 +202,8 @@ interface ClaudeFormFieldsProps {
   onLocalProxyHeadersOverrideChange: (value: string) => void;
   localProxyBodyOverride: string;
   onLocalProxyBodyOverrideChange: (value: string) => void;
+  /** 路由（代理接管）模式：直连时自动同步开关禁用 */
+  isProxyTakeover?: boolean;
   settingsConfig?: string;
   onSettingsConfigChange?: (config: string) => void;
   onAutoSyncContextWindowChange?: (checked: boolean) => void;
@@ -271,6 +273,7 @@ export function ClaudeFormFields({
   onLocalProxyHeadersOverrideChange,
   localProxyBodyOverride,
   onLocalProxyBodyOverrideChange,
+  isProxyTakeover = true,
   settingsConfig,
   onSettingsConfigChange,
   onAutoSyncContextWindowChange,
@@ -1234,8 +1237,9 @@ export function ClaudeFormFields({
                 })}
               </span>
               <Switch
-                checked={autoSyncContextWindow}
+                checked={isProxyTakeover && autoSyncContextWindow}
                 onCheckedChange={handleAutoSyncChange}
+                disabled={!isProxyTakeover}
                 aria-label={t("providerForm.autoSyncContextWindow", {
                   defaultValue: "自动同步模型上下文长度",
                 })}
@@ -1267,6 +1271,13 @@ export function ClaudeFormFields({
                 })}
               />
             </div>
+            {!isProxyTakeover && (
+              <p className="mt-1.5 ml-1 text-xs leading-relaxed text-muted-foreground">
+                {t("providerForm.autoSyncContextWindowRouteOnly", {
+                  defaultValue: "自动同步仅在路由（代理接管）模式下可用",
+                })}
+              </p>
+            )}
             {autoSyncCompactRatioError && (
               <p className="mt-1.5 ml-1 text-xs text-red-500">
                 {autoSyncCompactRatioError}

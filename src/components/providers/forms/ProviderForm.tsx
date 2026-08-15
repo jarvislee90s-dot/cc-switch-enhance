@@ -2243,6 +2243,7 @@ function ProviderFormFull({
           {appId === "claude" && (
             <ClaudeFormFields
               providerId={providerId}
+              isProxyTakeover={isProxyTakeover}
               shouldShowApiKey={
                 (category !== "cloud_provider" ||
                   hasApiKeyField(form.getValues("settingsConfig"), "claude")) &&

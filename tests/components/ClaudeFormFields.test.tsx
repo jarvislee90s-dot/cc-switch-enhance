@@ -632,4 +632,42 @@ describe("ClaudeFormFields", () => {
         .value,
     ).toBe("glm-5.2[200k]");
   });
+
+  it("路由模式下自动同步开关可切换", () => {
+    const onSettingsConfigChange = vi.fn();
+    renderCopilotForm({
+      settingsConfig: JSON.stringify({ env: {}, autoSyncContextWindow: false }),
+      isProxyTakeover: true,
+      onSettingsConfigChange,
+    });
+
+    const toggle = screen.getByRole("switch", {
+      name: "自动同步模型上下文长度",
+    });
+    expect(toggle).not.toBeDisabled();
+
+    fireEvent.click(toggle);
+    expect(onSettingsConfigChange).toHaveBeenCalled();
+  });
+
+  it("直连模式下自动同步开关禁用且视为关闭，并提示仅路由可用", () => {
+    const onSettingsConfigChange = vi.fn();
+    renderCopilotForm({
+      settingsConfig: JSON.stringify({ env: {}, autoSyncContextWindow: true }),
+      isProxyTakeover: false,
+      onSettingsConfigChange,
+    });
+
+    const toggle = screen.getByRole("switch", {
+      name: "自动同步模型上下文长度",
+    });
+    expect(toggle).toBeDisabled();
+    expect(toggle).toHaveAttribute("data-state", "unchecked");
+    expect(
+      screen.getByText("自动同步仅在路由（代理接管）模式下可用"),
+    ).toBeInTheDocument();
+
+    fireEvent.click(toggle);
+    expect(onSettingsConfigChange).not.toHaveBeenCalled();
+  });
 });
