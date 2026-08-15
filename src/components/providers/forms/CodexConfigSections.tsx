@@ -330,6 +330,13 @@ export const CodexConfigSection: React.FC<CodexConfigSectionProps> = ({
         </label>
       </div>
 
+      <p className="text-xs text-muted-foreground">
+        {t("codexConfig.contextWindowGlobalHint", {
+          defaultValue:
+            "全局上下文大小：填写后所有模型统一使用该长度；不填则以每个模型填写的上下文为准。压缩比例默认 0.95。",
+        })}
+      </p>
+
       <JsonEditor
         value={localValue}
         onChange={handleLocalChange}

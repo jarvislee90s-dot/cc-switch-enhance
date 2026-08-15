@@ -8,6 +8,8 @@ vi.mock("react-i18next", () => ({
       ({
         "codexConfig.contextWindow": "上下文大小",
         "codexConfig.autoCompactLimit": "自动压缩阈值",
+        "codexConfig.contextWindowGlobalHint":
+          "全局上下文大小：填写后所有模型统一使用该长度；不填则以每个模型填写的上下文为准。压缩比例默认 0.95。",
       })[key] ?? key,
   }),
 }));
@@ -108,5 +110,15 @@ describe("CodexConfigSection top-level integer fields", () => {
     expect(onChange).toHaveBeenCalledWith(
       expect.stringContaining("model_auto_compact_token_limit = 2000000"),
     );
+  });
+
+  it("展示全局上下文大小说明", () => {
+    renderSection();
+
+    expect(
+      screen.getByText(
+        "全局上下文大小：填写后所有模型统一使用该长度；不填则以每个模型填写的上下文为准。压缩比例默认 0.95。",
+      ),
+    ).toBeInTheDocument();
   });
 });

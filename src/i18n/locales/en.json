@@ -1365,6 +1365,7 @@
     "autoCompactLimit": "Auto Compact Limit",
     "autoCompactLimitPlaceholder": "e.g., 90000",
     "autoCompactLimitHint": "Auto-compacts history when context reaches this token limit",
+    "contextWindowGlobalHint": "Global context size: when set, all models use this length; when empty, each model's own context window is used. Compact ratio defaults to 0.95.",
     "modelMetadataAdvanced": "Model Metadata Advanced Options",
     "modelMetadataAdvancedHint": "Overrides Codex metadata for unknown models; clearing a field removes the matching config.toml entry.",
     "defaultModelLabel": "Default Model",

@@ -1365,6 +1365,7 @@
     "autoCompactLimit": "自動圧縮しきい値",
     "autoCompactLimitPlaceholder": "例: 90000",
     "autoCompactLimitHint": "コンテキストトークン数がこのしきい値に達すると履歴を自動圧縮",
+    "contextWindowGlobalHint": "グローバルコンテキストサイズ：設定するとすべてのモデルがこの長さを使用します。未設定の場合は各モデルのコンテキストウィンドウが使用されます。圧縮比率はデフォルトで0.95です。",
     "modelMetadataAdvanced": "モデルメタデータ詳細オプション",
     "modelMetadataAdvancedHint": "未知のモデル向けに Codex メタデータを上書きします。空にすると対応する config.toml 設定を削除します。",
     "defaultModelLabel": "デフォルトモデル",
