@@ -273,7 +273,7 @@ export function ClaudeFormFields({
   onLocalProxyHeadersOverrideChange,
   localProxyBodyOverride,
   onLocalProxyBodyOverrideChange,
-  isProxyTakeover = true,
+  isProxyTakeover = false,
   settingsConfig,
   onSettingsConfigChange,
   onAutoSyncContextWindowChange,
@@ -814,13 +814,14 @@ export function ClaudeFormFields({
 
   const handleRoleModelChange = (row: ModelRoleRow, value: string) => {
     const oldModelBase = stripModelSuffix(row.model).trim();
-    // 窗口后缀由 contextWindows 承载，模型名保存时只保留干净名称。
+    // 模型字段保留用户原样输入（可含 [200k] 后缀，保存路径负责剥离迁移）；
+    // display-name 始终同步干净模型名（不带窗口后缀）。
     const nextModel = value.trim();
     const displayName = row.displayName?.trim() ?? "";
     const shouldSyncDisplayName = !displayName || displayName === oldModelBase;
     onModelChange(row.modelField, nextModel);
     if (row.displayNameField && shouldSyncDisplayName) {
-      onModelChange(row.displayNameField, nextModel);
+      onModelChange(row.displayNameField, stripModelSuffix(nextModel).trim());
     }
   };
 
@@ -1265,7 +1266,7 @@ export function ClaudeFormFields({
                   handleAutoSyncCompactRatioChange(event.target.value)
                 }
                 onBlur={handleAutoSyncCompactRatioBlur}
-                disabled={!autoSyncContextWindow}
+                disabled={!(isProxyTakeover && autoSyncContextWindow)}
                 aria-label={t("providerForm.autoSyncCompactRatio", {
                   defaultValue: "压缩比例",
                 })}

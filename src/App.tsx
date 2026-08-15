@@ -1669,7 +1669,7 @@ function App() {
         }}
         onSubmit={handleEditProvider}
         appId={activeApp}
-        isProxyTakeover={isCurrentAppTakeoverActive}
+        isProxyTakeover={isProxyRunning && isCurrentAppTakeoverActive}
       />
 
       {effectiveUsageProvider && (

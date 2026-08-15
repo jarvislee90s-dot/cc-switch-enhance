@@ -2378,7 +2378,7 @@ impl ProxyService {
         false
     }
 
-    fn is_claude_live_taken_over(config: &Value) -> bool {
+    pub(crate) fn is_claude_live_taken_over(config: &Value) -> bool {
         let env = match config.get("env").and_then(|v| v.as_object()) {
             Some(env) => env,
             None => return false,

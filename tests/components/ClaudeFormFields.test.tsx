@@ -269,7 +269,9 @@ describe("ClaudeFormFields", () => {
       }),
     );
 
-    const modelInput = document.getElementById("claudeDefaultSonnetModel") as HTMLInputElement;
+    const modelInput = document.getElementById(
+      "claudeDefaultSonnetModel",
+    ) as HTMLInputElement;
     fireEvent.change(modelInput, { target: { value: "glm-5.3" } });
 
     const config = getConfig();
@@ -408,7 +410,9 @@ describe("ClaudeFormFields", () => {
       onModelChange,
     });
 
-    const modelInput = document.getElementById("claudeModel") as HTMLInputElement;
+    const modelInput = document.getElementById(
+      "claudeModel",
+    ) as HTMLInputElement;
     fireEvent.change(modelInput, { target: { value: "new-model[200K]" } });
 
     expect(onModelChange).toHaveBeenCalledWith(
@@ -422,6 +426,7 @@ describe("ClaudeFormFields", () => {
     const onSettingsConfigChange = vi.fn();
     renderCopilotForm({
       settingsConfig: JSON.stringify({ env: {}, autoSyncContextWindow: true }),
+      isProxyTakeover: true,
       onSettingsConfigChange,
       onAutoSyncContextWindowChange,
     });
@@ -447,6 +452,7 @@ describe("ClaudeFormFields", () => {
         },
         autoSyncContextWindow: true,
       }),
+      isProxyTakeover: true,
       onSettingsConfigChange,
     });
 
@@ -466,6 +472,7 @@ describe("ClaudeFormFields", () => {
   it("开关打开和关闭时显示对应的上下文同步提示", () => {
     renderCopilotForm({
       settingsConfig: JSON.stringify({ env: {}, autoSyncContextWindow: true }),
+      isProxyTakeover: true,
     });
 
     expect(
@@ -481,9 +488,7 @@ describe("ClaudeFormFields", () => {
     );
 
     expect(
-      screen.getByText(
-        "关闭后，切换模型不再自动更新上下文长度与压缩阈值。",
-      ),
+      screen.getByText("关闭后，切换模型不再自动更新上下文长度与压缩阈值。"),
     ).toBeInTheDocument();
   });
 
@@ -525,6 +530,7 @@ describe("ClaudeFormFields", () => {
     const onAutoSyncCompactRatioChange = vi.fn();
     renderCopilotForm({
       settingsConfig: JSON.stringify({ env: {}, autoSyncContextWindow: true }),
+      isProxyTakeover: true,
       onAutoSyncCompactRatioChange,
     });
 
@@ -539,6 +545,7 @@ describe("ClaudeFormFields", () => {
     const onAutoSyncCompactRatioChange = vi.fn();
     renderCopilotForm({
       settingsConfig: JSON.stringify({ env: {}, autoSyncContextWindow: true }),
+      isProxyTakeover: true,
       onAutoSyncCompactRatioChange,
     });
 
@@ -557,6 +564,7 @@ describe("ClaudeFormFields", () => {
         autoSyncContextWindow: true,
         autoSyncCompactRatio: 0.8,
       }),
+      isProxyTakeover: true,
       onAutoSyncCompactRatioChange,
     });
 
@@ -571,6 +579,7 @@ describe("ClaudeFormFields", () => {
     const onAutoSyncCompactRatioChange = vi.fn();
     renderCopilotForm({
       settingsConfig: JSON.stringify({ env: {}, autoSyncContextWindow: true }),
+      isProxyTakeover: true,
       onAutoSyncCompactRatioChange,
     });
 
@@ -622,15 +631,33 @@ describe("ClaudeFormFields", () => {
       }),
     );
 
-    const modelInput = document.getElementById("claudeDefaultSonnetModel") as HTMLInputElement;
+    const modelInput = document.getElementById(
+      "claudeDefaultSonnetModel",
+    ) as HTMLInputElement;
     fireEvent.change(modelInput, { target: { value: "glm-5.2[200k]" } });
 
     // 模型名输入框原样显示带后缀值（显示名输入可能同值，故按 id 断言）。
     expect(
-
       (document.getElementById("claudeDefaultSonnetModel") as HTMLInputElement)
         .value,
     ).toBe("glm-5.2[200k]");
+  });
+
+  it("模型名带 [200k] 后缀时 display-name 同步干净名、模型字段保留后缀", () => {
+    const { getConfig } = renderStatefulCopilotForm(
+      JSON.stringify({
+        env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "glm-5.2" },
+      }),
+    );
+
+    const modelInput = document.getElementById(
+      "claudeDefaultSonnetModel",
+    ) as HTMLInputElement;
+    fireEvent.change(modelInput, { target: { value: "glm-5.2[200k]" } });
+
+    const config = getConfig();
+    expect(config.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("glm-5.2[200k]");
+    expect(config.env.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME).toBe("glm-5.2");
   });
 
   it("路由模式下自动同步开关可切换", () => {

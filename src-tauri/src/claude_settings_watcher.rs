@@ -296,6 +296,16 @@ fn handle_settings_change(
         }
     };
 
+    // 只有路由（代理接管）模式才由 watcher 自动同步 ACW/MAX：直连状态下
+    // live settings.json 不含接管占位符，此时即使 DB 开关仍为 true（例如用户
+    // 曾路由模式开开关后转直连），watcher 也绝不回写 ACW/MAX。
+    if !crate::services::proxy::ProxyService::is_claude_live_taken_over(&v) {
+        log::debug!(
+            "[ClaudeSettingsWatcher] live settings not in takeover state, skip ACW/MAX write"
+        );
+        return;
+    }
+
     let new_model = v.get("model").and_then(Value::as_str);
     let new_acw = v
         .pointer("/env/CLAUDE_CODE_AUTO_COMPACT_WINDOW")
@@ -486,6 +496,25 @@ mod tests {
                 Err("db unavailable".to_string())
             }
         })
+    }
+
+    /// 给 live settings.json 注入接管占位符，模拟路由（代理接管）状态。
+    /// I1 守卫：直连（无占位符）时 watcher 不写 ACW/MAX，所有断言"写成功"的
+    /// 测试都必须用本 helper 生成接管态 live 文件。
+    fn taken_over_live(mut live: Value) -> Value {
+        let obj = live
+            .as_object_mut()
+            .expect("live settings must be a JSON object");
+        let env = obj
+            .entry("env".to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        env.as_object_mut()
+            .expect("live env must be a JSON object")
+            .insert(
+                "ANTHROPIC_AUTH_TOKEN".to_string(),
+                Value::String("PROXY_MANAGED".to_string()),
+            );
+        live
     }
 
     // ========== Task 2: 角色映射测试 ==========
@@ -1025,7 +1054,7 @@ mod tests {
                 "ANTHROPIC_DEFAULT_SONNET_MODEL":"MiniMax-M3[1M]","ANTHROPIC_DEFAULT_HAIKU_MODEL":"Kimi-K2.7-Code[30k]"
             }
         });
-        fs::write(&path, initial.to_string()).unwrap();
+        fs::write(&path, taken_over_live(initial).to_string()).unwrap();
 
         let provider = Arc::new(Mutex::new(Provider::with_id(
             "p".to_string(),
@@ -1050,7 +1079,7 @@ mod tests {
                 "ANTHROPIC_DEFAULT_SONNET_MODEL":"MiniMax-M3[1M]","ANTHROPIC_DEFAULT_HAIKU_MODEL":"Kimi-K2.7-Code[30k]"
             }
         });
-        fs::write(&path, new_content.to_string()).unwrap();
+        fs::write(&path, taken_over_live(new_content).to_string()).unwrap();
 
         // 等待 debouncer + 文件写入生效
         thread::sleep(Duration::from_millis(800));
@@ -1081,7 +1110,7 @@ mod tests {
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL": "Kimi-K2.7-Code[30k]"
             }
         });
-        fs::write(&path, initial.to_string()).unwrap();
+        fs::write(&path, taken_over_live(initial).to_string()).unwrap();
 
         let provider = Arc::new(Mutex::new(Provider::with_id(
             "p".to_string(),
@@ -1107,7 +1136,7 @@ mod tests {
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL": "Kimi-K2.7-Code[30k]"
             }
         });
-        fs::write(&path, new_content.to_string()).unwrap();
+        fs::write(&path, taken_over_live(new_content).to_string()).unwrap();
 
         thread::sleep(Duration::from_millis(800));
 
@@ -1136,7 +1165,7 @@ mod tests {
             },
             "autoSyncState": { "staticInjected": { "ACW": "262144", "MAX": "262144" } }
         });
-        fs::write(&path, initial.to_string()).unwrap();
+        fs::write(&path, taken_over_live(initial).to_string()).unwrap();
 
         let provider = Mutex::new(Provider::with_id(
             "kimi".to_string(),
@@ -1177,7 +1206,7 @@ mod tests {
             },
             "autoSyncState": { "staticInjected": { "ACW": "372000", "MAX": "372000" } }
         });
-        fs::write(&path, initial.to_string()).unwrap();
+        fs::write(&path, taken_over_live(initial).to_string()).unwrap();
 
         let provider = Mutex::new(Provider::with_id(
             "codex-oauth".to_string(),
@@ -1216,7 +1245,7 @@ mod tests {
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-5.5-mini"
             }
         });
-        fs::write(&path, initial.to_string()).unwrap();
+        fs::write(&path, taken_over_live(initial).to_string()).unwrap();
 
         let provider = Mutex::new(Provider::with_id(
             "codex-oauth-non-gpt56".to_string(),
@@ -1279,13 +1308,13 @@ mod tests {
         // 首次写：触发 watcher 建立快照并写入 ACW/MAX（1M 窗口）
         fs::write(
             &path,
-            json!({
+            taken_over_live(json!({
                 "model": "sonnet",
                 "env": {
                     "ANTHROPIC_DEFAULT_SONNET_MODEL":"MiniMax-M3[1M]",
                     "ANTHROPIC_DEFAULT_HAIKU_MODEL":"Kimi-K2.7-Code[30k]"
                 }
-            })
+            }))
             .to_string(),
         )
         .unwrap();
@@ -1294,14 +1323,14 @@ mod tests {
         // 只改 effortLevel（model / ACW / MAX 均未变化）→ 不应重写
         fs::write(
             &path,
-            json!({
+            taken_over_live(json!({
                 "model": "sonnet",
                 "effortLevel": "max",
                 "env": {
                     "ANTHROPIC_DEFAULT_SONNET_MODEL":"MiniMax-M3[1M]",
                     "ANTHROPIC_DEFAULT_HAIKU_MODEL":"Kimi-K2.7-Code[30k]"
                 }
-            })
+            }))
             .to_string(),
         )
         .unwrap();
@@ -1356,7 +1385,7 @@ mod tests {
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL":"Kimi-K2.7-Code[30k]"
             }
         });
-        fs::write(&path, initial.to_string()).unwrap();
+        fs::write(&path, taken_over_live(initial).to_string()).unwrap();
 
         let provider = Arc::new(Mutex::new(Provider::with_id(
             "p".to_string(),
@@ -1385,7 +1414,7 @@ mod tests {
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL":"Kimi-K2.7-Code[30k]"
             }
         });
-        fs::write(&path, new_content.to_string()).unwrap();
+        fs::write(&path, taken_over_live(new_content).to_string()).unwrap();
 
         thread::sleep(Duration::from_millis(800));
 
@@ -1414,7 +1443,7 @@ mod tests {
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL":"Kimi-K2.7-Code[30k]"
             }
         });
-        fs::write(&path, initial.to_string()).unwrap();
+        fs::write(&path, taken_over_live(initial).to_string()).unwrap();
 
         // provider 显式关闭 autoSyncContextWindow
         let provider = Arc::new(Mutex::new(Provider::with_id(
@@ -1442,7 +1471,7 @@ mod tests {
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL":"Kimi-K2.7-Code[30k]"
             }
         });
-        fs::write(&path, new_content.to_string()).unwrap();
+        fs::write(&path, taken_over_live(new_content).to_string()).unwrap();
 
         thread::sleep(Duration::from_millis(800));
 
@@ -1480,7 +1509,7 @@ mod tests {
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL":"Kimi-K2.7-Code[30k]"
             }
         });
-        fs::write(&path, initial.to_string()).unwrap();
+        fs::write(&path, taken_over_live(initial).to_string()).unwrap();
 
         let provider = Arc::new(Mutex::new(Provider::with_id(
             "p".to_string(),
@@ -1507,7 +1536,8 @@ mod tests {
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL":"Kimi-K2.7-Code[30k]"
             }
         });
-        crate::config::atomic_write(&path, new_content.to_string().as_bytes()).unwrap();
+        crate::config::atomic_write(&path, taken_over_live(new_content).to_string().as_bytes())
+            .unwrap();
 
         thread::sleep(Duration::from_millis(800));
 
@@ -1609,7 +1639,7 @@ mod tests {
             "model": "sonnet",
             "env": { "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2" }
         });
-        std::fs::write(&path, initial.to_string()).unwrap();
+        std::fs::write(&path, taken_over_live(initial).to_string()).unwrap();
 
         let provider = Mutex::new(Provider::with_id(
             "p".to_string(),
@@ -1657,7 +1687,7 @@ mod tests {
             "model": "haiku",
             "env": { "ANTHROPIC_DEFAULT_HAIKU_MODEL": "Kimi-K2.7-Code[30k]" }
         });
-        fs::write(&path, initial.to_string()).unwrap();
+        fs::write(&path, taken_over_live(initial).to_string()).unwrap();
 
         let provider = Mutex::new(Provider::with_id(
             "p".to_string(),
@@ -1714,10 +1744,10 @@ mod tests {
         let path = dir.path().join("settings.json");
         fs::write(
             &path,
-            json!({
+            taken_over_live(json!({
                 "model": "haiku",
                 "env": { "ANTHROPIC_DEFAULT_HAIKU_MODEL": "Kimi-K2.7-Code[30k]" }
-            })
+            }))
             .to_string(),
         )
         .unwrap();
@@ -1750,10 +1780,10 @@ mod tests {
         // 自动同步仍可继续：后续真实切换 model 仍会写入新窗口，而不是永久停同步。
         fs::write(
             &path,
-            json!({
+            taken_over_live(json!({
                 "model": "sonnet",
                 "env": { "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2" }
-            })
+            }))
             .to_string(),
         )
         .unwrap();
@@ -1780,7 +1810,7 @@ mod tests {
                 "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "30000"
             }
         });
-        fs::write(&path, initial.to_string()).unwrap();
+        fs::write(&path, taken_over_live(initial).to_string()).unwrap();
 
         // DB 账本还是旧值，live 文件已包含上一次自动写入的 ACW/MAX；
         // watcher 重建时 state 从空快照开始，不能用旧 lastWritten 判成用户手改。
@@ -1809,10 +1839,10 @@ mod tests {
         // 自动同步不停止：下一次真实切换仍按目标写入。
         fs::write(
             &path,
-            json!({
+            taken_over_live(json!({
                 "model": "sonnet",
                 "env": { "ANTHROPIC_DEFAULT_SONNET_MODEL": "sonnet-model" }
-            })
+            }))
             .to_string(),
         )
         .unwrap();
@@ -1839,7 +1869,7 @@ mod tests {
                 "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "200000"
             }
         });
-        fs::write(&path, initial.to_string()).unwrap();
+        fs::write(&path, taken_over_live(initial).to_string()).unwrap();
 
         // live 保留 sonnet 的自动写入值，但 DB lastWritten 缺失、当前 model 已是 haiku：
         // watcher 应直接按当前 model（haiku）的目标窗口重写，而非保留旧值。
@@ -1892,7 +1922,7 @@ mod tests {
                 "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "262144"
             }
         });
-        fs::write(&path, initial.to_string()).unwrap();
+        fs::write(&path, taken_over_live(initial).to_string()).unwrap();
 
         let provider = Mutex::new(Provider::with_id(
             "kimi".to_string(),
@@ -1937,7 +1967,7 @@ mod tests {
                 "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "372000"
             }
         });
-        fs::write(&path, initial.to_string()).unwrap();
+        fs::write(&path, taken_over_live(initial).to_string()).unwrap();
 
         let provider = Mutex::new(Provider::with_id(
             "codex-oauth".to_string(),
@@ -1980,7 +2010,7 @@ mod tests {
             "model": "haiku",
             "env": { "ANTHROPIC_DEFAULT_HAIKU_MODEL": "Kimi[30k]" }
         });
-        fs::write(&path, initial.to_string()).unwrap();
+        fs::write(&path, taken_over_live(initial).to_string()).unwrap();
 
         let provider = Mutex::new(Provider::with_id(
             "p".to_string(),
@@ -2009,10 +2039,10 @@ mod tests {
 
         fs::write(
             &path,
-            json!({
+            taken_over_live(json!({
                 "model": "sonnet",
                 "env": { "ANTHROPIC_DEFAULT_SONNET_MODEL": "GLM[200k]" }
-            })
+            }))
             .to_string(),
         )
         .unwrap();
@@ -2033,7 +2063,7 @@ mod tests {
             "model": "sonnet",
             "env": { "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2" }
         });
-        std::fs::write(&path, initial.to_string()).unwrap();
+        std::fs::write(&path, taken_over_live(initial).to_string()).unwrap();
 
         let provider = Mutex::new(Provider::with_id(
             "p".to_string(),
@@ -2085,7 +2115,7 @@ mod tests {
             "model": "haiku",
             "env": { "ANTHROPIC_DEFAULT_HAIKU_MODEL": "haiku-model" }
         });
-        fs::write(&path, initial.to_string()).unwrap();
+        fs::write(&path, taken_over_live(initial).to_string()).unwrap();
 
         let provider = Mutex::new(Provider::with_id(
             "p".to_string(),
@@ -2196,7 +2226,7 @@ mod tests {
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL": "Kimi-K2.7-Code[30k]"
             }
         });
-        fs::write(&path, initial.to_string()).unwrap();
+        fs::write(&path, taken_over_live(initial).to_string()).unwrap();
 
         let provider = Arc::new(Mutex::new(Provider::with_id(
             "p".to_string(),
@@ -2217,13 +2247,13 @@ mod tests {
         // 模拟外部程序修改 model 字段
         fs::write(
             &path,
-            json!({
+            taken_over_live(json!({
                 "model": "haiku",
                 "env": {
                     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "Kimi-K2.7-Code[30k]",
                     "ANTHROPIC_DEFAULT_SONNET_MODEL": "MiniMax-M3[1M]"
                 }
-            })
+            }))
             .to_string(),
         )
         .unwrap();
@@ -2243,5 +2273,59 @@ mod tests {
         );
 
         drop(watcher);
+    }
+
+    #[test]
+    fn handle_settings_change_route_mode_gate_controls_acw_max_writes() {
+        // I1：直连（live 无接管占位符）时即使 autoSyncContextWindow=true，
+        // watcher 也不写 ACW/MAX；接管态（占位符）则按激活角色写入。
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        let provider = Mutex::new(Provider::with_id(
+            "p".to_string(),
+            "P".to_string(),
+            json!({
+                "env": { "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2" },
+                "contextWindows": { "ANTHROPIC_DEFAULT_SONNET_MODEL": 200000 },
+                "autoSyncContextWindow": true
+            }),
+            None,
+        ));
+        let state = Mutex::new(None);
+
+        // 直连：live 无接管占位符 → 门早退，不写 ACW/MAX。
+        fs::write(
+            &path,
+            json!({
+                "model": "sonnet",
+                "env": { "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        handle_settings_change(&path, &provider, &state, &noop_persist());
+
+        let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(v["env"].get("CLAUDE_CODE_AUTO_COMPACT_WINDOW").is_none());
+        assert!(v["env"].get("CLAUDE_CODE_MAX_CONTEXT_TOKENS").is_none());
+
+        // 接管态：live 含 ANTHROPIC_AUTH_TOKEN=PROXY_MANAGED → 按 sonnet 窗口写入。
+        fs::write(
+            &path,
+            taken_over_live(json!({
+                "model": "sonnet",
+                "env": { "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2" }
+            }))
+            .to_string(),
+        )
+        .unwrap();
+        handle_settings_change(&path, &provider, &state, &noop_persist());
+
+        let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "190000");
+        assert_eq!(v["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "200000");
     }
 }
