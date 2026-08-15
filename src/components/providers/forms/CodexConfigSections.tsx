@@ -207,13 +207,21 @@ export const CodexConfigSection: React.FC<CodexConfigSectionProps> = ({
     [localValue],
   );
 
-  const handleTopLevelIntChange = useCallback(
+  // 输入过程中保留用户原样字符串（支持 500K / 2m），失焦时才解析写入 TOML；
+  // 未输入时回退到已存 TOML 顶层整数显示。回车只结束编辑状态，不触发表单保存。
+  const [rawTopLevelInt, setRawTopLevelInt] = useState<{
+    contextWindow?: string;
+    autoCompactLimit?: string;
+  }>({});
+
+  const commitTopLevelInt = useCallback(
     (
       fieldName: "model_context_window" | "model_auto_compact_token_limit",
+      rawKey: "contextWindow" | "autoCompactLimit",
       rawValue: string,
     ) => {
-      // 允许 K/M 尾缀（500K / 2m），解析由 parseWindowToken 完成。
-      const numericValue = parseWindowToken(rawValue.trim());
+      const trimmed = rawValue.trim();
+      const numericValue = trimmed ? parseWindowToken(trimmed) : undefined;
       const toml = numericValue
         ? setCodexTopLevelInt(
             localValueRef.current || "",
@@ -222,8 +230,40 @@ export const CodexConfigSection: React.FC<CodexConfigSectionProps> = ({
           )
         : removeCodexTopLevelField(localValueRef.current || "", fieldName);
       handleLocalChange(toml);
+      setRawTopLevelInt((prev) => {
+        const next = { ...prev };
+        if (trimmed && numericValue !== undefined) {
+          // 合法 K/M 输入：解析值已写入 TOML，输入框继续原样显示。
+          next[rawKey] = trimmed;
+        } else {
+          // 空或非法输入：回退到已存值显示。
+          delete next[rawKey];
+        }
+        return next;
+      });
     },
     [handleLocalChange],
+  );
+
+  const commitTopLevelIntFromKeyDown = useCallback(
+    (
+      event: React.KeyboardEvent<HTMLInputElement>,
+      rawKey: "contextWindow" | "autoCompactLimit",
+    ) => {
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      event.stopPropagation();
+      const fieldName =
+        rawKey === "contextWindow"
+          ? "model_context_window"
+          : "model_auto_compact_token_limit";
+      const raw = rawTopLevelInt[rawKey];
+      if (raw !== undefined) {
+        commitTopLevelInt(fieldName, rawKey, raw);
+      }
+      event.currentTarget.blur();
+    },
+    [commitTopLevelInt, rawTopLevelInt],
   );
 
   return (
@@ -299,13 +339,23 @@ export const CodexConfigSection: React.FC<CodexConfigSectionProps> = ({
             inputMode="numeric"
             pattern="[0-9]*[KkMm]?"
             aria-label={t("codexConfig.contextWindow")}
-            value={topLevelIntValues.contextWindow}
+            value={
+              rawTopLevelInt.contextWindow ?? topLevelIntValues.contextWindow
+            }
             placeholder={t("codexConfig.contextWindowPlaceholder")}
             onChange={(e) =>
-              handleTopLevelIntChange(
-                "model_context_window",
-                e.currentTarget.value,
-              )
+              setRawTopLevelInt((prev) => ({
+                ...prev,
+                contextWindow: e.currentTarget.value,
+              }))
+            }
+            onBlur={() => {
+              const raw = rawTopLevelInt.contextWindow;
+              if (raw === undefined) return;
+              commitTopLevelInt("model_context_window", "contextWindow", raw);
+            }}
+            onKeyDown={(event) =>
+              commitTopLevelIntFromKeyDown(event, "contextWindow")
             }
             className="w-32 h-7 px-2 text-sm rounded border border-border bg-background text-foreground"
           />
@@ -317,13 +367,28 @@ export const CodexConfigSection: React.FC<CodexConfigSectionProps> = ({
             inputMode="numeric"
             pattern="[0-9]*[KkMm]?"
             aria-label={t("codexConfig.autoCompactLimit")}
-            value={topLevelIntValues.autoCompactLimit}
+            value={
+              rawTopLevelInt.autoCompactLimit ??
+              topLevelIntValues.autoCompactLimit
+            }
             placeholder={t("codexConfig.autoCompactLimitPlaceholder")}
             onChange={(e) =>
-              handleTopLevelIntChange(
+              setRawTopLevelInt((prev) => ({
+                ...prev,
+                autoCompactLimit: e.currentTarget.value,
+              }))
+            }
+            onBlur={() => {
+              const raw = rawTopLevelInt.autoCompactLimit;
+              if (raw === undefined) return;
+              commitTopLevelInt(
                 "model_auto_compact_token_limit",
-                e.currentTarget.value,
-              )
+                "autoCompactLimit",
+                raw,
+              );
+            }}
+            onKeyDown={(event) =>
+              commitTopLevelIntFromKeyDown(event, "autoCompactLimit")
             }
             className="w-32 h-7 px-2 text-sm rounded border border-border bg-background text-foreground"
           />

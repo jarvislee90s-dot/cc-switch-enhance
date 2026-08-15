@@ -41,15 +41,16 @@ describe("CodexConfigSection top-level integer fields", () => {
       label: "自动压缩阈值",
       field: "model_auto_compact_token_limit",
     },
-  ])("填写$label后写入$field", ({ label, field }) => {
+  ])("填写$label失焦后写入$field", ({ label, field }) => {
     const onChange = renderSection();
 
-    fireEvent.change(screen.getByLabelText(label), {
-      target: { value: "200000" },
-    });
+    const input = screen.getByLabelText(label) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "200000" } });
+    expect(onChange).not.toHaveBeenCalled();
 
+    fireEvent.blur(input);
     expect(onChange).toHaveBeenCalledWith(
-      expect.stringContaining(`${field} = 200000`),
+      expect.stringContaining(field + " = 200000"),
     );
   });
 
@@ -65,8 +66,10 @@ describe("CodexConfigSection top-level integer fields", () => {
 
     const input = screen.getByLabelText(label) as HTMLInputElement;
     fireEvent.change(input, { target: { value: "12abc" } });
+    // 输入过程中原样显示，失焦解析失败后回退到已存值（此处为空）。
+    expect(input).toHaveValue("12abc");
 
-    // 不再硬剥非数字：非法 token 视为无效输入，字段被移除。
+    fireEvent.blur(input);
     expect(input).toHaveValue("");
   });
 
@@ -79,37 +82,55 @@ describe("CodexConfigSection top-level integer fields", () => {
       label: "自动压缩阈值",
       field: "model_auto_compact_token_limit",
     },
-  ])("清空$label后移除$field", ({ label, field }) => {
-    const onChange = renderSection(`${field} = 200000\n`);
+  ])("清空$label失焦后移除$field", ({ label, field }) => {
+    const onChange = renderSection(field + " = 200000\n");
 
-    fireEvent.change(screen.getByLabelText(label), { target: { value: "" } });
+    const input = screen.getByLabelText(label) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "" } });
+    fireEvent.blur(input);
 
     const updated = onChange.mock.calls[0][0] as string;
-    expect(updated).not.toMatch(new RegExp(`^${field}\\s*=`, "m"));
+    expect(updated).not.toMatch(new RegExp("^" + field + "\\s*=", "m"));
   });
 
-  it("输入 500k 写入 model_context_window = 500000", () => {
+  it("输入 500k 失焦后写入 model_context_window = 500000 且原样显示", () => {
     const onChange = renderSection();
 
-    fireEvent.change(screen.getByLabelText("上下文大小"), {
-      target: { value: "500k" },
-    });
+    const input = screen.getByLabelText("上下文大小") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "500k" } });
+    fireEvent.blur(input);
 
     expect(onChange).toHaveBeenCalledWith(
       expect.stringContaining("model_context_window = 500000"),
     );
+    expect(input).toHaveValue("500k");
   });
 
-  it("输入 2m 写入 model_auto_compact_token_limit = 2000000", () => {
+  it("输入 2m 失焦后写入 model_auto_compact_token_limit = 2000000", () => {
     const onChange = renderSection();
 
-    fireEvent.change(screen.getByLabelText("自动压缩阈值"), {
-      target: { value: "2m" },
-    });
+    const input = screen.getByLabelText("自动压缩阈值") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "2m" } });
+    fireEvent.blur(input);
 
     expect(onChange).toHaveBeenCalledWith(
       expect.stringContaining("model_auto_compact_token_limit = 2000000"),
     );
+    expect(input).toHaveValue("2m");
+  });
+
+  it("输入 500k 后按回车只结束编辑状态并写入解析值", () => {
+    const onChange = renderSection();
+
+    const input = screen.getByLabelText("上下文大小") as HTMLInputElement;
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "500k" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(onChange).toHaveBeenCalledWith(
+      expect.stringContaining("model_context_window = 500000"),
+    );
+    expect(input).toHaveValue("500k");
   });
 
   it("展示全局上下文大小说明", () => {
