@@ -3498,6 +3498,19 @@ mod tests {
             Some("claude-sonnet-4-6[1m]")
         );
         assert!(live.get("contextWindows").is_none());
+        // 接管开启瞬间同样写入 contextWindows 派生的 ACW/MAX 静态注入。
+        assert_eq!(
+            live.pointer("/env/CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+                .and_then(Value::as_str),
+            Some("1000000"),
+            "takeover must inject MAX from the provider contextWindows"
+        );
+        assert_eq!(
+            live.pointer("/env/CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+                .and_then(Value::as_str),
+            Some("950000"),
+            "takeover must inject ACW = MAX * 0.95 default ratio"
+        );
     }
 
     async fn use_ephemeral_proxy_port(db: &Arc<Database>) {
@@ -6023,6 +6036,22 @@ model = "gpt-5.1-codex"
             Some("deepseek-v4-pro[1M]"),
             "subagent model should follow the target provider during hot switch"
         );
+        // 路由模式热切换同样注入 contextWindows 派生的 ACW/MAX（静态注入），
+        // 与直连模式一致，不依赖 autoSyncContextWindow 开关。
+        assert_eq!(
+            live_env
+                .get("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+                .and_then(|v| v.as_str()),
+            Some("1000000"),
+            "hot switch must inject MAX from the migrated contextWindows"
+        );
+        assert_eq!(
+            live_env
+                .get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+                .and_then(|v| v.as_str()),
+            Some("950000"),
+            "hot switch must inject ACW = MAX * 0.95 default ratio"
+        );
 
         let backup = db
             .get_live_backup("claude")
@@ -6246,6 +6275,68 @@ model = "gpt-5.1-codex"
         assert!(
             !crate::claude_settings_watcher::watcher_slot_is_empty_for_tests(),
             "CC_SWITCH_TEST_WATCHER=1 must allow watcher replacement after proxy sync"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn proxy_sync_claude_live_injects_acw_max_from_context_windows() {
+        // 路由模式热切换：provider 带 contextWindows（900K sonnet / 200K opus），
+        // 开关关闭、压缩比例 0.9。live 里残留上一个供应商的 ACW/MAX 应被
+        // 静态注入的目标值覆盖（MAX = 最大窗口 900000，ACW = 900000*0.9）。
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let provider = Provider::with_id(
+            "p1".to_string(),
+            "P1".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_API_KEY": "provider-key",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "sonnet-model",
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL": "opus-model"
+                },
+                "contextWindows": {
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": 900000,
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL": 200000
+                },
+                "autoSyncContextWindow": false,
+                "autoSyncCompactRatio": 0.9
+            }),
+            None,
+        );
+        seed_claude_current_provider(&db, &provider);
+        service
+            .write_claude_live(&json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:15721",
+                    "ANTHROPIC_API_KEY": PROXY_TOKEN_PLACEHOLDER,
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "stale-sonnet",
+                    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "200000",
+                    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "190000"
+                }
+            }))
+            .expect("seed taken-over live file");
+        service
+            .sync_claude_live_from_provider_while_proxy_active(&provider)
+            .await
+            .expect("sync Claude live");
+        let live = service.read_claude_live().expect("read live config");
+        let env = live
+            .get("env")
+            .and_then(Value::as_object)
+            .expect("live env");
+        assert_eq!(
+            env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+                .and_then(Value::as_str),
+            Some("900000"),
+            "MAX should be injected from max contextWindows (auto-sync switch off)"
+        );
+        assert_eq!(
+            env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+                .and_then(Value::as_str),
+            Some("810000"),
+            "ACW should be 900000 * 0.9 compact ratio"
         );
     }
 
