@@ -134,8 +134,19 @@ export function EditProviderDialog({
     unknown
   > | null>(null);
 
-  // 使用 ref 标记是否已经加载过，防止重复读取覆盖用户编辑
+  // 标记是否已经完成 live 读取（成功、不存在、或跳过读取都视为完成）
   const [hasLoadedLive, setHasLoadedLive] = useState(false);
+
+  // live 读取失败时禁止保存，避免用 DB 快照覆盖实时配置
+  const [liveLoadFailed, setLiveLoadFailed] = useState(false);
+
+  // 记录已完成 live 加载的 scope，切换 provider/app 后首个 commit 不会把旧结果当作当前结果
+  const [loadedScope, setLoadedScope] = useState<string | null>(null);
+
+  // 失败后的手动重试计数：自增触发加载 effect 重新执行
+  const [loadAttempt, setLoadAttempt] = useState(0);
+
+  const currentScope = `${appId}:${provider?.id ?? "new"}`;
 
   const closeDialog = useCallback(() => {
     setAuthSettingsTarget(null);
@@ -152,15 +163,16 @@ export function EditProviderDialog({
 
   useEffect(() => {
     let cancelled = false;
+
+    // 打开、切换 provider 或切换 app 时，在 effect 同步阶段先重置加载状态
+    setLiveSettings(null);
+    setHasLoadedLive(false);
+    setLiveLoadFailed(false);
+    setLoadedScope(null);
+
+    const scope = currentScope;
     const load = async () => {
       if (!open || !provider) {
-        setLiveSettings(null);
-        setHasLoadedLive(false);
-        return;
-      }
-
-      // 关键修复：只在首次打开时加载一次
-      if (hasLoadedLive) {
         return;
       }
 
@@ -168,8 +180,8 @@ export function EditProviderDialog({
       // 因此直接回退到 SSOT（数据库）配置，避免用户困惑与误保存
       if (isProxyTakeover) {
         if (!cancelled) {
-          setLiveSettings(null);
           setHasLoadedLive(true);
+          setLoadedScope(scope);
         }
         return;
       }
@@ -179,8 +191,8 @@ export function EditProviderDialog({
       // snapshot that may replace the DB aggregate in this form.
       if (appId === "opencode" || appId === "pi") {
         if (!cancelled) {
-          setLiveSettings(null);
           setHasLoadedLive(true);
+          setLoadedScope(scope);
         }
         return;
       }
@@ -188,18 +200,18 @@ export function EditProviderDialog({
       if (appId === "openclaw") {
         try {
           const live = await openclawApi.getLiveProvider(provider.id);
-          if (!cancelled && live && typeof live === "object") {
-            setLiveSettings(live);
-          } else if (!cancelled) {
-            setLiveSettings(null);
+          if (!cancelled) {
+            if (live && typeof live === "object") {
+              setLiveSettings(live);
+            }
+            setHasLoadedLive(true);
+            setLoadedScope(scope);
           }
         } catch {
           if (!cancelled) {
-            setLiveSettings(null);
-          }
-        } finally {
-          if (!cancelled) {
+            setLiveLoadFailed(true);
             setHasLoadedLive(true);
+            setLoadedScope(scope);
           }
         }
         return;
@@ -212,32 +224,38 @@ export function EditProviderDialog({
             const live = (await vscodeApi.getLiveProviderSettings(
               appId,
             )) as Record<string, unknown>;
-            if (!cancelled && live && typeof live === "object") {
-              setLiveSettings(live);
+            if (!cancelled) {
+              if (live && typeof live === "object") {
+                setLiveSettings(live);
+              }
               setHasLoadedLive(true);
+              setLoadedScope(scope);
             }
           } catch {
-            // 读取实时配置失败则回退到 SSOT（不打断编辑流程）
             if (!cancelled) {
-              setLiveSettings(null);
+              setLiveLoadFailed(true);
               setHasLoadedLive(true);
+              setLoadedScope(scope);
             }
           }
-        } else {
-          if (!cancelled) {
-            setLiveSettings(null);
-            setHasLoadedLive(true);
-          }
+        } else if (!cancelled) {
+          setHasLoadedLive(true);
+          setLoadedScope(scope);
         }
-      } finally {
-        // no-op
+      } catch {
+        // 无法确认当前供应商时也按 live 读取失败处理，避免用 DB 快照覆盖 live
+        if (!cancelled) {
+          setLiveLoadFailed(true);
+          setHasLoadedLive(true);
+          setLoadedScope(scope);
+        }
       }
     };
     void load();
     return () => {
       cancelled = true;
     };
-  }, [open, provider?.id, appId, hasLoadedLive, isProxyTakeover]); // 只依赖 provider.id，不依赖整个 provider 对象
+  }, [open, provider?.id, appId, isProxyTakeover, loadAttempt]); // 只依赖 provider.id，不依赖整个 provider 对象
 
   const initialSettingsConfig = useMemo(() => {
     const storedSettings = asRecord(provider?.settingsConfig);
@@ -330,8 +348,58 @@ export function EditProviderDialog({
     [appId, onSubmit, closeDialog, provider],
   );
 
+  const isLiveReady = loadedScope === currentScope && hasLoadedLive;
+  const isCurrentFailure = liveLoadFailed && loadedScope === currentScope;
+
   if (!provider || !initialData) {
     return null;
+  }
+
+  if (!isLiveReady || isCurrentFailure) {
+    return (
+      <FullScreenPanel
+        isOpen={open}
+        title={t("provider.editProvider")}
+        onClose={() => onOpenChange(false)}
+        footer={
+          <Button
+            type="submit"
+            form="provider-form"
+            disabled
+            className="bg-primary text-primary-foreground hover:bg-primary/90"
+          >
+            <Save className="h-4 w-4 mr-2" />
+            {t("common.save")}
+          </Button>
+        }
+      >
+        <div
+          className={`p-8 text-sm ${
+            isCurrentFailure ? "text-destructive" : "text-muted-foreground"
+          }`}
+          data-testid={isCurrentFailure ? "live-load-error" : undefined}
+          role={isCurrentFailure ? "alert" : undefined}
+        >
+          {isCurrentFailure
+            ? t("providerForm.liveLoadFailed", {
+                defaultValue: "读取实时配置失败，为避免覆盖实时配置已禁用保存",
+              })
+            : t("common.loading", { defaultValue: "加载中..." })}
+        </div>
+        {isCurrentFailure && (
+          <div className="px-8 pb-6">
+            <Button
+              type="button"
+              variant="outline"
+              data-testid="live-load-retry"
+              onClick={() => setLoadAttempt((n) => n + 1)}
+            >
+              {t("common.retry", { defaultValue: "重试" })}
+            </Button>
+          </div>
+        )}
+      </FullScreenPanel>
+    );
   }
 
   return (
