@@ -188,8 +188,16 @@ export function EditProviderDialog({
 
       // OpenCode uses additive mode, while Pi's shared models.json is owned by
       // the catalog coordinator. Neither has a per-provider generic live
-      // snapshot that may replace the DB aggregate in this form.
-      if (appId === "opencode" || appId === "pi") {
+      // snapshot that may replace the DB aggregate in this form. Claude
+      // Desktop's 3P config bundles multiple providers in one file, so the
+      // backend read_live_settings() reports "unsupported" by design — a
+      // permanent error the failure gate would never let the user past. For
+      // these apps the DB snapshot is the form's sole legitimate source.
+      if (
+        appId === "opencode" ||
+        appId === "pi" ||
+        appId === "claude-desktop"
+      ) {
         if (!cancelled) {
           setHasLoadedLive(true);
           setLoadedScope(scope);

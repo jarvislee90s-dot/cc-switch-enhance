@@ -923,4 +923,46 @@ describe("EditProviderDialog live 加载 gate 与失败处理", () => {
     );
     expect(screen.queryByTestId("live-load-error")).not.toBeInTheDocument();
   });
+
+  it("claude-desktop 编辑激活供应商：不走 live 读取门，直接用数据库快照渲染表单", async () => {
+    const provider: Provider = {
+      id: "cd-current",
+      name: "CD Current",
+      settingsConfig: {
+        ANTHROPIC_AUTH_TOKEN: "db-token",
+        ANTHROPIC_BASE_URL: "https://db.example.com",
+      },
+    };
+
+    // 后端 read_live_settings 对 claude-desktop 永远返回"不支持"错误；
+    // 豁免名单生效时应压根不发起这两次调用
+    apiMocks.getCurrent.mockResolvedValue(provider.id);
+    apiMocks.getLiveProviderSettings.mockRejectedValue(
+      new Error("Claude Desktop 3P 配置不支持作为通用 live 配置导入"),
+    );
+
+    render(
+      <EditProviderDialog
+        open
+        provider={provider}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+        appId="claude-desktop"
+      />,
+    );
+
+    expect(apiMocks.getLiveProviderSettings).not.toHaveBeenCalled();
+    expect(apiMocks.getCurrent).not.toHaveBeenCalled();
+
+    expect(screen.queryByTestId("live-load-error")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("live-load-retry")).not.toBeInTheDocument();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("provider-form")).toBeInTheDocument(),
+    );
+    expect(screen.getByRole("button", { name: "common.save" })).toBeEnabled();
+    expect(
+      JSON.parse(screen.getByTestId("settings-config").textContent ?? "{}"),
+    ).toEqual(provider.settingsConfig);
+  });
 });
