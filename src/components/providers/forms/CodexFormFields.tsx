@@ -1305,7 +1305,7 @@ export function CodexFormFields({
                           placeholder={t(
                             "codexConfig.contextWindowPlaceholder",
                             {
-                              defaultValue: "例如: 128000",
+                              defaultValue: "例如: 1M / 200K / 128000",
                             },
                           )}
                           aria-label={t("codexConfig.catalogColumnContext", {

@@ -6760,6 +6760,48 @@ base_url = "https://production.api/v1"
     }
 
     #[test]
+    fn catalog_string_context_window_km_token_generates_full_window() {
+        // 前端保存层按模型窗口以用户原样串（"1M"/"200k"/纯数字）入库；
+        // 锁定串能走通 specs→entry 生成链路并归一化为正确数值，防止串
+        // 分支被当作死代码清理。
+        let settings = json!({
+            "modelCatalog": {
+                "models": [
+                    { "model": "deepseek-v4-flash", "contextWindow": "1M" },
+                    { "model": "kimi-k2", "contextWindow": "200k" },
+                    { "model": "glm-5.2", "contextWindow": "500000" }
+                ]
+            }
+        });
+
+        let catalog = codex_model_catalog_from_settings(
+            &settings,
+            "",
+            CodexCatalogToolProfile::NativeResponses,
+        )
+        .expect("catalog generation should not error")
+        .expect("non-empty modelCatalog must yield a catalog");
+
+        let models = catalog["models"].as_array().unwrap();
+        for (slug, expected) in [
+            ("deepseek-v4-flash", 1_000_000u64),
+            ("kimi-k2", 200_000),
+            ("glm-5.2", 500_000),
+        ] {
+            let entry = models
+                .iter()
+                .find(|e| e["slug"] == json!(slug))
+                .unwrap_or_else(|| panic!("missing catalog entry for {slug}"));
+            assert_eq!(
+                entry["context_window"].as_u64(),
+                Some(expected),
+                "{slug}: K/M token must normalize to the full window"
+            );
+            assert_eq!(entry["max_context_window"].as_u64(), Some(expected));
+        }
+    }
+
+    #[test]
     fn catalog_infers_image_input_independently_of_tool_profile() {
         // Start from a deliberately text-only template to prove that every
         // profile overwrites template defaults with shared capability logic.

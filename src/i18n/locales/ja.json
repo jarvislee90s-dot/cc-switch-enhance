@@ -1543,7 +1543,7 @@
     "upstreamModelNameHint": "Chat 形式ではここに実際の上流モデルを入力します。ルーティングで Codex の Responses リクエストを Chat Completions に変換し、このモデルを維持します。",
     "modelNamePlaceholder": "例: gpt-5-codex",
     "contextWindow": "コンテキストウィンドウ",
-    "contextWindowPlaceholder": "例: 128000",
+    "contextWindowPlaceholder": "例: 1M / 200K / 128000",
     "autoCompactLimit": "自動圧縮しきい値",
     "autoCompactLimitPlaceholder": "例: 90000",
     "autoCompactLimitHint": "コンテキストトークン数がこのしきい値に達すると履歴を自動圧縮",

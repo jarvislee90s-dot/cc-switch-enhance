@@ -1543,7 +1543,7 @@
     "upstreamModelNameHint": "For Chat format, enter the real upstream model here; routing converts Codex Responses requests to Chat Completions while keeping this model.",
     "modelNamePlaceholder": "e.g., gpt-5-codex",
     "contextWindow": "Context Window",
-    "contextWindowPlaceholder": "e.g., 128000",
+    "contextWindowPlaceholder": "e.g., 1M / 200K / 128000",
     "autoCompactLimit": "Auto Compact Limit",
     "autoCompactLimitPlaceholder": "e.g., 90000",
     "autoCompactLimitHint": "Auto-compacts history when context reaches this token limit",

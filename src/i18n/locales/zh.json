@@ -1543,7 +1543,7 @@
     "upstreamModelNameHint": "Chat 格式下这里填写真实上游模型；路由会把 Codex 的 Responses 请求转换为 Chat Completions 并保持该模型。",
     "modelNamePlaceholder": "例如: gpt-5-codex",
     "contextWindow": "上下文窗口",
-    "contextWindowPlaceholder": "例如: 128000",
+    "contextWindowPlaceholder": "例如: 1M / 200K / 128000",
     "autoCompactLimit": "压缩阈值",
     "autoCompactLimitPlaceholder": "例如: 90000",
     "autoCompactLimitHint": "上下文 token 数达到此阈值时自动压缩历史",
