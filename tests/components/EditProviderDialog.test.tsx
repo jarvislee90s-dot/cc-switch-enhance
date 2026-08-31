@@ -14,6 +14,7 @@ const apiMocks = vi.hoisted(() => ({
   getCurrent: vi.fn(),
   getLiveProviderSettings: vi.fn(),
   getOpenClawLiveProvider: vi.fn(),
+  getHermesLiveProvider: vi.fn(),
 }));
 let mockFormReady = true;
 let mockCodexManagedAccountSelected = false;
@@ -28,6 +29,12 @@ vi.mock("@/lib/api", () => ({
   },
   openclawApi: {
     getLiveProvider: apiMocks.getOpenClawLiveProvider,
+  },
+}));
+
+vi.mock("@/lib/api/hermes", () => ({
+  hermesApi: {
+    getLiveProvider: apiMocks.getHermesLiveProvider,
   },
 }));
 
@@ -145,6 +152,7 @@ describe("EditProviderDialog", () => {
     apiMocks.getCurrent.mockReset();
     apiMocks.getLiveProviderSettings.mockReset();
     apiMocks.getOpenClawLiveProvider.mockReset();
+    apiMocks.getHermesLiveProvider.mockReset();
   });
 
   it("保留 Codex 数据库中的 modelCatalog，避免 live 配置缺字段时清空模型映射", async () => {
@@ -583,6 +591,7 @@ describe("EditProviderDialog live 加载 gate 与失败处理", () => {
     apiMocks.getCurrent.mockReset();
     apiMocks.getLiveProviderSettings.mockReset();
     apiMocks.getOpenClawLiveProvider.mockReset();
+    apiMocks.getHermesLiveProvider.mockReset();
   });
   it("live 配置加载完成前不渲染表单，加载完成后出现", async () => {
     const provider: Provider = {
@@ -684,6 +693,114 @@ describe("EditProviderDialog live 加载 gate 与失败处理", () => {
     );
   });
 
+  it("Hermes 编辑时用 live fragment 替换数据库快照作为表单初值", async () => {
+    const provider: Provider = {
+      id: "my-hermes",
+      name: "My Hermes",
+      category: "custom",
+      settingsConfig: {
+        name: "my-hermes",
+        base_url: "https://db.example.com",
+      },
+    };
+    const liveFragment = {
+      name: "my-hermes",
+      base_url: "https://live.example.com",
+      api_key: "live-key",
+      models: [{ id: "m1", displayName: "M1" }],
+      _cc_source: "custom_providers",
+    };
+
+    apiMocks.getHermesLiveProvider.mockResolvedValue(liveFragment);
+
+    render(
+      <EditProviderDialog
+        open
+        provider={provider}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+        appId="hermes"
+      />,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("provider-form")).toBeInTheDocument(),
+    );
+    expect(
+      JSON.parse(screen.getByTestId("settings-config").textContent ?? "{}"),
+    ).toEqual(liveFragment);
+    expect(screen.getByRole("button", { name: "common.save" })).toBeEnabled();
+    // Hermes 走专用分支读取 live，不经 getCurrent（additive 应用 current() 恒为空串）
+    expect(apiMocks.getCurrent).not.toHaveBeenCalled();
+    expect(apiMocks.getLiveProviderSettings).not.toHaveBeenCalled();
+  });
+
+  it("Hermes live 节点不存在时用数据库快照渲染并允许保存", async () => {
+    const provider: Provider = {
+      id: "my-hermes",
+      name: "My Hermes",
+      category: "custom",
+      settingsConfig: {
+        name: "my-hermes",
+        base_url: "https://db.example.com",
+      },
+    };
+
+    apiMocks.getHermesLiveProvider.mockResolvedValue(null);
+
+    render(
+      <EditProviderDialog
+        open
+        provider={provider}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+        appId="hermes"
+      />,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("provider-form")).toBeInTheDocument(),
+    );
+    expect(screen.getByRole("button", { name: "common.save" })).toBeEnabled();
+    expect(
+      JSON.parse(screen.getByTestId("settings-config").textContent ?? "{}"),
+    ).toEqual(provider.settingsConfig);
+  });
+
+  it("Hermes live 配置加载失败时禁用保存且不渲染表单", async () => {
+    const provider: Provider = {
+      id: "my-hermes",
+      name: "My Hermes",
+      category: "custom",
+      settingsConfig: {
+        name: "my-hermes",
+        base_url: "https://db.example.com",
+      },
+    };
+
+    apiMocks.getHermesLiveProvider.mockRejectedValue(new Error("boom"));
+
+    render(
+      <EditProviderDialog
+        open
+        provider={provider}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+        appId="hermes"
+      />,
+    );
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "common.save" }),
+      ).toBeDisabled(),
+    );
+    expect(screen.queryByTestId("provider-form")).not.toBeInTheDocument();
+    expect(screen.getByTestId("live-load-error")).toHaveTextContent(
+      /读取实时配置失败/,
+    );
+  });
+
   it("providersApi.getCurrent 失败时禁用保存并显示 live 读取失败", async () => {
     const provider: Provider = {
       id: "deepseek",
@@ -765,7 +882,9 @@ describe("EditProviderDialog live 加载 gate 与失败处理", () => {
       ).toEqual(liveA);
     });
 
-    // 直接 ReactDOM.render 绕开 RTL 的 act，让断言落在切换后的首个 commit 上
+    // 直接 ReactDOM.render 绕开 RTL 的 act，让断言落在切换后的首个 commit 上。
+    // 升级债：ReactDOM.render + legacyRoot 是 React 18 遗留 API，React 19 已移除，
+    // 升级时本用例需改写为 createRoot（同步 render 的语义需另行补偿）。
     ReactDOM.render(
       <EditProviderDialog
         open

@@ -17,6 +17,7 @@ import {
   type ManagedAuthProvider,
 } from "@/lib/api";
 import { extractCodexExperimentalBearerToken } from "@/utils/providerConfigUtils";
+import { hermesApi } from "@/lib/api/hermes";
 
 interface EditProviderDialogProps {
   open: boolean;
@@ -188,11 +189,17 @@ export function EditProviderDialog({
 
       // OpenCode uses additive mode, while Pi's shared models.json is owned by
       // the catalog coordinator. Neither has a per-provider generic live
-      // snapshot that may replace the DB aggregate in this form. Claude
+      // snapshot that may replace the DB aggregate in this form, so on the
+      // read side the DB snapshot is their sole legitimate source. Claude
       // Desktop's 3P config bundles multiple providers in one file, so the
       // backend read_live_settings() reports "unsupported" by design — a
-      // permanent error the failure gate would never let the user past. For
-      // these apps the DB snapshot is the form's sole legitimate source.
+      // permanent error the failure gate would never let the user past.
+      // NOTE this exemption only covers the READ side: when such a
+      // provider's node already exists in the live file, saving still
+      // overwrites that node with the DB-sourced form values (backend
+      // update()'s additive branch). Hermes reads its live fragment through
+      // the dedicated branch below; the OpenCode gap needs a single-provider
+      // live-read command and is tracked in a #6962 follow-up.
       if (
         appId === "opencode" ||
         appId === "pi" ||
@@ -205,9 +212,19 @@ export function EditProviderDialog({
         return;
       }
 
-      if (appId === "openclaw") {
+      // Additive apps with a dedicated per-provider live-read command
+      // (Option contract: null = no live node yet → DB fallback). The generic
+      // path below cannot serve them: ProviderService::current() returns ""
+      // for additive apps, so the getCurrent check would never reach a live
+      // read. The Hermes fragment already matches the DB's UI shape
+      // (snake_case, models array, `_cc_source` marker — write side drops
+      // the marker and re-normalizes models back to the YAML dict).
+      if (appId === "openclaw" || appId === "hermes") {
         try {
-          const live = await openclawApi.getLiveProvider(provider.id);
+          const live =
+            appId === "hermes"
+              ? await hermesApi.getLiveProvider(provider.id)
+              : await openclawApi.getLiveProvider(provider.id);
           if (!cancelled) {
             if (live && typeof live === "object") {
               setLiveSettings(live);
