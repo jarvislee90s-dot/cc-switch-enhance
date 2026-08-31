@@ -153,7 +153,10 @@ export const CodexConfigSection: React.FC<CodexConfigSectionProps> = ({
   useEffect(() => {
     setLocalValue(value);
     localValueRef.current = value;
-    if (lastCommittedRef.current !== null && value !== lastCommittedRef.current) {
+    if (
+      lastCommittedRef.current !== null &&
+      value !== lastCommittedRef.current
+    ) {
       setRawTopLevelInt({});
     }
   }, [value]);
