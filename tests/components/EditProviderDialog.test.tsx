@@ -854,6 +854,8 @@ describe("EditProviderDialog live 加载 gate 与失败处理", () => {
     });
   });
 
+  // null 是后端对"live 文件缺失"的真实契约（read_live_provider_settings 对
+  // *.missing 错误码返回 Ok(null)），不再是只有测试才会构造的假分支。
   it("live 配置不存在时仍使用数据库快照渲染并允许保存", async () => {
     const provider: Provider = {
       id: "deepseek",
